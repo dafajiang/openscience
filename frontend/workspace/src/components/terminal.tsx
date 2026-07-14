@@ -59,9 +59,7 @@ export const Terminal = (props: TerminalProps) => {
   const language = useLanguage()
   let container!: HTMLDivElement
   const [local, others] = splitProps(props, ["pty", "class", "classList", "onConnect", "onConnectError"])
-  let ws: WebSocket | undefined
   let term: Term | undefined
-  let ghostty: Ghostty
   let serializeAddon: SerializeAddon
   let fitAddon: FitAddon
   let handleResize: () => void
@@ -155,8 +153,6 @@ export const Terminal = (props: TerminalProps) => {
         cleanup()
         return
       }
-      ws = socket
-
       const t = new mod.Terminal({
         cursorBlink: true,
         cursorStyle: "bar",
@@ -172,7 +168,6 @@ export const Terminal = (props: TerminalProps) => {
         cleanup()
         return
       }
-      ghostty = g
       term = t
 
       const copy = () => {

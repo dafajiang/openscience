@@ -234,9 +234,9 @@ export namespace Server {
         // Folder-resolve endpoints are filesystem-global (no project Instance
         // needed), so mount before the Instance.provide wrapper below.
         .route("/api/resolve-folder", FolderResolveRoutes())
-        // Atlas graph bridge — proxies /api/thesis/* to the Atlas REST API
+        // Atlas graph bridge — proxies /api/atlas/* to the Atlas REST API
         // using the user's stored thk_ key (see routes/atlas-bridge.ts).
-        .route("/api/thesis", AtlasBridgeRoutes())
+        .route("/api/atlas", AtlasBridgeRoutes())
         // Repository tab (status/commit/push/remote) — shells out to git.
         .route("/api/repo", RepoRoutes())
         .use(async (c, next) => {

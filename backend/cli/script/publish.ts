@@ -109,8 +109,6 @@ if (!Script.preview) {
       .text()
       .then((x) => x.trim())
 
-    const [pkgver, _subver = ""] = Script.version.split(/(-.*)/, 2)
-
     // Homebrew formula
     const homebrewFormula = [
       "# typed: false",

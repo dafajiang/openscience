@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, mkdir, stat, readdir, copyFile } from "node:fs/p
 import path from "node:path"
 import os from "node:os"
 import { $ } from "bun"
-import { runtimeRegexPass, classifierInjectionRegexPass, type Warning } from "./review"
+import { runtimeRegexPass, classifierInjectionRegexPass } from "./review"
 import type { SkillEntry } from "./fetcher"
 
 interface FetchPinnedParams {

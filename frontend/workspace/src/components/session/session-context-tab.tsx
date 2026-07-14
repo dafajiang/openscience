@@ -13,7 +13,6 @@ import { Code } from "@synsci/ui/code"
 import { Markdown } from "@synsci/ui/markdown"
 import type { AssistantMessage, Message, Part, UserMessage } from "@synsci/sdk/v2/client"
 import { useLanguage } from "@/context/language"
-import { useLocal } from "@/context/local"
 
 interface SessionContextTabProps {
   messages: () => Message[]
@@ -26,7 +25,6 @@ export function SessionContextTab(props: SessionContextTabProps) {
   const params = useParams()
   const sync = useSync()
   const language = useLanguage()
-  const local = useLocal()
 
   const usd = createMemo(
     () =>

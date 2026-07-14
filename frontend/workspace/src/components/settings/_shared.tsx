@@ -31,7 +31,7 @@ export const PanelBody: ParentComponent = (props) => (
 // Muted "SECTION" subheader with a trailing count.
 export const SectionLabel: Component<{ label: string; count?: number }> = (props) => (
   <div class="flex items-center gap-2 px-0.5">
-    <span class="thesis-section-label">{props.label}</span>
+    <span class="atlas-section-label">{props.label}</span>
     <Show when={props.count !== undefined}>
       <span class="text-10-regular text-text-weaker">{props.count}</span>
     </Show>
@@ -64,6 +64,34 @@ export const EmptyState: Component<{ icon: IconProps["name"]; title: string; hin
       <p class="text-12-regular text-text-weak leading-relaxed max-w-[380px]">{props.hint}</p>
     </Show>
   </div>
+)
+
+// Leading identity tile for a list row — the shared visual anchor that makes the
+// Specialists and Connectors lists read as one family. Pass a `monogram` (takes
+// the tint as its colour, for a specialist's identity) or an `icon` (stays
+// neutral on the tinted tile, for a connector's type). `tint` (hex or a CSS var)
+// washes the tile background; omit it for a neutral tile.
+export const Avatar: Component<{ tint?: string; icon?: IconProps["name"]; monogram?: string }> = (props) => (
+  <div
+    class="flex items-center justify-center size-8 rounded-[5px] flex-shrink-0 text-13-medium leading-none uppercase"
+    style={{
+      background: props.tint
+        ? `color-mix(in srgb, ${props.tint} 14%, transparent)`
+        : "var(--color-surface-raised-base)",
+      color: props.monogram && props.tint ? props.tint : "var(--color-icon-strong-base)",
+    }}
+  >
+    <Show when={props.icon} fallback={<span>{props.monogram}</span>}>
+      <Icon name={props.icon!} size="small" />
+    </Show>
+  </div>
+)
+
+// Small inline metadata badge (a specialist's mode, a connector's type).
+export const Chip: ParentComponent = (props) => (
+  <span class="text-11-medium text-text-weak/70 px-1.5 py-0.5 rounded-md bg-surface-raised-base/60 flex-shrink-0">
+    {props.children}
+  </span>
 )
 
 // ── Toolbar pieces ──────────────────────────────────────────────────────────

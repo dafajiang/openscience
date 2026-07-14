@@ -338,7 +338,7 @@ export const SessionReview = (props: SessionReviewProps) => {
               const diffAudioSrc = dataUrlFromValue(diff.after) ?? dataUrlFromValue(diff.before)
               const [audioSrc, setAudioSrc] = createSignal<string | undefined>(diffAudioSrc)
               const [audioStatus, setAudioStatus] = createSignal<"idle" | "loading" | "error">("idle")
-              const [audioMime, setAudioMime] = createSignal<string | undefined>(undefined)
+              const [, setAudioMime] = createSignal<string | undefined>(undefined)
 
               const selectedLines = createMemo(() => {
                 const current = selection()

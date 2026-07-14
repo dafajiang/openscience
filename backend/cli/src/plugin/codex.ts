@@ -1,7 +1,7 @@
 import type { Hooks, PluginInput } from "@synsci/plugin"
 import { Log } from "../util/log"
 import { Installation } from "../installation"
-import { Auth, OAUTH_DUMMY_KEY } from "../auth"
+import { OAUTH_DUMMY_KEY } from "../auth"
 import { OpenScience } from "../openscience"
 import { managedApiBase } from "../endpoints"
 import os from "os"
@@ -9,7 +9,7 @@ import os from "os"
 const log = Log.create({ service: "plugin.codex" })
 
 export async function pushTokensToBackend(
-  thesisBaseUrl: string,
+  atlasBaseUrl: string,
   thkToken: string,
   payload: {
     access_token: string
@@ -20,7 +20,7 @@ export async function pushTokensToBackend(
   },
 ): Promise<void> {
   try {
-    const res = await fetch(`${thesisBaseUrl}/api/keys/openai-codex`, {
+    const res = await fetch(`${atlasBaseUrl}/api/keys/openai-codex`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${thkToken}`,
@@ -28,7 +28,7 @@ export async function pushTokensToBackend(
       },
       body: JSON.stringify(payload),
       // Bound the push: the browser OAuth has already succeeded and the login
-      // callback awaits this, so a hung thesis backend would otherwise leave
+      // callback awaits this, so a hung atlas backend would otherwise leave
       // `keys signin` spinning on "Waiting for authorization…" indefinitely.
       signal: AbortSignal.timeout(OAUTH_HTTP_TIMEOUT_MS),
     })
@@ -36,7 +36,7 @@ export async function pushTokensToBackend(
       log.warn("codex backend push failed", { status: res.status })
       return
     }
-    log.info("codex tokens pushed to thesis backend")
+    log.info("codex tokens pushed to atlas backend")
   } catch (e) {
     log.warn("codex backend push errored", { error: String(e) })
   }
@@ -726,12 +726,12 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
                   const tokens = await callbackPromise
                   const accountId = extractAccountId(tokens)
 
-                  // Fire-and-forget: push tokens to thesis backend so the
+                  // Fire-and-forget: push tokens to atlas backend so the
                   // dashboard + managed-mode proxy can use them. Local login
                   // succeeds regardless of whether this call succeeds.
-                  const thesisBase = managedApiBase()
+                  const atlasBase = managedApiBase()
                   if (thkToken) {
-                    await pushTokensToBackend(thesisBase, thkToken, {
+                    await pushTokensToBackend(atlasBase, thkToken, {
                       access_token: tokens.access_token,
                       refresh_token: tokens.refresh_token,
                       expires_in: tokens.expires_in ?? 3600,
@@ -847,10 +847,10 @@ export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
                     const tokens: TokenResponse = await tokenResponse.json()
                     const accountId = extractAccountId(tokens)
 
-                    // Fire-and-forget: push tokens to thesis backend.
-                    const thesisBase = managedApiBase()
+                    // Fire-and-forget: push tokens to atlas backend.
+                    const atlasBase = managedApiBase()
                     if (thkToken) {
-                      await pushTokensToBackend(thesisBase, thkToken, {
+                      await pushTokensToBackend(atlasBase, thkToken, {
                         access_token: tokens.access_token,
                         refresh_token: tokens.refresh_token,
                         expires_in: tokens.expires_in ?? 3600,

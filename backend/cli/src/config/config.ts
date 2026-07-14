@@ -205,7 +205,16 @@ export namespace Config {
       const scoped: Partial<Config.Info> = {}
       if (synced?.provider?.openrouter) scoped.provider = { openrouter: synced.provider.openrouter }
       if (synced?.model) scoped.model = synced.model
-      result = mergeConfigConcatArrays(result, scoped)
+      // Merge synced UNDERNEATH the user's own config, not on top: it is the
+      // server's *recommendation* (default model, OpenRouter managed catalog),
+      // not a lockdown, so the user's config must win — otherwise their chosen
+      // default model and custom OpenRouter models are reverted on every sync
+      // (#159). mergeConfigConcatArrays(base, override) lets `override` win, so
+      // pass the user config (result) as the override. Model records still union,
+      // so server-whitelisted models the user didn't declare stay available.
+      // Enterprise lockdown is unaffected: the managed /etc layer merges LAST
+      // below and still wins over both.
+      result = mergeConfigConcatArrays(scoped as Config.Info, result)
     } catch {
       // treat an unreadable synced config as absent
     }
@@ -959,6 +968,12 @@ export namespace Config {
         .object({
           apiKey: z.string().optional(),
           baseURL: z.string().optional(),
+          tokenCommand: z
+            .string()
+            .optional()
+            .describe(
+              "Shell command whose stdout is a short-lived bearer token. Sent as 'Authorization: Bearer <token>' on every request and re-minted automatically before the token's JWT exp (or every request for a non-JWT token). Use for providers behind rotating/SSO-minted credentials.",
+            ),
           enterpriseUrl: z.string().optional().describe("GitHub Enterprise URL for copilot authentication"),
           setCacheKey: z.boolean().optional().describe("Enable promptCacheKey for this provider (default false)"),
           timeout: z
@@ -1156,6 +1171,32 @@ export namespace Config {
         .object({
           auto: z.boolean().optional().describe("Enable automatic compaction when context is full (default: true)"),
           prune: z.boolean().optional().describe("Enable pruning of old tool outputs (default: true)"),
+          threshold: z
+            .number()
+            .min(0)
+            .max(1)
+            .optional()
+            .describe("Compact when context exceeds this fraction of the model window (default: 0.75)"),
+          fallbackContext: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Assumed context window (tokens) when a provider reports 0 (default: 128000)"),
+          tailTurns: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Minimum recent turns kept verbatim during compaction (default: 2)"),
+          tailTokens: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+              "Token budget for the verbatim recent tail during compaction (default: clamp(0.20*usable, 8000, 32000))",
+            ),
         })
         .optional(),
       experimental: z

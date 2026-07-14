@@ -3,8 +3,8 @@ import { useNavigate } from "@solidjs/router"
 import { base64Encode } from "@synsci/util/encode"
 import { DateTime } from "luxon"
 import { useDialog } from "@synsci/ui/context/dialog"
-import { FolderPicker } from "@/thesis/FolderPicker"
-import { FdaBanner } from "@/thesis/FdaBanner"
+import { FolderPicker } from "@/atlas/FolderPicker"
+import { FdaBanner } from "@/atlas/FdaBanner"
 import { DialogSelectServer } from "@/components/dialog-select-server"
 import { useServer } from "@/context/server"
 import { useGlobalSync } from "@/context/global-sync"
@@ -12,19 +12,19 @@ import { useLayout } from "@/context/layout"
 import { usePlatform } from "@/context/platform"
 import { useLanguage } from "@/context/language"
 import { useTheme } from "@synsci/ui/theme"
-import { Wordmark } from "@/thesis/Wordmark"
-import { AppHeader, HeaderIconButton } from "@/thesis/AppHeader"
-import { AgentIcon } from "@/thesis/shared/AgentIcon"
-import { toast } from "@/thesis/Toast"
-import { ToastContainer } from "@/thesis/Toast"
+import { Wordmark } from "@/atlas/Wordmark"
+import { AppHeader, HeaderIconButton } from "@/atlas/AppHeader"
+import { AgentIcon } from "@/atlas/shared/AgentIcon"
+import { toast } from "@/atlas/Toast"
+import { ToastContainer } from "@/atlas/Toast"
 import { DialogSettings } from "@/components/dialog-settings"
-import { DisconnectedPanel } from "@/thesis/DisconnectedPanel"
-import { uiStore } from "@/thesis/store/ui"
-import { useGlobalKeys } from "@/thesis/useGlobalKeys"
-import { CommandPalette } from "@/thesis/CommandPalette"
-import { HelpOverlay } from "@/thesis/HelpOverlay"
-import { projectPrefs } from "@/thesis/store/projectPrefs"
-import { IconStar, IconStarFilled, IconTrash } from "@/thesis/shared/Icon"
+import { DisconnectedPanel } from "@/atlas/DisconnectedPanel"
+import { uiStore } from "@/atlas/store/ui"
+import { useGlobalKeys } from "@/atlas/useGlobalKeys"
+import { CommandPalette } from "@/atlas/CommandPalette"
+import { HelpOverlay } from "@/atlas/HelpOverlay"
+import { projectPrefs } from "@/atlas/store/projectPrefs"
+import { IconStar, IconStarFilled, IconTrash } from "@/atlas/shared/Icon"
 import {
   IconArrowRight,
   IconClock,
@@ -34,7 +34,7 @@ import {
   IconSearch,
   IconSettings,
   IconSun,
-} from "@/thesis/shared/Icon"
+} from "@/atlas/shared/Icon"
 import { FONT_CODE, FONT_MONO, FONT_SANS, FONT_SERIF } from "@/styles/tokens"
 
 /** 26px bordered icon button shared by the hover action clusters in grid cards and list rows. */
@@ -182,7 +182,7 @@ export default function Home(): JSX.Element {
 
   return (
     <div
-      class="thesis-root"
+      class="atlas-root"
       style={{
         flex: 1,
         display: "flex",
@@ -298,7 +298,7 @@ export default function Home(): JSX.Element {
       </AppHeader>
 
       <main
-        class="thesis-scroll"
+        class="atlas-scroll"
         style={{
           flex: 1,
           "overflow-y": "auto",
@@ -502,7 +502,7 @@ function ProjectCard(props: {
       }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      class="thesis-stagger"
+      class="atlas-stagger"
       style={{
         cursor: "pointer",
         display: "flex",
@@ -866,7 +866,7 @@ function NewProjectCard(props: { onClick: () => void }): JSX.Element {
       onClick={props.onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      class="thesis-stagger"
+      class="atlas-stagger"
       style={{
         all: "unset",
         cursor: "pointer",
@@ -892,7 +892,7 @@ function NewProjectCard(props: { onClick: () => void }): JSX.Element {
 function EmptyHero(props: { onChoose: () => void }): JSX.Element {
   return (
     <div
-      class="thesis-fade-in"
+      class="atlas-fade-in"
       style={{
         display: "flex",
         "flex-direction": "column",

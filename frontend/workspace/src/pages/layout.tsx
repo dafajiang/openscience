@@ -1,5 +1,5 @@
 import { type ParentProps } from "solid-js"
-import { SetupGate } from "@/thesis/SetupGate"
+import { SetupGate } from "@/atlas/SetupGate"
 
 /**
  * Outer Router layout — passthrough.
@@ -8,7 +8,7 @@ import { SetupGate } from "@/thesis/SetupGate"
  * (folder/+/settings/external). Now that the home page (Conductor grid)
  * and the in-session view both render their own headers, the outer
  * chrome was just doubling up. This file used to be 2871 lines; the
- * project sidebar + workspace tab bar logic now lives in src/thesis/*.
+ * project sidebar + workspace tab bar logic now lives in src/atlas/*.
  *
  * Returning `props.children` keeps the routing tree intact while letting
  * each page own its own visual chrome. `SetupGate` is a headless first-run

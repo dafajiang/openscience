@@ -530,6 +530,9 @@
       width: 12px;
       height: 12px;
       margin-right: 4px;
+      /* Don't let a long status line ("Searching the web · 10m, 1s") squeeze the
+         SVG — without this the 15-unit grid compresses and the dots read as cut off. */
+      flex-shrink: 0;
     }
 
     [data-component="icon"] {

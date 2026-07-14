@@ -144,7 +144,7 @@ export default function Network() {
         <Show when={!loading()} fallback={<div class="text-13-regular text-text-weak py-6 text-center">Loading…</div>}>
           {/* Domain groups */}
           <div class="flex flex-col gap-2">
-            <span class="thesis-section-label px-1">Domain sets</span>
+            <span class="atlas-section-label px-1">Domain sets</span>
             <For each={catalog()}>
               {(group) => {
                 const on = () => state().enabled.includes(group.id)
@@ -188,7 +188,7 @@ export default function Network() {
           {/* Custom allowed domains */}
           <div class="flex flex-col gap-2">
             <div class="flex items-center justify-between px-1">
-              <span class="thesis-section-label">Allowed domains</span>
+              <span class="atlas-section-label">Allowed domains</span>
               <Show when={state().custom.length > 0}>
                 <button
                   type="button"

@@ -35,7 +35,7 @@ import { URLS } from "@/config/urls"
 // the renderer registry so `metadata.artifact` envelopes render in chat.
 import "@/science/tool-renderer"
 import { Suspense } from "solid-js"
-import { AsciiSpinner } from "@/thesis/shared/AsciiSpinner"
+import { AsciiSpinner } from "@/atlas/shared/AsciiSpinner"
 
 const Home = lazy(() => import("@/pages/home"))
 const Session = lazy(() => import("@/pages/session"))

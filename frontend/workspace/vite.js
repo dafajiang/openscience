@@ -1,7 +1,7 @@
 import solidPlugin from "vite-plugin-solid"
 import tailwindcss from "@tailwindcss/vite"
 import { fileURLToPath } from "url"
-import thesisBridge from "./vite-thesis.js"
+import atlasBridge from "./vite-atlas.js"
 import folderResolve from "./vite-folder-resolve.js"
 import repoBridge from "./vite-repo.js"
 
@@ -26,7 +26,7 @@ export default [
   },
   tailwindcss(),
   solidPlugin(),
-  thesisBridge,
+  atlasBridge,
   folderResolve,
   repoBridge,
 ]

@@ -52,7 +52,7 @@ export interface SettingsPanel {
 // Order here is the render order in the rail (top→bottom within each section).
 export const SETTINGS_PANELS: SettingsPanel[] = [
   // ── Capabilities ──
-  // Skills moved to a dedicated center-pane tab (thesis/SkillsPage) — it's a
+  // Skills moved to a dedicated center-pane tab (atlas/SkillsPage) — it's a
   // first-class catalog now, not a settings row.
   {
     id: "connectors",

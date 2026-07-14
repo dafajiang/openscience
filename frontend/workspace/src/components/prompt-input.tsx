@@ -60,7 +60,15 @@ import { showToast } from "@synsci/ui/toast"
 import { base64Encode } from "@synsci/util/encode"
 
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
-const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf"]
+const ACCEPTED_TEXT_TYPES = ["text/markdown", "text/plain"]
+const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf", ...ACCEPTED_TEXT_TYPES]
+// Browsers frequently report file.type === "" for .md (and sometimes .txt), so the
+// mime allow-list alone would drop them. Resolve by extension as a fallback.
+const TEXT_EXTENSIONS: Record<string, string> = { md: "text/markdown", markdown: "text/markdown", txt: "text/plain" }
+const fileExtension = (name: string) => name.slice(name.lastIndexOf(".") + 1).toLowerCase()
+const resolveMime = (file: File) => file.type || TEXT_EXTENSIONS[fileExtension(file.name)] || ""
+const isAcceptedFile = (file: File) =>
+  ACCEPTED_FILE_TYPES.includes(file.type) || Boolean(TEXT_EXTENSIONS[fileExtension(file.name)])
 
 type PendingPrompt = {
   abort: AbortController
@@ -326,7 +334,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const isImeComposing = (event: KeyboardEvent) => event.isComposing || composing() || event.keyCode === 229
 
   const addImageAttachment = async (file: File) => {
-    if (!ACCEPTED_FILE_TYPES.includes(file.type)) return
+    if (!isAcceptedFile(file)) return
+    const mime = resolveMime(file)
 
     const reader = new FileReader()
     reader.onload = () => {
@@ -335,7 +344,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         type: "image",
         id: crypto.randomUUID(),
         filename: file.name,
-        mime: file.type,
+        mime,
         dataUrl,
       }
       const cursorPosition = prompt.cursor() ?? getCursorPosition(editorRef)
@@ -412,7 +421,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (!dropped) return
 
     for (const file of Array.from(dropped)) {
-      if (ACCEPTED_FILE_TYPES.includes(file.type)) {
+      if (isAcceptedFile(file)) {
         await addImageAttachment(file)
       }
     }
@@ -511,13 +520,23 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         type: "builtin" as const,
       }))
 
-    const custom = sync.data.command.map((cmd) => ({
-      id: `custom.${cmd.name}`,
-      trigger: cmd.name,
-      title: cmd.name,
-      description: cmd.description,
-      type: "custom" as const,
-    }))
+    const custom = sync.data.command
+      // `menu` commands are executable action commands (e.g. /compact) that must RUN
+      // on select, not prefill text. They're surfaced by their owning context as a
+      // builtin `command.options` entry (with a matching `slash`) and dropped here so
+      // they don't ALSO appear as a prefill-only custom entry. A menu command is
+      // therefore visible only where that builtin is registered — e.g. /compact only
+      // once a session exists (session.tsx registers it under params.id); it is
+      // intentionally absent in the new-session composer, where there's nothing to
+      // compact and a prefilled "/compact " would not execute anyway.
+      .filter((cmd) => !(cmd as { menu?: boolean }).menu)
+      .map((cmd) => ({
+        id: `custom.${cmd.name}`,
+        trigger: cmd.name,
+        title: cmd.name,
+        description: cmd.description,
+        type: "custom" as const,
+      }))
 
     // Surface installed skills as slash entries. Selecting one prefills a
     // "Use the <name> skill: " prompt that the agent matches against its
@@ -2044,7 +2063,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             <input
               ref={fileInputRef}
               type="file"
-              accept={ACCEPTED_FILE_TYPES.join(",")}
+              accept={[...ACCEPTED_FILE_TYPES, ".md", ".markdown", ".txt"].join(",")}
               class="hidden"
               onChange={(e) => {
                 const file = e.currentTarget.files?.[0]

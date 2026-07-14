@@ -147,7 +147,11 @@ async function getKernel(sessionID: string): Promise<Kernel> {
   })
   const proc = spawn(sandboxed.file, sandboxed.args, {
     cwd: Instance.directory,
-    env: { ...(await OpenScience.subprocessEnv(process.env)), PYTHONUNBUFFERED: "1" },
+    env: {
+      ...(await OpenScience.subprocessEnv(process.env)),
+      ...OpenScience.pythonThreadCapEnv(process.env),
+      PYTHONUNBUFFERED: "1",
+    },
     stdio: ["pipe", "pipe", "pipe"],
   })
 

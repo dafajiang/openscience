@@ -7,7 +7,6 @@ import { useCommand } from "@/context/command"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useSync } from "@/context/sync"
-import { useGlobalSDK } from "@/context/global-sdk"
 import { getFilename } from "@synsci/util/path"
 import { decode64 } from "@/utils/base64"
 
@@ -21,7 +20,6 @@ import { Keybind } from "@synsci/ui/keybind"
 import { StatusPopover } from "../status-popover"
 
 export function SessionHeader() {
-  const globalSDK = useGlobalSDK()
   const layout = useLayout()
   const params = useParams()
   const command = useCommand()

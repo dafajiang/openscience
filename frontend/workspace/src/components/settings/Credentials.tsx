@@ -8,7 +8,7 @@ import { useGlobalSDK } from "@/context/global-sdk"
 import { usePlatform } from "@/context/platform"
 import { useProviders } from "@/hooks/use-providers"
 import { FONT_CODE, FONT_SANS, sectionTitle } from "@/styles/tokens"
-import { StatusDot } from "@/thesis/shared/StatusDot"
+import { StatusDot } from "@/atlas/shared/StatusDot"
 import { settingsApi } from "./api"
 
 type FieldSpec = {

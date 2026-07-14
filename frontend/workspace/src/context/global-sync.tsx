@@ -25,7 +25,7 @@ import { retry } from "@synsci/util/retry"
 import { useGlobalSDK } from "./global-sdk"
 // InitError used to live in pages/error.tsx (now deleted with the legacy
 // openscience shell). Inline the shape so the openscience context layer keeps
-// compiling — it's dead code under the new ThesisApp entry but is still
+// compiling — it's dead code under the new AtlasApp entry but is still
 // imported transitively from app.tsx tooling.
 type InitError = { code: string; message?: string; cause?: unknown }
 import {
@@ -627,37 +627,6 @@ function createGlobalSync() {
       booting.delete(directory)
     })
     return promise
-  }
-
-  function purgeMessageParts(setStore: SetStoreFunction<State>, messageID: string | undefined) {
-    if (!messageID) return
-    setStore(
-      produce((draft) => {
-        delete draft.part[messageID]
-      }),
-    )
-  }
-
-  function purgeSessionData(store: Store<State>, setStore: SetStoreFunction<State>, sessionID: string | undefined) {
-    if (!sessionID) return
-
-    const messages = store.message[sessionID]
-    const messageIDs = (messages ?? []).map((m) => m.id).filter((id): id is string => !!id)
-
-    setStore(
-      produce((draft) => {
-        delete draft.message[sessionID]
-        delete draft.session_diff[sessionID]
-        delete draft.todo[sessionID]
-        delete draft.permission[sessionID]
-        delete draft.question[sessionID]
-        delete draft.session_status[sessionID]
-
-        for (const messageID of messageIDs) {
-          delete draft.part[messageID]
-        }
-      }),
-    )
   }
 
   const unsub = globalSDK.event.listen((e) => {

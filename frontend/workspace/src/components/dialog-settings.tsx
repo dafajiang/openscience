@@ -99,7 +99,7 @@ export const DialogSettings: Component = () => {
             <For each={SETTINGS_SECTIONS}>
               {(section) => (
                 <div class="flex flex-col gap-1">
-                  <span class="px-2.5 pb-1 thesis-section-label">{section.label}</span>
+                  <span class="px-2.5 pb-1 atlas-section-label">{section.label}</span>
                   <For each={SETTINGS_PANELS.filter((p) => p.section === section.id)}>
                     {(panel) => (
                       <button

@@ -13,7 +13,6 @@ import { useNavigate } from "@solidjs/router"
 import { useLanguage } from "@/context/language"
 import { DropdownMenu } from "@synsci/ui/dropdown-menu"
 import { Tooltip } from "@synsci/ui/tooltip"
-import { useGlobalSDK } from "@/context/global-sdk"
 import { showToast } from "@synsci/ui/toast"
 
 type ServerStatus = { healthy: boolean; version?: string }
@@ -128,7 +127,6 @@ export function DialogSelectServer() {
   const dialog = useDialog()
   const server = useServer()
   const platform = usePlatform()
-  const globalSDK = useGlobalSDK()
   const language = useLanguage()
   const [store, setStore] = createStore({
     status: {} as Record<string, ServerStatus | undefined>,

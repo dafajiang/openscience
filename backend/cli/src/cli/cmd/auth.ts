@@ -527,9 +527,9 @@ async function backendHasCodex(): Promise<boolean | null> {
   const session = await OpenScience.getSession?.()
   const thkToken = session?.api_key
   if (!thkToken) return null
-  const thesisBase = managedApiBase()
+  const atlasBase = managedApiBase()
   try {
-    const res = await fetch(`${thesisBase}/api/keys/openai-codex/status`, {
+    const res = await fetch(`${atlasBase}/api/keys/openai-codex/status`, {
       headers: { Authorization: `Bearer ${thkToken}` },
     })
     if (!res.ok) return null
@@ -715,7 +715,7 @@ export const AuthLogoutCommand = cmd({
 })
 
 async function revokeCodexOnBackend(): Promise<void> {
-  const thesisBase = managedApiBase()
+  const atlasBase = managedApiBase()
   const session = await OpenScience.getSession?.()
   const thkToken = session?.api_key
   if (!thkToken) {
@@ -723,7 +723,7 @@ async function revokeCodexOnBackend(): Promise<void> {
     return
   }
   try {
-    const res = await fetch(`${thesisBase}/api/keys/openai-codex`, {
+    const res = await fetch(`${atlasBase}/api/keys/openai-codex`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${thkToken}` },
     })

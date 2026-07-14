@@ -12,7 +12,7 @@ import { Icon } from "@synsci/ui/icon"
 import { showToast } from "@synsci/ui/toast"
 import { useGlobalSDK } from "@/context/global-sdk"
 import { usePlatform } from "@/context/platform"
-import { StatusDot } from "@/thesis/shared/StatusDot"
+import { StatusDot } from "@/atlas/shared/StatusDot"
 import { settingsApi } from "./api"
 
 interface SshHost {

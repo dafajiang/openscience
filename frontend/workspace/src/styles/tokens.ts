@@ -12,7 +12,7 @@ export const FONT_MONO = FONT_SANS
  *  one product typeface (Computer Modern) so nothing can drift to a second family. */
 export const FONT_UI_SANS = FONT_SANS
 
-/** Control radius in px — keep in lockstep with --radius in thesis.css. */
+/** Control radius in px — keep in lockstep with --radius in atlas.css. */
 export const RADIUS = 4
 
 export const Z = {
@@ -32,7 +32,7 @@ export const ICON_SIZE = {
   xl: 16,
 } as const
 
-/** The one uppercase "eyebrow" label spec — mirror of .thesis-section-label. */
+/** The one uppercase "eyebrow" label spec — mirror of .atlas-section-label. */
 export const sectionTitle: JSX.CSSProperties = {
   "font-family": FONT_SANS,
   "font-size": "10px",

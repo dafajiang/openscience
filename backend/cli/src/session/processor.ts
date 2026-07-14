@@ -46,6 +46,29 @@ export namespace SessionProcessor {
     )
   }
 
+  function sharedPrefixLen(a: string, b: string): number {
+    const n = Math.min(a.length, b.length)
+    let i = 0
+    while (i < n && a[i] === b[i]) i++
+    return i
+  }
+
+  /** True when the last 3 finished assistant turns are long AND share a large
+   *  identical leading block — the repeated "continuity summary" a weak/local
+   *  model emits instead of converging on a final answer (#176). The tool-call
+   *  isDoomLoop guard can't see this: the TEXT repeats, not the tool calls. Inputs
+   *  are already-normalized turn texts (lowercased, whitespace-collapsed). Kept
+   *  conservative — 3 substantial near-identical turns in a row is a signal that
+   *  legitimate progress does not produce. */
+  export function isTextLoop(turns: string[], minLen = 400, prefix = 300): boolean {
+    if (turns.length < 3) return false
+    const last = turns.slice(-3)
+    const lengths = last.map((t) => t.length)
+    if (Math.min(...lengths) < minLen) return false
+    if (Math.max(...lengths) / Math.max(1, Math.min(...lengths)) > 1.25) return false
+    return sharedPrefixLen(last[0], last[1]) >= prefix && sharedPrefixLen(last[1], last[2]) >= prefix
+  }
+
   export type Info = Awaited<ReturnType<typeof create>>
   export type Result = Awaited<ReturnType<Info["process"]>>
 
@@ -54,12 +77,16 @@ export namespace SessionProcessor {
     sessionID: string
     model: Provider.Model
     abort: AbortSignal
+    // Status published while this processor is streaming. Compaction turns pass
+    // "compacting" so the UI can show a distinct loader.
+    busyStatus?: "busy" | "compacting"
   }) {
     const toolcalls: Record<string, MessageV2.ToolPart> = {}
     let snapshot: string | undefined
     let blocked = false
     let attempt = 0
     let needsCompaction = false
+    let overflow = false
 
     const result = {
       get message() {
@@ -71,6 +98,7 @@ export namespace SessionProcessor {
       async process(streamInput: LLM.StreamInput) {
         log.info("process")
         needsCompaction = false
+        overflow = false
         const shouldBreak = (await Config.get()).experimental?.continue_loop_on_deny !== true
         while (true) {
           try {
@@ -121,7 +149,7 @@ export namespace SessionProcessor {
               input.abort.throwIfAborted()
               switch (value.type) {
                 case "start":
-                  SessionStatus.set(input.sessionID, { type: "busy" })
+                  SessionStatus.set(input.sessionID, { type: input.busyStatus ?? "busy" })
                   break
 
                 case "reasoning-start":
@@ -337,7 +365,7 @@ export namespace SessionProcessor {
                   if (usageResult && "modelBlocked" in usageResult) {
                     log.warn("model blocked by server — halting session", { model: input.model.id })
                     // Hard stop. The user is out of credits (managed
-                    // mode) or has no active thesis subscription. The
+                    // mode) or has no active atlas subscription. The
                     // current step's response is already in their
                     // context; we just don't kick off the next loop.
                     throw new InsufficientCreditsError()
@@ -361,8 +389,36 @@ export namespace SessionProcessor {
                     sessionID: input.sessionID,
                     messageID: input.assistantMessage.parentID,
                   })
-                  if (await SessionCompaction.isOverflow({ tokens: usage.tokens, model: input.model })) {
+                  // Only compact MID-TASK — when the agent is still going (more tool calls).
+                  // On a completed answer (finish "stop"/"length"/…) we must NOT compact here:
+                  // that would auto-resume a finished request and make the agent invent
+                  // unrequested work. Instead the turn just ends and yields; the NEXT user
+                  // message trips the proactive start-of-turn check (claude-code's model).
+                  // Also skip the summary turn itself: its input IS the over-threshold history
+                  // being compacted, so it would always trip isOverflow.
+                  if (
+                    !input.assistantMessage.summary &&
+                    MessageV2.isContinuing(value.finishReason) &&
+                    (await SessionCompaction.isOverflow({ tokens: usage.tokens, model: input.model }))
+                  ) {
                     needsCompaction = true
+                  }
+                  // A "length" finish with an over-threshold token count is NOT a
+                  // finished answer — the turn was truncated mid-thought (often right
+                  // before a tool call, leaving a pending tool part). isContinuing()
+                  // excludes "length", so the block above skips it. Treat it as a
+                  // context overflow: compact history and re-run the SAME user message
+                  // against the summary, instead of exiting the loop as if the agent
+                  // was done (which strands the pending tool part → "Tool execution
+                  // aborted"). A genuine max-output truncation (small input) has
+                  // isOverflow=false and still falls through unchanged.
+                  if (
+                    !input.assistantMessage.summary &&
+                    value.finishReason === "length" &&
+                    (await SessionCompaction.isOverflow({ tokens: usage.tokens, model: input.model }))
+                  ) {
+                    overflow = true
+                    input.assistantMessage.finish = "compact"
                   }
                   break
 
@@ -424,7 +480,7 @@ export namespace SessionProcessor {
                   })
                   continue
               }
-              if (needsCompaction) break
+              if (needsCompaction || overflow) break
             }
           } catch (e: any) {
             log.error("process", {
@@ -432,28 +488,41 @@ export namespace SessionProcessor {
               stack: JSON.stringify(e.stack),
             })
             const error = MessageV2.fromError(e, { providerID: input.model.providerID })
-            const retry = SessionRetry.retryable(error)
-            if (retry !== undefined && attempt < MAX_RETRY_ATTEMPTS) {
-              attempt++
-              const delay = SessionRetry.delay(attempt, error.name === "APIError" ? error : undefined)
-              SessionStatus.set(input.sessionID, {
-                type: "retry",
-                attempt,
-                message: retry,
-                next: Date.now() + delay,
-              })
-              await SessionRetry.sleep(delay, input.abort).catch(() => {})
-              continue
+            // A context-window overflow is deterministic — retrying the same
+            // oversized input can only fail again. Signal the outer loop (via the
+            // "overflow" return below) to compact + resume instead of burning
+            // retries or surfacing an error. Checked BEFORE retryable() so it
+            // isn't swallowed by the generic "Provider Server Error" bucket.
+            overflow = SessionRetry.isContextOverflow(error)
+            if (overflow) {
+              log.info("context overflow — compacting instead of retrying", { sessionID: input.sessionID })
+              // Mark the turn finished so it isn't persisted as a blank, statusless
+              // assistant bubble; the outer loop compacts it away and resumes.
+              input.assistantMessage.finish = "compact"
             }
-            input.assistantMessage.error = error
-            // A user-initiated abort is a clean cancellation, not a failure —
-            // record it on the message (so the turn stops) but don't fire the
-            // session Error event the UI renders as an error state.
-            if (!MessageV2.AbortedError.isInstance(error)) {
-              Bus.publish(Session.Event.Error, {
-                sessionID: input.assistantMessage.sessionID,
-                error: input.assistantMessage.error,
-              })
+            if (!overflow) {
+              const retry = SessionRetry.retryable(error)
+              if (retry !== undefined && attempt < MAX_RETRY_ATTEMPTS) {
+                attempt++
+                const delay = SessionRetry.delay(attempt, error.name === "APIError" ? error : undefined)
+                SessionStatus.set(input.sessionID, {
+                  type: "retry",
+                  attempt,
+                  message: retry,
+                  next: Date.now() + delay,
+                })
+                await SessionRetry.sleep(delay, input.abort).catch(() => {})
+                continue
+              }
+              input.assistantMessage.error = error
+              // A user-initiated abort is a clean cancellation, not a failure —
+              // record it on the message but don't fire the session Error event.
+              if (!MessageV2.AbortedError.isInstance(error)) {
+                Bus.publish(Session.Event.Error, {
+                  sessionID: input.assistantMessage.sessionID,
+                  error: input.assistantMessage.error,
+                })
+              }
             }
           }
           if (snapshot) {
@@ -478,7 +547,9 @@ export namespace SessionProcessor {
                 state: {
                   ...part.state,
                   status: "error",
-                  error: "Tool execution aborted",
+                  error: overflow
+                    ? "Model output was truncated before the tool call completed (context limit); no action was taken. Compacting and retrying."
+                    : "Tool execution aborted",
                   time: {
                     start: Date.now(),
                     end: Date.now(),
@@ -489,6 +560,7 @@ export namespace SessionProcessor {
           }
           input.assistantMessage.time.completed = Date.now()
           await Session.updateMessage(input.assistantMessage)
+          if (overflow) return "overflow"
           if (needsCompaction) return "compact"
           if (blocked) return "stop"
           if (input.assistantMessage.error) return "stop"

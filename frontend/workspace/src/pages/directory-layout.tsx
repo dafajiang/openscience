@@ -10,7 +10,7 @@ import type { QuestionAnswer } from "@synsci/sdk/v2"
 import { decode64 } from "@/utils/base64"
 import { showToast } from "@synsci/ui/toast"
 import { useLanguage } from "@/context/language"
-import { centerTabs } from "@/thesis/store/centerTabs"
+import { centerTabs } from "@/atlas/store/centerTabs"
 
 export default function Layout(props: ParentProps) {
   const params = useParams()

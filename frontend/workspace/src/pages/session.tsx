@@ -8,39 +8,41 @@ import {
   onCleanup,
   onMount,
   Show,
+  Suspense,
   Switch,
   type JSX,
 } from "solid-js"
 import { useNavigate, useParams } from "@solidjs/router"
 import { SessionTurn } from "@synsci/ui/session-turn"
+import { createAutoScroll } from "@synsci/ui/hooks"
 import { useSync } from "@/context/sync"
 import { useSDK } from "@/context/sdk"
 import { useLayout } from "@/context/layout"
 import { useTheme } from "@synsci/ui/theme"
 import { PromptInput } from "@/components/prompt-input"
 import { NewSessionView } from "@/components/session/session-new-view"
-import { Wordmark } from "@/thesis/Wordmark"
-import { AppHeader, HeaderIconButton, HeaderDivider } from "@/thesis/AppHeader"
-import { RightPane } from "@/thesis/RightPane"
-import { FileExplorer } from "@/thesis/FileExplorer"
-import { FileView } from "@/thesis/FilePreview"
-import SkillsPage from "@/thesis/SkillsPage"
-import { centerTabs } from "@/thesis/store/centerTabs"
-import { FONT_MONO, FONT_SANS, FONT_SERIF } from "@/styles/tokens"
-import { uiStore } from "@/thesis/store/ui"
-import { useGlobalKeys } from "@/thesis/useGlobalKeys"
+import { AsciiSpinner } from "@/atlas/shared/AsciiSpinner"
+import { Wordmark } from "@/atlas/Wordmark"
+import { AppHeader, HeaderIconButton, HeaderDivider } from "@/atlas/AppHeader"
+import { RightPane } from "@/atlas/RightPane"
+import { FileExplorer } from "@/atlas/FileExplorer"
+import { FileView } from "@/atlas/FilePreview"
+import SkillsPage from "@/atlas/SkillsPage"
+import { centerTabs } from "@/atlas/store/centerTabs"
+import { FONT_MONO, FONT_SANS } from "@/styles/tokens"
+import { uiStore } from "@/atlas/store/ui"
+import { useGlobalKeys } from "@/atlas/useGlobalKeys"
 import { useDialog } from "@synsci/ui/context/dialog"
-import { useModels } from "@/context/models"
 import { useCommand, type CommandOption } from "@/context/command"
 import { useLanguage } from "@/context/language"
-import { openSetupDialog } from "@/thesis/SetupDialog"
-import { confirmDialog } from "@/thesis/dialogs"
+import { confirmDialog } from "@/atlas/dialogs"
 import { DialogSettings } from "@/components/dialog-settings"
-import { DisconnectedPanel } from "@/thesis/DisconnectedPanel"
-import { CommandPalette } from "@/thesis/CommandPalette"
-import { HelpOverlay } from "@/thesis/HelpOverlay"
-import { ToastContainer } from "@/thesis/Toast"
+import { DisconnectedPanel } from "@/atlas/DisconnectedPanel"
+import { CommandPalette } from "@/atlas/CommandPalette"
+import { HelpOverlay } from "@/atlas/HelpOverlay"
+import { ToastContainer } from "@/atlas/Toast"
 import {
+  IconChevronDown,
   IconChevronLeft,
   IconPlus,
   IconSearch,
@@ -53,11 +55,11 @@ import {
   IconFile,
   IconBrain,
   IconX,
-} from "@/thesis/shared/Icon"
-import { StatusDot } from "@/thesis/shared/StatusDot"
+} from "@/atlas/shared/Icon"
+import { StatusDot } from "@/atlas/shared/StatusDot"
 import { DateTime } from "luxon"
-import { IconTrash } from "@/thesis/shared/Icon"
-import { toast } from "@/thesis/Toast"
+import { IconTrash } from "@/atlas/shared/Icon"
+import { toast } from "@/atlas/Toast"
 
 type SyncSession = ReturnType<typeof useSync>["data"]["session"][number]
 
@@ -238,6 +240,23 @@ export default function Page(): JSX.Element {
     const revertID = revertInfo()?.messageID
     return messages().filter((m) => m.role === "user" && (!revertID || m.id < revertID))
   })
+  const sessionStatus = createMemo(() =>
+    params.id ? (sync.data.session_status?.[params.id] as { type?: string } | undefined)?.type : undefined,
+  )
+  // A message is a compaction boundary when it carries a `compaction` part.
+  const hasCompactionPart = (id: string) => (sync.data.part[id] ?? []).some((p) => p.type === "compaction")
+  // While compacting, an inline loader replaces the divider on the compaction
+  // message currently being summarized (the most recent one). Once compaction
+  // finishes the status leaves "compacting" and it becomes the "context
+  // compacted" divider; older boundaries always render as dividers.
+  const compactingMessageId = createMemo(() => {
+    if (sessionStatus() !== "compacting") return undefined
+    const msgs = turnMessages()
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (hasCompactionPart(msgs[i].id)) return msgs[i].id
+    }
+    return undefined
+  })
   const revertedCount = createMemo(() => {
     const revertID = revertInfo()?.messageID
     if (!revertID) return 0
@@ -305,6 +324,42 @@ export default function Page(): JSX.Element {
         onSelect: () => void restoreRevert(),
       })
     }
+    // /compact — summarize the conversation to free up context. Runs the backend
+    // compaction action (model/agent default to the session's last); it does NOT
+    // prefill text, so it must be a builtin option, not a `sync.data.command`
+    // entry (those prefill). The backend command is deduped out of the prompt
+    // menu's custom list by its `menu` flag.
+    list.push({
+      id: "session.compact",
+      title: "Compact conversation",
+      description: "Summarize the conversation so far to free up context",
+      category: language.t("command.category.session"),
+      slash: "compact",
+      onSelect: () => {
+        void sdk.client.session
+          .command({ sessionID: id, command: "compact", arguments: "" } as any)
+          .catch((e: unknown) => {
+            console.error("compact failed", e)
+            toast.error("could not compact", e instanceof Error ? e.message : String(e))
+          })
+      },
+    })
+    // /handoff — write a self-contained handoff.md for another agent, then compact.
+    list.push({
+      id: "session.handoff",
+      title: "Write handoff & compact",
+      description: "Write a self-contained handoff.md for another agent, then compact",
+      category: language.t("command.category.session"),
+      slash: "handoff",
+      onSelect: () => {
+        void sdk.client.session
+          .command({ sessionID: id, command: "handoff", arguments: "" } as any)
+          .catch((e: unknown) => {
+            console.error("handoff failed", e)
+            toast.error("could not write handoff", e instanceof Error ? e.message : String(e))
+          })
+      },
+    })
     return list
   })
 
@@ -330,73 +385,45 @@ export default function Page(): JSX.Element {
     if (centerTabs.active() === "skills") setVisitedSkills(true)
   })
 
-  // Chat scroll. The container resizes whenever the right pane opens/closes
-  // (the chat column narrows/widens) or the window changes size. A bare reflow
-  // can drop the scroll position to the top, so we track whether the user is
-  // pinned to the bottom and re-anchor on every resize via a ResizeObserver —
-  // sticking to the bottom when they were reading the latest output, or
-  // preserving their distance from the bottom when they had scrolled up.
-  let scrollRef: HTMLDivElement | undefined
-  let scrollObserver: ResizeObserver | undefined
-  let boundScroll: HTMLDivElement | undefined
-  const NEAR_BOTTOM_PX = 120
-  let pinnedToBottom = true
-  let distanceFromBottom = 0
-
-  const recordScroll = () => {
-    if (!scrollRef) return
-    distanceFromBottom = scrollRef.scrollHeight - scrollRef.scrollTop - scrollRef.clientHeight
-    pinnedToBottom = distanceFromBottom <= NEAR_BOTTOM_PX
-  }
-
-  const stickToBottom = () => {
-    if (scrollRef) scrollRef.scrollTop = scrollRef.scrollHeight
-  }
-
-  const reanchor = () => {
-    if (!scrollRef) return
-    if (pinnedToBottom) stickToBottom()
-    else scrollRef.scrollTop = Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight - distanceFromBottom)
-  }
-
-  const attachScroll = (el: HTMLDivElement) => {
-    if (boundScroll === el) return
-    if (scrollObserver) scrollObserver.disconnect()
-    if (boundScroll) boundScroll.removeEventListener("scroll", recordScroll)
-    boundScroll = el
-    scrollRef = el
-    pinnedToBottom = true
-    el.addEventListener("scroll", recordScroll, { passive: true })
-    // First callback fires synchronously on observe; ignore it (initial layout)
-    // and only re-anchor on genuine resizes after that.
-    let primed = false
-    scrollObserver = new ResizeObserver(() => {
-      if (!primed) {
-        primed = true
-        return
-      }
-      reanchor()
-    })
-    scrollObserver.observe(el)
-  }
-
-  onCleanup(() => {
-    if (scrollObserver) scrollObserver.disconnect()
-    if (boundScroll) boundScroll.removeEventListener("scroll", recordScroll)
+  // Chat scroll: stick to the bottom while the agent streams; detach the
+  // moment the user scrolls up (a "jump to latest" button re-attaches).
+  // Follow is driven by content growth (ResizeObserver on the content
+  // wrapper), not message count, so streamed part updates keep the view
+  // pinned instead of only re-anchoring on new messages / container resize.
+  const working = createMemo(() => {
+    const id = params.id
+    if (!id) return false
+    const status = sync.data.session_status?.[id]
+    return !!status && status.type !== "idle"
   })
 
-  // New messages / session switch → keep the latest output in view when the
-  // user is pinned to the bottom (don't yank them down if they scrolled up).
+  const chatScroll = createAutoScroll({
+    working,
+    overflowAnchor: "dynamic",
+    bottomThreshold: 120,
+  })
+
+  // Re-pin when the user switches sessions, and on initial mount once
+  // messages populate (covers direct URL / bookmark / refresh into a long,
+  // idle session, where createAutoScroll's settling window would otherwise
+  // expire before async-loaded messages render).
   createEffect(
     on(
-      () => [messages().length, params.id],
-      ([, id], prev) => {
-        const sessionChanged = !prev || prev[1] !== id
-        if (sessionChanged) pinnedToBottom = true
-        if (scrollRef && pinnedToBottom)
-          requestAnimationFrame(() => {
-            if (scrollRef && pinnedToBottom) stickToBottom()
-          })
+      () => [params.id, messages().length > 0] as const,
+      ([, hasMessages]) => {
+        if (!hasMessages) return
+        // A turn's markdown/code-highlight/katex renders progressively AFTER the
+        // message array populates, growing scrollHeight over ~1s. An idle session
+        // isn't in follow-mode, so createAutoScroll won't track that growth — a
+        // single scroll lands at the early bottom. Re-pin across the load window
+        // (bail the moment the user scrolls up, so we never fight them).
+        chatScroll.forceScrollToBottom()
+        const timers = [80, 200, 450, 800, 1200].map((ms) =>
+          setTimeout(() => {
+            if (!chatScroll.userScrolled()) chatScroll.forceScrollToBottom()
+          }, ms),
+        )
+        onCleanup(() => timers.forEach(clearTimeout))
       },
     ),
   )
@@ -405,9 +432,19 @@ export default function Page(): JSX.Element {
     if (project()) layout.projects.open(project()!.worktree)
   })
 
+  // Re-anchor a bottom-following view on viewport-height changes with no new
+  // content (window resize, right-pane toggle, mobile virtual keyboard).
+  onMount(() => {
+    const onResize = () => {
+      if (!chatScroll.userScrolled()) chatScroll.forceScrollToBottom()
+    }
+    window.addEventListener("resize", onResize)
+    onCleanup(() => window.removeEventListener("resize", onResize))
+  })
+
   return (
     <div
-      class="thesis-root"
+      class="atlas-root"
       style={{
         flex: 1,
         display: "flex",
@@ -488,70 +525,172 @@ export default function Page(): JSX.Element {
             >
               <Switch>
                 <Match when={params.id && messages().length > 0}>
+                  {/* Scoped to just the scroll area (not the revert banner / Composer
+                      below) so the jump-to-latest pill's position:absolute resolves
+                      against this box instead of the whole chat column. */}
                   <div
-                    ref={attachScroll}
-                    class="thesis-scroll thesis-chat-scroll session-scroller"
                     style={{
+                      position: "relative",
                       flex: 1,
                       "min-height": 0,
-                      "overflow-y": "auto",
-                      "overflow-x": "hidden",
-                      position: "relative",
+                      display: "flex",
+                      "flex-direction": "column",
                     }}
                   >
-                    {/* Sticky title + back-to-parent (sub-agent) header */}
-                    <Show when={activeSession()?.title || activeSession()?.parentID}>
-                      <div class="sticky top-0 z-30 bg-background-stronger w-full">
-                        <div class="w-full px-4 md:px-6 md:max-w-200 md:mx-auto">
-                          <div class="h-10 flex items-center gap-1.5">
-                            <Show when={activeSession()?.parentID}>
-                              <button
-                                type="button"
-                                class="flex items-center justify-center size-7 shrink-0 rounded-md text-text-weak hover:text-text-base hover:bg-surface-base-hover transition-colors"
-                                aria-label="Back to parent session"
-                                onClick={() => navigate(`/${params.dir}/session/${activeSession()!.parentID}`)}
-                              >
-                                <IconChevronLeft />
-                              </button>
-                            </Show>
-                            <Show when={activeSession()?.title}>
-                              <EditableTitle
-                                title={activeSession()!.title!}
-                                onRename={(t) => void renameSession(activeSession()!.id, t)}
-                              />
-                            </Show>
+                    <div
+                      ref={chatScroll.scrollRef}
+                      onScroll={chatScroll.handleScroll}
+                      onClick={chatScroll.handleInteraction}
+                      class="atlas-scroll atlas-chat-scroll session-scroller"
+                      style={{
+                        flex: 1,
+                        "min-height": 0,
+                        "overflow-y": "auto",
+                        "overflow-x": "hidden",
+                      }}
+                    >
+                      {/* Sub-agent back-to-parent header only. Normal chats render
+                          NO fixed header — the sticky session title used to sit on top
+                          of the conversation and block content. The title is still
+                          shown/renamable in the session list. Kept outside contentRef
+                          so the ResizeObserver measures only the growing message list. */}
+                      <Show when={activeSession()?.parentID}>
+                        <div class="sticky top-0 z-30 bg-background-stronger w-full">
+                          <div class="w-full px-4 md:px-6 md:max-w-200 md:mx-auto">
+                            <div class="h-10 flex items-center gap-1.5">
+                              <Show when={activeSession()?.parentID}>
+                                <button
+                                  type="button"
+                                  class="flex items-center justify-center size-7 shrink-0 rounded-md text-text-weak hover:text-text-base hover:bg-surface-base-hover transition-colors"
+                                  aria-label="Back to parent session"
+                                  onClick={() => navigate(`/${params.dir}/session/${activeSession()!.parentID}`)}
+                                >
+                                  <IconChevronLeft />
+                                </button>
+                              </Show>
+                              <Show when={activeSession()?.title}>
+                                <EditableTitle
+                                  title={activeSession()!.title!}
+                                  onRename={(t) => void renameSession(activeSession()!.id, t)}
+                                />
+                              </Show>
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    </Show>
+                      </Show>
 
-                    {/* Centered conversation column with 2px between-turn divider */}
-                    <div class="w-full md:max-w-200 md:mx-auto flex flex-col items-start justify-start pt-3 pb-[calc(10rem+64px)]">
-                      <For each={turnMessages()}>
-                        {(message, index) => (
-                          <div data-message-id={message.id} class="min-w-0 w-full max-w-full">
-                            <SessionTurn
-                              sessionID={params.id!}
-                              messageID={message.id}
-                              lastUserMessageID={lastUserMessage()?.id}
-                              stepsExpanded={stepsExpanded()[message.id] ?? false}
-                              onStepsExpandedToggle={() => toggleSteps(message.id)}
-                              classes={{
-                                root: "min-w-0 w-full relative",
-                                content: "flex flex-col justify-between !overflow-visible",
-                                container: "w-full px-4 md:px-6",
-                              }}
-                            />
-                            {/* The v1.1.116 between-turns rule */}
-                            <Show when={index() < turnMessages().length - 1}>
-                              <div class="w-full px-4 md:px-6 pt-2 pb-1">
-                                <div class="h-[2px] bg-border-weak-base rounded-full" />
-                              </div>
-                            </Show>
-                          </div>
-                        )}
-                      </For>
+                      {/* Centered conversation column with 2px between-turn divider */}
+                      <div
+                        ref={chatScroll.contentRef}
+                        class="w-full md:max-w-200 md:mx-auto flex flex-col items-start justify-start pt-3 pb-[calc(10rem+64px)]"
+                      >
+                        <For each={turnMessages()}>
+                          {(message, index) => (
+                            <div data-message-id={message.id} class="min-w-0 w-full max-w-full">
+                              <Show
+                                when={!hasCompactionPart(message.id)}
+                                fallback={
+                                  <Show
+                                    when={message.id === compactingMessageId()}
+                                    fallback={
+                                      <div
+                                        style={{
+                                          display: "flex",
+                                          "align-items": "center",
+                                          gap: "10px",
+                                          padding: "2px 16px",
+                                          "font-size": "11px",
+                                          "letter-spacing": "0.06em",
+                                          "text-transform": "uppercase",
+                                          color: "var(--color-text-faint)",
+                                        }}
+                                      >
+                                        <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
+                                        <span>context compacted</span>
+                                        <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
+                                      </div>
+                                    }
+                                  >
+                                    <div
+                                      style={{
+                                        display: "flex",
+                                        "align-items": "center",
+                                        "justify-content": "center",
+                                        gap: "8px",
+                                        padding: "6px 16px",
+                                        "font-family": FONT_MONO,
+                                        "font-size": "11px",
+                                        "letter-spacing": "0.06em",
+                                        "text-transform": "uppercase",
+                                        color: "var(--color-text-faint)",
+                                      }}
+                                    >
+                                      <AsciiSpinner size={10} />
+                                      <span>compacting conversation…</span>
+                                    </div>
+                                  </Show>
+                                }
+                              >
+                                <SessionTurn
+                                  sessionID={params.id!}
+                                  messageID={message.id}
+                                  lastUserMessageID={lastUserMessage()?.id}
+                                  stepsExpanded={stepsExpanded()[message.id] ?? false}
+                                  onStepsExpandedToggle={() => toggleSteps(message.id)}
+                                  classes={{
+                                    root: "min-w-0 w-full relative",
+                                    content: "flex flex-col justify-between !overflow-visible",
+                                    container: "w-full px-4 md:px-6",
+                                  }}
+                                />
+                              </Show>
+                              {/* The v1.1.116 between-turns rule — skipped for a
+                                  compaction row, which already draws its own "context
+                                  compacted" divider (avoids a doubled rule). */}
+                              <Show when={index() < turnMessages().length - 1 && !hasCompactionPart(message.id)}>
+                                <div class="w-full px-4 md:px-6 pt-2 pb-1">
+                                  <div class="h-[2px] bg-border-weak-base rounded-full" />
+                                </div>
+                              </Show>
+                            </div>
+                          )}
+                        </For>
+                      </div>
                     </div>
+
+                    <Show when={chatScroll.userScrolled()}>
+                      <button
+                        type="button"
+                        onClick={() => chatScroll.forceScrollToBottom()}
+                        title="Jump to latest"
+                        style={{
+                          position: "absolute",
+                          // The content column reserves calc(10rem + 64px) of bottom
+                          // padding (above) so the last message clears the absolute
+                          // prompt dock; land the pill just above that same
+                          // reservation so the dock doesn't sit on top of it.
+                          bottom: "calc(10rem + 64px + 16px)",
+                          left: "50%",
+                          transform: "translateX(-50%)",
+                          display: "inline-flex",
+                          "align-items": "center",
+                          gap: "6px",
+                          padding: "6px 12px",
+                          "border-radius": "999px",
+                          border: "1px solid var(--color-border-strong)",
+                          background: "var(--color-surface-solid)",
+                          "box-shadow": "var(--shadow-md)",
+                          "font-family": FONT_MONO,
+                          "font-size": "11px",
+                          color: "var(--color-text)",
+                          cursor: "pointer",
+                          "z-index": 6,
+                        }}
+                      >
+                        <IconChevronDown size={13} strokeWidth={1.6} />
+                        jump to latest
+                      </button>
+                    </Show>
                   </div>
                 </Match>
                 <Match when={true}>
@@ -632,7 +771,12 @@ export default function Page(): JSX.Element {
                   "flex-direction": "column",
                 }}
               >
-                <SkillsPage />
+                {/* Local boundary: SkillsPage reads its skills resource eagerly, so
+                    its first-load suspend must stay in this pane, not blank the
+                    whole session via the coarse route-level <Suspense>. */}
+                <Suspense fallback={<PaneLoading />}>
+                  <SkillsPage />
+                </Suspense>
               </div>
             </Show>
 
@@ -647,12 +791,18 @@ export default function Page(): JSX.Element {
                     "flex-direction": "column",
                   }}
                 >
-                  <FileView
-                    path={doc.path}
-                    directory={doc.directory}
-                    subtitle={`This computer · ${doc.directory.replace(/\/$/, "")}/${doc.path}`}
-                    onClose={() => centerTabs.closeDoc(doc.id)}
-                  />
+                  {/* Local boundary: FileView reads its `file` resource eagerly (the
+                      `kind` memo forces it at mount), so opening a NEW file suspends.
+                      Contain it here so the doc tab shows a local spinner instead of
+                      blanking the entire session through the route-level <Suspense>. */}
+                  <Suspense fallback={<PaneLoading />}>
+                    <FileView
+                      path={doc.path}
+                      directory={doc.directory}
+                      subtitle={`This computer · ${doc.directory.replace(/\/$/, "")}/${doc.path}`}
+                      onClose={() => centerTabs.closeDoc(doc.id)}
+                    />
+                  </Suspense>
                 </div>
               )}
             </For>
@@ -665,11 +815,22 @@ export default function Page(): JSX.Element {
   )
 }
 
+// Pane-scoped Suspense fallback — a small centered spinner shown while an
+// interaction-mounted pane (a file view, the Skills catalog) loads its data,
+// so the load can't reach the route-level boundary and blank the whole session.
+function PaneLoading(): JSX.Element {
+  return (
+    <div style={{ flex: 1, display: "flex", "align-items": "center", "justify-content": "center" }}>
+      <AsciiSpinner size={10} label="loading…" color="var(--color-text-faint)" />
+    </div>
+  )
+}
+
 function CenterTabStrip(props: { chatTitle: string }): JSX.Element {
   const active = centerTabs.active
   return (
     <div
-      class="thesis-scroll"
+      class="atlas-scroll"
       style={{
         display: "flex",
         "align-items": "stretch",
@@ -956,7 +1117,7 @@ function SessionsSidebar(props: {
   })
   return (
     <aside
-      class="thesis-scroll"
+      class="atlas-scroll"
       style={{
         width: "240px",
         "min-width": "240px",
@@ -1321,155 +1482,3 @@ function SessionRow(props: {
     </div>
   )
 }
-
-function ChatWelcome(): JSX.Element {
-  const models = useModels()
-  const dialog = useDialog()
-  // No connected provider yields any model → the composer's model() stays
-  // undefined. Surface a real setup CTA instead of leading into that dead-end.
-  const noModel = () => models.list().length === 0
-  return (
-    <div
-      class="thesis-fade-in"
-      style={{
-        flex: 1,
-        display: "flex",
-        "flex-direction": "column",
-        "justify-content": "center",
-        gap: "18px",
-        padding: "0 32px",
-        "max-width": "540px",
-        "margin-inline": "auto",
-        width: "100%",
-      }}
-    >
-      <h2
-        style={{
-          margin: 0,
-          "font-family": FONT_SERIF,
-          "font-size": "22px",
-          "line-height": 1.15,
-          "font-weight": 400,
-          "letter-spacing": "-0.02em",
-          color: "var(--color-text)",
-        }}
-      >
-        What are we working on?
-        <span class="thesis-blink" style={{ color: "var(--color-text-faint)" }}>
-          _
-        </span>
-      </h2>
-
-      <Show when={noModel()}>
-        <div style={{ display: "flex", "flex-direction": "column", gap: "8px" }}>
-          <p
-            style={{
-              margin: 0,
-              "font-family": FONT_SANS,
-              "font-size": "13px",
-              color: "var(--color-text-faint)",
-              "line-height": 1.5,
-            }}
-          >
-            No model is connected yet — set one up to start, with managed credits or your own key.
-          </p>
-          <button
-            type="button"
-            onClick={() => openSetupDialog(dialog)}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              "align-self": "flex-start",
-              display: "inline-flex",
-              "align-items": "center",
-              gap: "6px",
-              height: "34px",
-              padding: "0 16px",
-              "border-radius": "4px",
-              background: "var(--color-accent)",
-              color: "var(--color-on-accent)",
-              "font-family": FONT_MONO,
-              "font-size": "12px",
-            }}
-          >
-            Set up models →
-          </button>
-        </div>
-      </Show>
-
-      <div style={{ display: "flex", "flex-wrap": "wrap", gap: "6px" }}>
-        <For each={WELCOME_MODES}>
-          {(m) => (
-            <button
-              type="button"
-              onClick={() => uiStore.setAgent(m.name)}
-              title={m.hint}
-              style={{
-                all: "unset",
-                cursor: "pointer",
-                padding: "5px 12px",
-                "border-radius": "4px",
-                border: uiStore.agent() === m.name ? "1px solid var(--color-border)" : "1px solid transparent",
-                background: uiStore.agent() === m.name ? "var(--color-accent-subtle)" : "transparent",
-                "font-family": FONT_MONO,
-                "font-size": "11px",
-                color: uiStore.agent() === m.name ? "var(--color-text)" : "var(--color-text-muted)",
-                transition: "border-color 120ms ease, background 120ms ease, color 120ms ease",
-              }}
-              onMouseEnter={(e) => {
-                if (uiStore.agent() !== m.name) e.currentTarget.style.background = "var(--color-bg-elevated)"
-              }}
-              onMouseLeave={(e) => {
-                if (uiStore.agent() !== m.name) e.currentTarget.style.background = "transparent"
-              }}
-            >
-              {m.name}
-            </button>
-          )}
-        </For>
-      </div>
-
-      <div style={{ display: "flex", "flex-direction": "column", gap: "1px" }}>
-        <For each={WELCOME_PROMPTS}>
-          {(p) => (
-            <button
-              type="button"
-              onClick={() => uiStore.setPrefill(p)}
-              style={{
-                all: "unset",
-                cursor: "pointer",
-                display: "flex",
-                "align-items": "baseline",
-                gap: "9px",
-                padding: "7px 2px",
-                "font-family": FONT_SANS,
-                "font-size": "13px",
-                "line-height": 1.5,
-                color: "var(--color-text-faint)",
-                transition: "color 120ms ease",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--color-text)")}
-              onMouseLeave={(e) => (e.currentTarget.style.color = "var(--color-text-faint)")}
-            >
-              <span style={{ color: "var(--color-text-faint)", "flex-shrink": 0 }}>→</span>
-              {p}
-            </button>
-          )}
-        </For>
-      </div>
-    </div>
-  )
-}
-
-const WELCOME_MODES: { name: string; hint: string }[] = [
-  { name: "research", hint: "literature + analysis" },
-  { name: "biology", hint: "computational biology" },
-  { name: "physics", hint: "simulation + theory" },
-  { name: "ml", hint: "train + evaluate models" },
-]
-
-const WELCOME_PROMPTS: string[] = [
-  "Survey recent work on this repo's research question and summarize open problems.",
-  "Reproduce the main result and report what's missing to run it end-to-end.",
-  "Draft an experiment plan with hypotheses, metrics, and ablations.",
-]

@@ -7,7 +7,6 @@ import path from "path"
 import fs from "fs/promises"
 import { Global } from "@/global"
 import { Session } from "@/session"
-import { MessageV2 } from "@/session/message-v2"
 import { Log } from "@/util/log"
 import { RLMState } from "../rlm/state"
 import { RSICritic } from "./critic"
@@ -42,7 +41,6 @@ export namespace RSITrajectory {
    *  Called asynchronously after the session loop exits. */
   export async function capture(sessionID: string): Promise<Trajectory | null> {
     try {
-      const session = await Session.get(sessionID)
       const messages = await Session.messages({ sessionID })
 
       if (!messages.length) return null

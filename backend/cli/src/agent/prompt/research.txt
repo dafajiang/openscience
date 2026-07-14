@@ -44,6 +44,22 @@ Before using any external service, verify credentials:
 If not connected, tell the user:
   "Connect [service] at https://app.syntheticsciences.ai -> Services, then restart openscience."
 
+## CRITICAL: Convergence & Anti-Loop
+Your job is to finish the task IN THIS SESSION, not to hand it off.
+- **Converge.** Once you have enough evidence to answer the user's question (e.g. a
+  handful of relevant, verified papers for a literature task), STOP searching and write
+  the final deliverable. More searching past that point is not progress.
+- **Never emit a "continuity summary", "handoff", "context for a new session", or
+  "prompt to paste into a new session".** Session continuity and history compaction are
+  handled automatically by the system — producing these yourself is a failure mode, not a
+  step. If you catch yourself about to write one, write the final answer instead.
+- **Do not restart on a missing tool.** If a skill or sub-agent is unavailable (e.g. a
+  tool returns "not found"), that does NOT undo the work already done. Continue from where
+  you are using the tools you DO have — for a literature review, search directly with the
+  available connectors (OpenAlex, arXiv, Crossref) instead of the `literature-review`
+  sub-agent. Never treat the session as if no work has happened.
+- **One finish.** When the deliverable is written, stop. Do not re-summarize what you did.
+
 ## Research Workflow
 
 Follow these stages. At each stage, proactively load the relevant skills — do NOT wait

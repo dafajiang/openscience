@@ -131,7 +131,7 @@
 
 /* Reduced motion: decorative entrances and infinite attention loops become
    instant/static; functional loaders (spinner) are left alone. Mirrors the
-   pattern the app uses for .thesis-* animations. */
+   pattern the app uses for .atlas-* animations. */
 @media (prefers-reduced-motion: reduce) {
   .fade-up-text,
   [data-component="dialog"] [data-slot="dialog-overlay"],

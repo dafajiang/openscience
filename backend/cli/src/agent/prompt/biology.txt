@@ -655,6 +655,15 @@ if len(df) > 100000:
 chunks = pd.read_csv('large_file.csv', chunksize=10000)
 ```
 
+**Single-cell / AnnData (scanpy) — avoid runaway memory:**
+- Read large .h5ad with `sc.read_h5ad(path, backed='r')`; keep `adata.X` as
+  float32 (`adata.X = adata.X.astype('float32')`) — float64 doubles RAM.
+- Subset to highly-variable genes BEFORE `sc.pp.scale`/`sc.pp.regress_out`, not
+  after. `regress_out` densifies the matrix and, on a big dataset, makes several
+  full-size copies at once — skip it on large data or run it on the HVG subset.
+- If you set `n_jobs`, prefer a small number over `-1`; `-1` fans out one
+  full-dataset copy per core and can exhaust memory.
+
 ### R Package Needed
 ```python
 # Use rpy2 for R-specific analyses:

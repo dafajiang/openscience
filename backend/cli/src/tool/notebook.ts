@@ -248,7 +248,12 @@ class PythonKernel implements Kernel {
     })
     const proc = spawn(sandboxed.file, sandboxed.args, {
       cwd: opts?.cwd ?? Instance.directory,
-      env: { ...(await OpenScience.subprocessEnv(process.env)), ...(opts?.env ?? {}), PYTHONUNBUFFERED: "1" },
+      env: {
+        ...(await OpenScience.subprocessEnv(process.env)),
+        ...OpenScience.pythonThreadCapEnv(process.env),
+        ...(opts?.env ?? {}),
+        PYTHONUNBUFFERED: "1",
+      },
       stdio: ["pipe", "pipe", "pipe"],
     })
     this.proc = proc

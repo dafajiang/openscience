@@ -9,7 +9,7 @@ import { showToast } from "@synsci/ui/toast"
 import { useDialog } from "@synsci/ui/context/dialog"
 import { useGlobalSDK } from "@/context/global-sdk"
 import { usePlatform } from "@/context/platform"
-import { uiStore } from "@/thesis/store/ui"
+import { uiStore } from "@/atlas/store/ui"
 import { settingsApi } from "./api"
 
 interface Detected {

@@ -11,6 +11,7 @@ import { Agent } from "../agent/agent"
 import { Provider } from "../provider/provider"
 import { type Tool as AITool, tool, jsonSchema, type ToolCallOptions } from "ai"
 import { SessionCompaction } from "./compaction"
+import { SessionTelemetry } from "./telemetry"
 import { Instance } from "../project/instance"
 import { Bus } from "../bus"
 import { ProviderTransform } from "../provider/transform"
@@ -94,6 +95,19 @@ export namespace SessionPrompt {
       }
     },
   )
+
+  // Decode the text payload of a data: URL (data:<mime>[;base64],<payload>) — an
+  // uploaded .txt/.md arrives this way. Only the part after the comma is the
+  // payload; base64url-decoding the whole URL left a ~12-byte garbage prefix from
+  // "data:text/plain," on the inlined text (#170). FileReader.readAsDataURL always
+  // emits the ;base64 form; a hand-written percent-encoded data URL is also handled.
+  export function decodeDataUrlText(url: string): string {
+    const comma = url.indexOf(",")
+    const payload = comma === -1 ? url : url.slice(comma + 1)
+    return url.slice(0, comma).includes(";base64")
+      ? Buffer.from(payload, "base64").toString()
+      : decodeURIComponent(payload)
+  }
 
   export function assertNotBusy(sessionID: string) {
     const match = state()[sessionID]
@@ -279,6 +293,11 @@ export namespace SessionPrompt {
       item.reject()
     }
     delete s[sessionID]
+    // Flush any coalesced (debounced) streaming part writes now, so the final
+    // text/reasoning content is durable the moment the turn goes idle. cancel()
+    // is sync (invoked from a `using` disposer), so this can't be awaited; log
+    // instead of leaving an unhandled rejection.
+    void Session.flushPendingParts(sessionID).catch((e) => log.error("flushPendingParts failed", { error: e }))
     SessionStatus.set(sessionID, { type: "idle" })
     return
   }
@@ -295,7 +314,28 @@ export namespace SessionPrompt {
     using _ = defer(() => cancel(sessionID))
 
     let step = 0
+    // Consecutive context-overflow compactions for the current unanswered turn.
+    // Reset on any non-overflow result; a second overflow means the pending
+    // message itself is too large to ever fit.
+    let overflowCompactions = 0
+    // Compact once, then don't compact again until context drops back under the
+    // threshold. Prevents an infinite compaction loop when fixed system+tool+
+    // summary overhead alone already exceeds the 0.75 threshold.
+    let compactionArmed = true
     const session = await Session.get(sessionID)
+    // Text doom-loop guard (#176): weak/local models sometimes emit a near-identical
+    // "continuity summary" turn over and over instead of converging on an answer.
+    // The processor's doom-loop guard can't catch it — the TOOL calls vary (or are
+    // absent), only the TEXT repeats. Normalize an assistant turn's own text;
+    // SessionProcessor.isTextLoop does the (unit-tested) detection.
+    const turnText = (m: MessageV2.WithParts) =>
+      m.parts
+        .filter((p) => p.type === "text" && !p.synthetic && !p.ignored)
+        .map((p) => (p as MessageV2.TextPart).text)
+        .join("\n")
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim()
     while (true) {
       SessionStatus.set(sessionID, { type: "busy" })
       log.info("loop", { step, sessionID })
@@ -304,12 +344,16 @@ export namespace SessionPrompt {
 
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
+      let lastAssistantMsg: MessageV2.WithParts | undefined
       let lastFinished: MessageV2.Assistant | undefined
       let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
       for (let i = msgs.length - 1; i >= 0; i--) {
         const msg = msgs[i]
         if (!lastUser && msg.info.role === "user") lastUser = msg.info as MessageV2.User
-        if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info as MessageV2.Assistant
+        if (!lastAssistant && msg.info.role === "assistant") {
+          lastAssistant = msg.info as MessageV2.Assistant
+          lastAssistantMsg = msg
+        }
         if (!lastFinished && msg.info.role === "assistant" && msg.info.finish)
           lastFinished = msg.info as MessageV2.Assistant
         if (lastUser && lastFinished) break
@@ -320,17 +364,86 @@ export namespace SessionPrompt {
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+      const user = lastUser
+      // Terminal for "input exceeds the window and compaction can't help":
+      // either the summarization itself overflowed, or the input is still too
+      // big after one compaction. Surface an actionable error, never loop.
+      const failTooLarge = async (message?: string) => {
+        // Attach the terminal error under the user's real prompt, not a synthetic
+        // bookkeeping message — the compaction carrier (only a compaction marker) OR
+        // the auto-resume "Continue if you have next steps" turn (only synthetic text)
+        // — otherwise the errored assistant turn hangs off internal bookkeeping. A
+        // real prompt has at least one non-compaction, non-synthetic content part.
+        const realUser =
+          (msgs.findLast(
+            (m) =>
+              m.info.role === "user" &&
+              m.parts.some((p) => p.type !== "compaction" && !(p.type === "text" && p.synthetic)),
+          )?.info as MessageV2.User | undefined) ?? user
+        const error = new NamedError.Unknown({
+          message:
+            message ??
+            "This message is too large for the model's context window, even after summarizing earlier history. Shorten it or start a new session.",
+        }).toObject()
+        Bus.publish(Session.Event.Error, { sessionID, error })
+        await Session.updateMessage({
+          id: await MessageV2.nextMessageID(sessionID),
+          role: "assistant",
+          parentID: realUser.id,
+          sessionID,
+          mode: realUser.agent,
+          agent: realUser.agent,
+          path: { cwd: Instance.directory, root: Instance.worktree },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: realUser.model.modelID,
+          providerID: realUser.model.providerID,
+          error,
+          time: { created: Date.now(), completed: Date.now() },
+        })
+      }
+      const compact = (trigger: "proactive" | "overflow" = "proactive") =>
+        SessionCompaction.create({ sessionID, agent: user.agent, model: user.model, auto: true, trigger })
+      // Latched compaction: fire once, then not again until context drops back under
+      // the threshold (re-arm happens in the reactive branch). Returns whether it fired.
+      const armedCompact = async () => {
+        if (!compactionArmed) return false
+        compactionArmed = false
+        try {
+          await compact()
+        } catch (e) {
+          // Re-arm on failure so a transient compaction error doesn't permanently
+          // disable proactive compaction for the rest of the session.
+          compactionArmed = true
+          throw e
+        }
+        return true
+      }
       const bareMode = lastUser.tools?.["*"] === false
-      if (
-        lastAssistant?.finish &&
-        (!["tool-calls", "unknown"].includes(lastAssistant.finish) || bareMode) &&
-        lastUser.id < lastAssistant.id
-      ) {
+      // A text-only turn that finished "unknown" (no tool call to feed back) is a
+      // completed turn, not a continue — otherwise the loop re-prompts the identical
+      // context forever (the #176 doom loop). See MessageV2.isContinuingTurn.
+      const lastAssistantHasTool = lastAssistantMsg?.parts.some((p) => p.type === "tool") ?? false
+      const continuing = MessageV2.isContinuingTurn(lastAssistant?.finish, lastAssistantHasTool)
+      if (lastAssistant?.finish && (!continuing || bareMode) && lastUser.id < lastAssistant.id) {
         log.info("exiting loop", { sessionID, bareMode })
         // RSI: capture trajectory from ultra agent sessions (async, non-blocking)
         if (lastUser.agent && RSITrajectory.ARTIFACT_AGENTS.includes(lastUser.agent as any)) {
           RSITrajectory.pipeline(sessionID).catch(() => {})
         }
+        break
+      }
+
+      // Trip the text doom-loop guard when the last 3 finished assistant turns are
+      // long AND share a large identical leading block (the repeated "continuity
+      // summary"). Conservative on purpose — 3 substantial near-identical turns in a
+      // row is a clear non-convergence signal that legitimate progress never produces.
+      const finishedTurns = msgs.filter((m) => m.info.role === "assistant" && m.info.finish)
+      if (SessionProcessor.isTextLoop(finishedTurns.map(turnText))) {
+        log.info("text doom-loop detected — stopping", { sessionID, step })
+        await failTooLarge(
+          "The model repeated nearly the same response several times without making progress — a known failure mode of smaller local models on multi-step research tasks. Stopping to avoid an endless loop. Try a larger or hosted model for this task, or break it into smaller steps.",
+        )
         break
       }
 
@@ -562,24 +675,78 @@ export namespace SessionPrompt {
           abort,
           sessionID,
           auto: task.auto,
+          focus: task.focus,
+          handoffFile: task.handoffFile,
+          trigger: task.trigger,
         })
         if (result === "stop") break
+        // The summarization request itself exceeded the window — the pending
+        // turn is too large to even compact. Fail loudly, don't re-attempt.
+        if (result === "overflow") {
+          await failTooLarge()
+          break
+        }
         continue
       }
 
-      // context overflow, needs compaction
-      if (
-        lastFinished &&
+      // After a compaction, filterCompacted re-splices the verbatim tail AFTER the summary,
+      // so the position-based lastFinished above can resolve to a tail assistant carrying
+      // its stale PRE-compaction token count. If a summary is newer (higher id) than
+      // lastFinished we just compacted — the real post-compaction size isn't measurable
+      // until the next model turn, so skip proactive-compaction work this turn (avoiding a
+      // wasted prune + a misleading "did not bring under threshold" warning). The
+      // compactionArmed latch, left as the compaction set it, still governs re-firing.
+      const freshlyCompacted =
+        !!lastFinished &&
+        msgs.some(
+          (m) =>
+            m.info.role === "assistant" &&
+            (m.info as MessageV2.Assistant).summary === true &&
+            !!(m.info as MessageV2.Assistant).finish &&
+            m.info.id > lastFinished!.id,
+        )
+      // context overflow, needs compaction (proactive, at the 0.75 threshold)
+      const overThreshold =
+        !!lastFinished &&
         lastFinished.summary !== true &&
         (await SessionCompaction.isOverflow({ tokens: lastFinished.tokens, model }))
-      ) {
-        await SessionCompaction.create({
-          sessionID,
-          agent: lastUser.agent,
-          model: lastUser.model,
-          auto: true,
-        })
-        continue
+      // Circuit breaker: once repeated compactions have proven ineffective for this
+      // session (fixed overhead already exceeds the threshold), stop proactively
+      // compacting — it only burns tokens/latency. The reactive overflow-error path is
+      // the sole remaining backstop for a genuine hard overflow.
+      if (overThreshold && !freshlyCompacted && SessionCompaction.breakerTripped(sessionID)) {
+        log.warn("compaction circuit breaker tripped; proceeding without compacting", { sessionID })
+      } else if (overThreshold && !freshlyCompacted) {
+        // Cheapest first: clear stale tool outputs / older images. If that reclaims a
+        // meaningful chunk, skip the expensive LLM compaction this turn — the next turn
+        // re-checks on real token usage. Only summarize when clearing can't hold budget.
+        const reclaimed = await SessionCompaction.prune({ sessionID })
+        if (reclaimed > 0) {
+          log.info("prune reclaimed context; deferring compaction", { sessionID, reclaimed })
+          // Re-read the stream so THIS turn's request reflects the prune. prune() persists
+          // time.compacted on the cleared parts, but the `msgs` fetched at the loop top (and
+          // the sessionMessages clone below) still hold the pre-prune bodies — without this
+          // the "deferring compaction" turn would ship the full un-pruned context anyway.
+          msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+          // `before` is the last finished turn's real token usage (the reason we tripped
+          // the threshold); prune's return value is the estimated reclaim.
+          const before = lastFinished!.tokens.input + lastFinished!.tokens.cache.read + lastFinished!.tokens.output
+          SessionTelemetry.recordCompaction({ sessionID, trigger: "proactive", mechanism: "prune", before, reclaimed })
+          SessionCompaction.noteCompaction({ sessionID, before, reclaimed })
+          compactionArmed = true
+        }
+        if (reclaimed === 0 && (await armedCompact())) continue
+        // Nothing left to prune and already compacted — fixed system+tool+summary
+        // overhead exceeds the threshold, so re-compacting is futile and would loop.
+        // Proceed silently; the model's real window + the overflow-error path backstop.
+        if (reclaimed === 0)
+          log.warn("auto-compaction did not bring context under threshold; proceeding", { sessionID })
+      }
+      // Genuinely under threshold — re-arm for future growth and clear the breaker so a
+      // later, legitimately-needed compaction can still fire.
+      if (!overThreshold && lastFinished && lastFinished.summary !== true) {
+        compactionArmed = true
+        SessionCompaction.resetBreaker(sessionID)
       }
 
       // normal processing
@@ -684,19 +851,30 @@ export namespace SessionPrompt {
         }
       }
 
+      const system = [
+        ...(await SystemPrompt.environment(model)),
+        ...(await InstructionPrompt.system()),
+        ...(await Memory.recall()),
+        ...artifactContext,
+      ]
+
+      // P0.1 telemetry: record what the working context is made of, by content type,
+      // for exactly the messages + system prompt about to be sent. Fire-and-forget so it
+      // never adds latency to the model call.
+      SessionTelemetry.recordContext({ sessionID, composition: MessageV2.composition(sessionMessages, { system }) })
+
       const result = await processor.process({
         user: lastUser,
         agent,
         abort,
         sessionID,
-        system: [
-          ...(await SystemPrompt.environment(model)),
-          ...(await InstructionPrompt.system()),
-          ...(await Memory.recall()),
-          ...artifactContext,
-        ],
+        system,
         messages: [
-          ...MessageV2.toModelMessages(sessionMessages, model),
+          // Keep only the most-recent images in full; older figures/screenshots become
+          // text placeholders so re-shipping media every turn can't bloat the window.
+          ...MessageV2.toModelMessages(sessionMessages, model, {
+            keepRecentImages: SessionCompaction.KEEP_RECENT_IMAGES,
+          }),
           ...(isLastStep
             ? [
                 {
@@ -710,14 +888,34 @@ export namespace SessionPrompt {
         model,
       })
       if (result === "stop") break
-      if (result === "compact") {
-        await SessionCompaction.create({
-          sessionID,
-          agent: lastUser.agent,
-          model: lastUser.model,
-          auto: true,
-        })
+      if (result === "overflow") {
+        // Honor an explicit opt-out: if the user disabled auto-compaction, a hard
+        // overflow must NOT silently rewrite their history to a summary. Surface a
+        // terminal error pointing at /compact instead.
+        if ((await Config.get()).compaction?.auto === false) {
+          await failTooLarge(
+            "Context window exceeded and auto-compaction is disabled (compaction.auto=false). Run /compact or start a new session.",
+          )
+          break
+        }
+        overflowCompactions++
+        // A compaction already ran for this turn and the input STILL overflows —
+        // the pending message itself is too large. Surface a terminal error.
+        if (overflowCompactions > 1) {
+          await failTooLarge()
+          break
+        }
+        // First overflow this turn: compact history, then the loop resumes the
+        // same unanswered user message against the summary — the agent continues
+        // on its own; the user never re-enters the prompt.
+        await compact("overflow")
+        // A compaction just ran; disarm so the reactive 0.75 branch doesn't
+        // immediately re-compact the same (now-summarized) context next turn.
+        compactionArmed = false
+        continue
       }
+      overflowCompactions = 0
+      if (result === "compact") await armedCompact()
       continue
     }
     SessionCompaction.prune({ sessionID })
@@ -1048,7 +1246,8 @@ export namespace SessionPrompt {
                     sessionID: input.sessionID,
                     type: "text",
                     synthetic: true,
-                    text: Buffer.from(part.url, "base64url").toString(),
+                    // Decode only the payload after the comma — see decodeDataUrlText (#170).
+                    text: decodeDataUrlText(part.url),
                   },
                   {
                     ...part,
@@ -1836,6 +2035,62 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
   export async function command(input: CommandInput) {
     log.info("command", input)
+
+    // /compact is an action, not a prompt template: enqueue a compaction task
+    // and run the loop to process it (same machinery as auto-compaction), then
+    // return the summary. The user does not get a normal AI turn. Any text after
+    // the command (input.arguments) is the optional focus topic.
+    // A user-defined `compact` command in config takes precedence over the
+    // built-in action, so don't shadow it.
+    const userDefinedCompact = (await Config.get()).command?.[Command.Default.COMPACT]
+    if (input.command === Command.Default.COMPACT && !userDefinedCompact) {
+      const model = input.model ? Provider.parseModel(input.model) : await lastModel(input.sessionID)
+      const agentName = input.agent ?? (await Agent.defaultAgent())
+      const focus = input.arguments.trim()
+      await SessionCompaction.create({
+        sessionID: input.sessionID,
+        agent: agentName,
+        model: { providerID: model.providerID, modelID: model.modelID },
+        auto: false,
+        focus: focus || undefined,
+        trigger: "manual",
+      })
+      const result = await loop(input.sessionID)
+      Bus.publish(Command.Event.Executed, {
+        name: input.command,
+        sessionID: input.sessionID,
+        arguments: input.arguments,
+        messageID: result.info.id,
+      })
+      return result
+    }
+
+    // /handoff [path]: write a self-contained handoff to the project (handoff.md, or
+    // the given path) for another agent to pick up, then compact. Same summary as
+    // /compact — the only difference is where the doc lands and that it doesn't
+    // auto-resume (the point is a fresh agent continues from the file).
+    const userDefinedHandoff = (await Config.get()).command?.[Command.Default.HANDOFF]
+    if (input.command === Command.Default.HANDOFF && !userDefinedHandoff) {
+      const model = input.model ? Provider.parseModel(input.model) : await lastModel(input.sessionID)
+      const agentName = input.agent ?? (await Agent.defaultAgent())
+      await SessionCompaction.create({
+        sessionID: input.sessionID,
+        agent: agentName,
+        model: { providerID: model.providerID, modelID: model.modelID },
+        auto: false,
+        handoffFile: input.arguments.trim() || undefined,
+        trigger: "manual",
+      })
+      const result = await loop(input.sessionID)
+      Bus.publish(Command.Event.Executed, {
+        name: input.command,
+        sessionID: input.sessionID,
+        arguments: input.arguments,
+        messageID: result.info.id,
+      })
+      return result
+    }
+
     const command = await Command.get(input.command)
     const agentName = command.agent ?? input.agent ?? (await Agent.defaultAgent())
 

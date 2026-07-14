@@ -6,7 +6,7 @@
  */
 import type { Connector, ConnectorHit } from "../types"
 import { getJSON } from "../http"
-import { arr, asRecord, num, str, summarize, type Rec } from "./util"
+import { arr, asRecord, str, summarize, type Rec } from "./util"
 
 const API = "https://api.genome.ucsc.edu"
 const DEFAULT_GENOME = "hg38"

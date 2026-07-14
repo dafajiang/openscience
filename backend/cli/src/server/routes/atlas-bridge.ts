@@ -1,5 +1,5 @@
 /**
- * Bridge for `/api/thesis/*` → the Atlas graph backend.
+ * Bridge for `/api/atlas/*` → the Atlas graph backend.
  *
  * The OpenScience web canvas (node list) and project/session sync proxy
  * through here to the Atlas REST API (`API_BASE/api/v1/*`), authenticated
@@ -580,6 +580,6 @@ export const AtlasBridgeRoutes = lazy(() =>
           : {}),
       })
     })
-    // Quiet 200 for any other thesis path the SPA probes.
+    // Quiet 200 for any other atlas path the SPA probes.
     .all("/*", (c) => c.json({}, 200)),
 )

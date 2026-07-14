@@ -22,11 +22,6 @@ import type { ArtifactRenderProps } from "../registry"
  * Optional: `displayMode` (default true → centered block; false → inline).
  */
 
-interface LatexData {
-  tex: string
-  displayMode: boolean
-}
-
 const SAMPLE = "\\hat{H}\\,\\psi = E\\,\\psi"
 
 function normalize(data: unknown): { tex: string; displayMode: boolean; isSample: boolean } {

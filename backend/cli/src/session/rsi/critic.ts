@@ -123,7 +123,6 @@ Respond with ONLY a JSON object:
     const total = clamp(base + efficiencyMod + diversityMod + reproducibilityMod, 0, 100)
 
     // Distribute across dimensions (proportional to total)
-    const ratio = total / 100
     const score: CriticScore = {
       correctness: clamp(
         Math.round(25 * (trajectory.outcome === "success" ? 1 : trajectory.outcome === "partial" ? 0.6 : 0.2)),

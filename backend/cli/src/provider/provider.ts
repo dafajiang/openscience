@@ -1333,6 +1333,49 @@ export namespace Provider {
     return state().then((state) => state.providers)
   }
 
+  // === tokenCommand: refreshing shell-command auth (#146) ===
+  // Some providers sit behind a rotating/SSO-minted bearer token that a local
+  // command prints on demand. `options.tokenCommand` runs that command and injects
+  // its stdout as `Authorization: Bearer <token>`, re-minting shortly before the
+  // token's JWT exp. Module-level so the cache + single-flight are shared across the
+  // (memoized) SDK instances rather than re-run per request.
+  const tokenCache = new Map<string, { token: string; expires: number }>()
+  const tokenInflight = new Map<string, Promise<string>>()
+
+  async function mintToken(command: string): Promise<string> {
+    const cached = tokenCache.get(command)
+    // Re-mint a minute early so an in-flight request never ships an expired token.
+    if (cached && cached.expires > Date.now() + 60_000) return cached.token
+    const pending = tokenInflight.get(command)
+    if (pending) return pending
+    const run = (async () => {
+      const proc = Bun.spawn(["sh", "-c", command], { stdout: "pipe", stderr: "pipe" })
+      const [out, err, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ])
+      const token = out.trim()
+      if (code !== 0) throw new Error(`tokenCommand exited ${code}: ${err.trim() || "no stderr"}`)
+      if (!token) throw new Error("tokenCommand produced no output")
+      // Decode a JWT exp (seconds) so we can re-mint just before it lapses; a
+      // non-JWT token has no exp, so expire it immediately (re-mint every request).
+      const claims = token.split(".")
+      let exp = 0
+      if (claims.length === 3) {
+        try {
+          exp = JSON.parse(Buffer.from(claims[1], "base64url").toString()).exp ?? 0
+        } catch {
+          /* not a JWT — leave exp 0 */
+        }
+      }
+      tokenCache.set(command, { token, expires: exp ? exp * 1000 : 0 })
+      return token
+    })().finally(() => tokenInflight.delete(command))
+    tokenInflight.set(command, run)
+    return run
+  }
+
   async function getSDK(model: Model) {
     try {
       using _ = log.time("getSDK", {
@@ -1348,6 +1391,10 @@ export namespace Provider {
 
       if (!options["baseURL"]) options["baseURL"] = model.api.url
       if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
+      // tokenCommand supplies the credential per-request via the fetch hook below;
+      // give the SDK a non-empty placeholder so @ai-sdk/openai's loadApiKey doesn't
+      // throw at construction (the real Bearer header is overwritten on each call).
+      if (options["tokenCommand"] && options["apiKey"] === undefined) options["apiKey"] = "token-command"
       pinByokToPublicEndpoint(provider, options, model.api.url)
       requireAtlasProxyForManagedKey(provider, options)
       if (model.headers)
@@ -1361,6 +1408,7 @@ export namespace Provider {
       if (existing) return existing
 
       const customFetch = options["fetch"]
+      const tokenCommand = options["tokenCommand"] as string | undefined
 
       options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
         // Preserve custom fetch if it exists, wrap it with timeout logic
@@ -1393,6 +1441,16 @@ export namespace Provider {
             }
             opts.body = JSON.stringify(body)
           }
+        }
+
+        // Mint (or reuse) the shell-command token and overwrite Authorization.
+        // Headers.set is case-insensitive, so it replaces the placeholder key the
+        // SDK attached at construction.
+        if (tokenCommand) {
+          const token = await mintToken(tokenCommand)
+          const headers = new Headers(opts.headers as HeadersInit | undefined)
+          headers.set("authorization", `Bearer ${token}`)
+          opts.headers = headers
         }
 
         return fetchFn(input, {

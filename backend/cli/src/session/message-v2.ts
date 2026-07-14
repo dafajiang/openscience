@@ -14,6 +14,7 @@ import { type SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { correctImageMimeFromBase64 } from "@/util/image"
 import { Lock } from "@/util/lock"
+import { Token } from "@/util/token"
 
 export namespace MessageV2 {
   export const OutputLengthError = NamedError.create("MessageOutputLengthError", z.object({}))
@@ -161,6 +162,11 @@ export namespace MessageV2 {
   export const CompactionPart = PartBase.extend({
     type: z.literal("compaction"),
     auto: z.boolean(),
+    focus: z.string().optional(),
+    handoffFile: z.string().optional(),
+    // What asked for this compaction — carried through to summary telemetry so we can
+    // tell proactive (0.75 threshold) from reactive (overflow backstop) from manual.
+    trigger: z.enum(["proactive", "overflow", "manual"]).optional(),
   }).meta({
     ref: "CompactionPart",
   })
@@ -391,6 +397,10 @@ export namespace MessageV2 {
       }),
     }),
     finish: z.string().optional(),
+    // P3.2: the id of the user message where the verbatim recent tail begins, for the
+    // summary message. filterCompacted keeps [tailStartId..boundary] verbatim after the
+    // summary instead of dropping it.
+    tailStartId: z.string().optional(),
   }).meta({
     ref: "AssistantMessage",
   })
@@ -438,9 +448,69 @@ export namespace MessageV2 {
   })
   export type WithParts = z.infer<typeof WithParts>
 
-  export function toModelMessages(input: WithParts[], model: Provider.Model): ModelMessage[] {
+  // Finish reasons that mean the agent is NOT done — it will call more tools, or the reason
+  // is ambiguous ("unknown") and the loop treats it as "keep going". Everything else ("stop",
+  // "length", …) is a completed turn. The loop uses this to decide whether to keep iterating,
+  // and compaction uses it to decide whether to compact mid-task vs yield after a finished
+  // answer — sharing one predicate so the two can't drift apart.
+  export const CONTINUING_FINISH = ["tool-calls", "unknown"]
+  export function isContinuing(finish?: string): boolean {
+    return !!finish && CONTINUING_FINISH.includes(finish)
+  }
+
+  // Whether a completed TURN should keep the agent loop running. Stricter than
+  // isContinuing for the ambiguous "unknown" reason: it only means "keep going"
+  // when the turn actually made a tool call whose result must be fed back. A
+  // text-only turn that finished "unknown" (common with local Ollama models that
+  // don't report a finish reason) produced no continuation signal — re-prompting
+  // the identical context just yields the same text forever (the #176 doom loop),
+  // so treat it as done. Used only by the loop; compaction keeps isContinuing.
+  export function isContinuingTurn(finish: string | undefined, hasToolCall: boolean): boolean {
+    return isContinuing(finish) && (finish !== "unknown" || hasToolCall)
+  }
+
+  export function toModelMessages(
+    input: WithParts[],
+    model: Provider.Model,
+    options?: { stripMedia?: boolean; keepRecentImages?: number },
+  ): ModelMessage[] {
     const result: UIMessage[] = []
     const toolNames = new Set<string>()
+    // P2.1: older tool outputs identical to a more recent call collapse to a back-ref.
+    const superseded = supersededOutputs(input)
+
+    // Media budgeting. `stripMedia` (used for the compaction summary) drops ALL images;
+    // otherwise `keepRecentImages` keeps only the last N images in full and replaces
+    // older ones with a text placeholder — so re-shipping many figures every turn can't
+    // bloat the window. The image stays on disk and can be re-read on demand. Count up
+    // front so "last N" is well-defined; both passes visit images in input→part order.
+    const isImage = (mime: string) => mime.startsWith("image/")
+    let totalImages = 0
+    if (!options?.stripMedia && options?.keepRecentImages !== undefined) {
+      for (const msg of input)
+        for (const part of msg.parts) {
+          if (part.type === "file" && isImage(part.mime)) totalImages++
+          if (part.type === "tool" && part.state.status === "completed" && !part.state.time.compacted)
+            for (const a of part.state.attachments ?? []) if (isImage(a.mime)) totalImages++
+        }
+    }
+    let imagesSeen = 0
+    // Returns a placeholder string when this image occurrence should be dropped, else undefined.
+    const dropImage = (mime: string, url: string, filename?: string): string | undefined => {
+      if (!isImage(mime)) return undefined
+      if (options?.stripMedia) return `[image omitted${filename ? `: ${filename}` : ""}]`
+      // Oversized guard (P2.4): a too-large image is replaced by an actionable resize
+      // nudge even when it is a recent image we would otherwise keep — shipping it would
+      // 400 the request. Independent of the recency budget below.
+      const oversized = oversizedImageNudge(url, filename)
+      if (options?.keepRecentImages === undefined) return oversized
+      const drop = imagesSeen < totalImages - options.keepRecentImages
+      imagesSeen++
+      if (oversized) return oversized
+      return drop
+        ? `[older image omitted to save context${filename ? `: ${filename}` : ""} — read it again if you need it]`
+        : undefined
+    }
 
     const toModelOutput = (output: unknown) => {
       if (typeof output === "string") {
@@ -495,19 +565,24 @@ export namespace MessageV2 {
             })
           // text/plain and directory files are converted into text parts, ignore them
           if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory") {
-            let mime = part.mime
-            if (mime.startsWith("image/") && part.url.startsWith("data:")) {
-              const commaIdx = part.url.indexOf(",")
-              if (commaIdx !== -1) {
-                mime = correctImageMimeFromBase64(mime, part.url.slice(commaIdx + 1))
+            const dropped = dropImage(part.mime, part.url, part.filename)
+            if (dropped) {
+              userMessage.parts.push({ type: "text", text: dropped })
+            } else {
+              let mime = part.mime
+              if (mime.startsWith("image/") && part.url.startsWith("data:")) {
+                const commaIdx = part.url.indexOf(",")
+                if (commaIdx !== -1) {
+                  mime = correctImageMimeFromBase64(mime, part.url.slice(commaIdx + 1))
+                }
               }
+              userMessage.parts.push({
+                type: "file",
+                url: mime !== part.mime ? `data:${mime};base64,${part.url.slice(part.url.indexOf(",") + 1)}` : part.url,
+                mediaType: mime,
+                filename: part.filename,
+              })
             }
-            userMessage.parts.push({
-              type: "file",
-              url: mime !== part.mime ? `data:${mime};base64,${part.url.slice(part.url.indexOf(",") + 1)}` : part.url,
-              mediaType: mime,
-              filename: part.filename,
-            })
           }
 
           if (part.type === "compaction") {
@@ -556,8 +631,20 @@ export namespace MessageV2 {
           if (part.type === "tool") {
             toolNames.add(part.tool)
             if (part.state.status === "completed") {
-              const outputText = part.state.time.compacted ? "[Old tool result content cleared]" : part.state.output
-              const attachments = part.state.time.compacted ? [] : (part.state.attachments ?? [])
+              const isDuplicate = superseded.has(part.id)
+              const rawAttachments = part.state.time.compacted || isDuplicate ? [] : (part.state.attachments ?? [])
+              let droppedNote = ""
+              const attachments = rawAttachments.filter((a) => {
+                const dropped = dropImage(a.mime, a.url, a.filename)
+                if (dropped) droppedNote += `\n${dropped}`
+                return !dropped
+              })
+              const baseText = isDuplicate
+                ? DUPLICATE_OUTPUT
+                : part.state.time.compacted
+                  ? toolSummary(part.tool, part.state)
+                  : part.state.output
+              const outputText = baseText + droppedNote
               const output =
                 attachments.length > 0
                   ? {
@@ -570,7 +657,9 @@ export namespace MessageV2 {
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-available",
                 toolCallId: part.callID,
-                input: part.state.input,
+                // A superseded call's output is stubbed to a back-ref, so its (possibly huge)
+                // input args are dead weight too — truncate them, same as a compacted call.
+                input: part.state.time.compacted || isDuplicate ? truncateArgs(part.state.input) : part.state.input,
                 output,
                 ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
               })
@@ -619,6 +708,203 @@ export namespace MessageV2 {
         tools,
       },
     )
+  }
+
+  // Flat per-image token cost. An image's model cost bears no relation to its base64
+  // byte length, so a fixed estimate is what the reference tools use (claude-code /
+  // opencode 2000, hermes 1500). Single source of truth — SessionCompaction re-exports
+  // it as IMAGE_TOKEN_ESTIMATE (it can't import here without a cycle).
+  export const IMAGE_TOKENS = 1600
+
+  // Anthropic (and most providers) reject a single image over 5 MB with an HTTP 400.
+  // P1's flat token estimate neither counts an oversized image accurately nor prevents
+  // that error, so a single big figure can hard-fail the turn. P2.4 guards it WITHOUT an
+  // image codec in the binary: when an image is too large to send, the harness never
+  // ships the base64 — it substitutes an actionable nudge telling the agent to resize the
+  // source file (which it can see in the preceding read/attach) and re-read the smaller
+  // copy. The resize runs in the agent's own tool sandbox (bash/python), mirroring
+  // hermes' runtime-Pillow model without baking a native dep into the compiled binary.
+  export const IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+  // v1 triggers on byte size — the dominant cause of the 400. Pixel-dimension oversize
+  // (a tall thin screenshot under 5 MB but over the 8000px per-side cap) is a documented
+  // follow-up; `readImageDimensions` in util/image is the primitive it would build on.
+  export function oversizedImageNudge(url: string, filename?: string, maxBytes = IMAGE_MAX_BYTES): string | undefined {
+    if (!url.startsWith("data:")) return undefined // only measurable for inline base64
+    const comma = url.indexOf(",")
+    if (comma === -1) return undefined
+    const bytes = Math.floor(((url.length - comma - 1) * 3) / 4) // base64 → decoded size
+    if (bytes <= maxBytes) return undefined
+    const mb = (bytes / (1024 * 1024)).toFixed(1)
+    const limit = Math.round(maxBytes / (1024 * 1024))
+    const name = filename ? ` ${filename}` : ""
+    return (
+      `[Image${name} omitted — too large to send (~${mb} MB, ${limit} MB limit). ` +
+      `To view it, resize the source file to ≤2000px and read the smaller copy, e.g.: ` +
+      `python3 -c "from PIL import Image; im=Image.open(SRC); im.thumbnail((2000,2000)); im.save(OUT)" ` +
+      `(SRC = the file named in the read/attachment just above; OUT = a new path), then read OUT. ` +
+      `If it was rendered by a script, re-run it at a lower dpi/figsize.]`
+    )
+  }
+
+  // Skill/artifact invocations are bucketed separately from generic tool traffic so the
+  // telemetry can attribute their cost. NOTE: the skill *catalog* (the bulk of skill
+  // tokens) lives in the agent/system prompt and is counted under `system`, not here.
+  const SKILL_TOOLS = new Set(["skill", "artifact"])
+
+  // Deterministic, lossless dedupe of repeated tool output. Re-reading a file or
+  // re-running a command re-ships the identical body every turn; only the newest copy is
+  // useful, so older identical outputs become a back-reference. Minimum size guards
+  // against churning on trivially-small outputs (the back-ref itself costs a line), and
+  // parts with attachments are left alone (identical text ≠ identical media).
+  export const DEDUPE_MIN_CHARS = 200
+  // Stubs a LATER re-read that is byte-identical to an earlier one (keep-older; see
+  // supersededOutputs). Points BACKWARD to the earlier full copy and leads with an explicit
+  // "unchanged" assertion, so the model reads it as "I already have this, it didn't change"
+  // rather than "this read differs from my earlier one." Wording clarity is secondary to the
+  // keep-older structure — but both matter (the model still parses this line).
+  export const DUPLICATE_OUTPUT =
+    "[Duplicate read omitted — byte-for-byte identical to an earlier read of the same tool in this conversation; the content is UNCHANGED. Refer to that earlier copy.]"
+
+  // Returns the ids of completed tool parts whose output is byte-identical to an EARLIER
+  // call's output — i.e. the later re-reads, safe to replace with a back-reference to the
+  // first full copy. Keep-OLDER (not keep-newer) is deliberate: the model's first read
+  // stays full and the re-read becomes the stub, so it never perceives "first read = stub,
+  // later read = full body" as the content having changed (a real failure we hit live;
+  // claude-code's read-time FILE_UNCHANGED_STUB keeps the older copy for the same reason).
+  // Self-healing under pruning: compacted parts are skipped, so once the kept first copy is
+  // pruned, the next occurrence stops being superseded and renders full again.
+  export function supersededOutputs(input: WithParts[], min = DEDUPE_MIN_CHARS): Set<string> {
+    const firstSeen = new Map<string, string>() // dedupe key -> id of its EARLIEST occurrence
+    const superseded = new Set<string>()
+    for (const msg of input)
+      for (const part of msg.parts) {
+        if (part.type !== "tool" || part.state.status !== "completed") continue
+        if (part.state.time.compacted) continue
+        if ((part.state.attachments ?? []).length) continue
+        const output = part.state.output ?? ""
+        if (output.length < min) continue
+        // Key on tool + input + output, not output alone: a byte-identical output from a
+        // DIFFERENT tool or a different target (two reads of different files that happen to
+        // match) is not a re-read, and the back-ref explicitly claims "the same tool" — so
+        // keying on output alone would tell the model an untrue thing about unrelated calls.
+        const key = `${part.tool} ${JSON.stringify(part.state.input ?? {})} ${output}`
+        if (firstSeen.has(key))
+          superseded.add(part.id) // a later identical copy
+        else firstSeen.set(key, part.id) // the first full copy — keep it
+      }
+    return superseded
+  }
+
+  // Per-string cap for the args of a reduced (pruned) tool call. Once a call is
+  // compacted its result is gone, so an oversized payload arg (a 50KB `write` content, a
+  // long `edit` oldString) is dead weight — truncate it while keeping the JSON valid and
+  // the small identifying args (paths, flags) intact so the call still reads correctly.
+  export const ARG_TRUNCATE_CHARS = 200
+
+  export function truncateArgs(input: Record<string, unknown>, cap = ARG_TRUNCATE_CHARS): Record<string, unknown> {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(input ?? {}))
+      out[k] = typeof v === "string" && v.length > cap ? v.slice(0, cap) + `…[+${v.length - cap} chars]` : v
+    return out
+  }
+
+  // A 1-line, tool-aware stand-in for a reduced (pruned) tool output. Replaces the blunt
+  // "[Old tool result content cleared]" so the model retains the gist — which tool ran,
+  // against what, and how big the result was — and knows it can re-run to recover the
+  // body. Keeps the token cost to a single line. Used by both toModelMessages (render)
+  // and composition (accounting) so the two never disagree.
+  export function toolSummary(tool: string, state: ToolStateCompleted): string {
+    const descriptor = iife(() => {
+      const title = state.title?.trim()
+      if (title) return title
+      const entries = Object.entries(state.input ?? {})
+      if (!entries.length) return ""
+      return entries.map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join(" ")
+    })
+      .replace(/\s+/g, " ")
+      .slice(0, 80)
+      .trim()
+    const lines = state.output ? state.output.split("\n").length : 0
+    return `[${tool}]${descriptor ? " " + descriptor : ""} → cleared (${lines} line${lines === 1 ? "" : "s"})`
+  }
+
+  export type Composition = {
+    system: number
+    text: number
+    reasoning: number
+    tool: number
+    skills: number
+    image: number
+    images: number
+    total: number
+  }
+
+  // Deterministic, zero-cost breakdown of what the working context is made of, bucketed
+  // by content type. Mirrors `toModelMessages` accounting so the numbers match what is
+  // actually shipped: images are the flat IMAGE_TOKENS estimate, and a pruned
+  // (`time.compacted`) tool part counts its cleared placeholder with attachments dropped
+  // — so a prune visibly shrinks the breakdown. `system` covers the prompt strings that
+  // are not part of the message log. Powers P0 context-composition telemetry.
+  export function composition(input: WithParts[], options?: { system?: string[] }): Composition {
+    const out: Composition = { system: 0, text: 0, reasoning: 0, tool: 0, skills: 0, image: 0, images: 0, total: 0 }
+    for (const s of options?.system ?? []) out.system += Token.estimate(s)
+    const superseded = supersededOutputs(input)
+
+    const addImages = (count: number) => {
+      out.image += count * IMAGE_TOKENS
+      out.images += count
+    }
+
+    for (const msg of input)
+      for (const part of msg.parts) {
+        if (part.type === "text") {
+          if (part.ignored) continue
+          out.text += Token.estimate(part.text)
+          continue
+        }
+        if (part.type === "reasoning") {
+          out.reasoning += Token.estimate(part.text)
+          continue
+        }
+        if (part.type === "file") {
+          if (part.mime.startsWith("image/")) {
+            const nudge = oversizedImageNudge(part.url, part.filename)
+            if (nudge) out.text += Token.estimate(nudge)
+            else addImages(1)
+          }
+          continue
+        }
+        if (part.type === "tool") {
+          const bucket = SKILL_TOOLS.has(part.tool) ? "skills" : "tool"
+          const compacted = part.state.status === "completed" && !!part.state.time.compacted
+          // Mirror toModelMessages: a compacted OR superseded call's args are truncated in
+          // the render, so count them truncated here too — otherwise the breakdown over-counts.
+          const reducedArgs = compacted || superseded.has(part.id)
+          out[bucket] += Token.estimate(
+            JSON.stringify((reducedArgs ? truncateArgs(part.state.input) : part.state.input) ?? {}),
+          )
+          if (part.state.status === "completed") {
+            const body = superseded.has(part.id)
+              ? DUPLICATE_OUTPUT
+              : compacted
+                ? toolSummary(part.tool, part.state)
+                : part.state.output
+            out[bucket] += Token.estimate(body)
+            if (!compacted && !superseded.has(part.id))
+              for (const a of part.state.attachments ?? [])
+                if (a.mime.startsWith("image/")) {
+                  const nudge = oversizedImageNudge(a.url, a.filename)
+                  if (nudge) out[bucket] += Token.estimate(nudge)
+                  else addImages(1)
+                }
+          }
+          if (part.state.status === "error") out[bucket] += Token.estimate(part.state.error)
+        }
+      }
+
+    out.total = out.system + out.text + out.reasoning + out.tool + out.skills + out.image
+    return out
   }
 
   export const stream = fn(Identifier.schema("session"), async function* (sessionID) {
@@ -725,19 +1011,61 @@ export namespace MessageV2 {
 
   export async function filterCompacted(stream: AsyncIterable<MessageV2.WithParts>) {
     const result = [] as MessageV2.WithParts[]
-    const completed = new Set<string>()
+    const completed = new Set<string>() // carrier ids (parentIDs of completed summaries)
+    let tailStartId: string | undefined // from the newest completed summary
+    let retain: string | undefined // once set, keep reading (to collect the tail) until this id, then stop
     for await (const msg of stream) {
+      // stream yields NEWEST-first
       result.push(msg)
+      if (retain) {
+        if (msg.info.id === retain) break
+        continue
+      }
+      // A summary is only a real compaction boundary if it actually produced handoff
+      // text. A summarization whose own request overflowed is left marked summary:true +
+      // finish but with NO text; treating that as a boundary would drop the entire history
+      // and replace it with an empty summary (data loss). Require text to gate on it.
       if (
-        msg.info.role === "user" &&
-        completed.has(msg.info.id) &&
-        msg.parts.some((part) => part.type === "compaction")
-      )
-        break
-      if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish) completed.add(msg.info.parentID)
+        msg.info.role === "assistant" &&
+        msg.info.summary &&
+        msg.info.finish &&
+        msg.parts.some((p) => p.type === "text" && p.text.trim())
+      ) {
+        completed.add(msg.info.parentID)
+        if (tailStartId === undefined) tailStartId = (msg.info as MessageV2.Assistant).tailStartId
+      }
+      if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((p) => p.type === "compaction")) {
+        if (!tailStartId) break
+        retain = tailStartId
+        if (msg.info.id === retain) break
+      }
     }
-    result.reverse()
-    return result
+    result.reverse() // now OLDEST-first
+    if (!tailStartId) return result
+    const carrierIdx = result.findLastIndex(
+      (m) => m.info.role === "user" && completed.has(m.info.id) && m.parts.some((p) => p.type === "compaction"),
+    )
+    const summaryIdx =
+      carrierIdx === -1
+        ? -1
+        : result.findIndex(
+            (m, i) =>
+              i > carrierIdx &&
+              m.info.role === "assistant" &&
+              m.info.summary === true &&
+              m.info.parentID === result[carrierIdx].info.id,
+          )
+    const tailIdx = result.findIndex((m) => m.info.id === tailStartId)
+    if (tailIdx >= 0 && tailIdx < carrierIdx && summaryIdx > carrierIdx)
+      return [
+        ...result.slice(carrierIdx, summaryIdx + 1), // [carrier, summary]
+        ...result.slice(tailIdx, carrierIdx), // verbatim tail
+        ...result.slice(summaryIdx + 1), // continuation
+      ]
+    // tailStartId was set but its message is gone (reverted/migrated) or the layout is
+    // malformed. Fall back to the no-tail behavior — drop everything before the carrier —
+    // rather than returning the whole (unbounded) history the retain scan just collected.
+    return carrierIdx >= 0 ? result.slice(carrierIdx) : result
   }
 
   const isOpenAiErrorRetryable = (e: APICallError) => {
