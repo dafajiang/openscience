@@ -19,6 +19,12 @@ export namespace RSIDistill {
   const log = Log.create({ service: "rsi-distill" })
   const LEARNED_SKILLS_DIR = path.join(Global.Path.data, "learned-skills")
   const SCORE_THRESHOLD = 75
+  // A high critic score alone is not enough: trivial sessions (a bare greeting,
+  // a one-shot answer) can score high yet distill into worthless template skills
+  // that pollute the catalog. Require a substantive hypothesis and a real
+  // multi-step workflow before a trajectory earns a learned skill.
+  const MIN_HYPOTHESIS_LEN = 24
+  const MIN_STEPS = 4
 
   /** Distill a learned skill from a scored trajectory.
    *  Only generates a skill if score >= threshold. Returns the skill name or null. */
@@ -27,6 +33,15 @@ export namespace RSIDistill {
       log.info("trajectory below threshold, skipping distill", {
         sessionId: trajectory.sessionId,
         score: trajectory.score,
+      })
+      return null
+    }
+
+    if ((trajectory.hypothesis?.trim().length ?? 0) < MIN_HYPOTHESIS_LEN || trajectory.steps.length < MIN_STEPS) {
+      log.info("trajectory too trivial to distill", {
+        sessionId: trajectory.sessionId,
+        hypothesisLen: trajectory.hypothesis?.trim().length ?? 0,
+        steps: trajectory.steps.length,
       })
       return null
     }

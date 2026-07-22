@@ -41,10 +41,32 @@ export const SkillTool = Tool.define("skill", async (ctx) => {
       })
     : skills
 
-  // Group skills by category for the description
+  // Locally authored skills (learned via /learn + user skills) are few and the
+  // highest-signal — the user's own hard-won, machine-specific lessons. The
+  // category catalog below only shows 3 example names per category, so these
+  // would be invisible by name. List them IN FULL in a dedicated block instead.
+  // Auto-distilled RSI skills (`learned-<agent>-<hash>` with templated bodies)
+  // are low-signal noise and excluded from the display entirely — they stay
+  // loadable by exact name, just not advertised.
+  const learnedDir = path.join(Global.Path.data, "learned-skills")
+  const userDir = path.join(Global.Path.data, "user-skills")
+  const AUTO_DISTILL_RE = /^learned-[a-z0-9]+-[A-Za-z0-9]{8}$/
+  const isLocalAuthored = (s: Skill.Info) =>
+    s.location.startsWith(learnedDir) || s.location.startsWith(userDir)
+  const isAutoDistilled = (s: Skill.Info) =>
+    AUTO_DISTILL_RE.test(s.name) || s.description.startsWith("Learned ") // distill.ts description prefix
+
+  const localCurated = accessibleSkills
+    .filter((s) => isLocalAuthored(s) && !isAutoDistilled(s))
+    .sort((a, b) => a.name.localeCompare(b.name))
+  const localCuratedSet = new Set(localCurated)
+
+  // Group the remaining catalog skills by category for the compressed listing.
+  // Curated-local skills go in their own block; auto-distilled noise is dropped.
   const categories: Record<string, Skill.Info[]> = {}
   const uncategorized: Skill.Info[] = []
   for (const skill of accessibleSkills) {
+    if (localCuratedSet.has(skill) || (isLocalAuthored(skill) && isAutoDistilled(skill))) continue
     const cat = skill.category ?? "other"
     if (cat === "other" && !skill.category) {
       uncategorized.push(skill)
@@ -57,6 +79,21 @@ export const SkillTool = Tool.define("skill", async (ctx) => {
     categories["other"] = [...(categories["other"] ?? []), ...uncategorized]
   }
 
+  const LOCAL_CAP = 40
+  const localBlock =
+    localCurated.length === 0
+      ? []
+      : [
+          "",
+          "<your_learned_skills note=\"Your own distilled/authored skills — the highest-signal, machine-specific lessons. Check these FIRST and load the relevant one by its exact name before falling back to the catalog below.\">",
+          ...localCurated.slice(0, LOCAL_CAP).map((s) => {
+            const d = s.description.length > 140 ? `${s.description.slice(0, 140)}...` : s.description
+            return `  <skill name="${s.name}">${d}</skill>`
+          }),
+          ...(localCurated.length > LOCAL_CAP ? [`  <!-- +${localCurated.length - LOCAL_CAP} more; browse category -->`] : []),
+          "</your_learned_skills>",
+        ]
+
   const description =
     accessibleSkills.length === 0
       ? "Load a skill to get detailed instructions for a specific task. No skills are currently available."
@@ -66,6 +103,7 @@ export const SkillTool = Tool.define("skill", async (ctx) => {
           "Use `name` to load a specific skill directly, or `category` to browse available skills in a domain.",
           "",
           "INVOCATION ETIQUETTE: Call this tool silently. Do NOT preface the call with messages like 'Let me load the X skill' or 'I'll consult the X skill first'. The tool call is internal — emit your first user-visible message AFTER the skill content is loaded, using the loaded guidance directly. If the user typed `/<skill-name>` to invoke a skill, treat it as a request to act on that skill's instructions immediately, not as a request to narrate the load.",
+          ...localBlock,
           "",
           "<skill_categories>",
           ...Object.entries(categories)

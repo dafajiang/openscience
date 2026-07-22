@@ -75,7 +75,33 @@ export namespace Skill {
   async function compute() {
     const skills: Record<string, Info> = {}
 
-    const addSkill = async (match: string) => {
+    const commit = (info: Info) => {
+      // Block skills with injection-like descriptions
+      const desc = (info.description ?? "").toLowerCase()
+      if (desc.includes("always run this skill") || desc.includes("must always run")) {
+        log.warn("blocked skill with injection pattern", {
+          name: info.name,
+          reason: "description contains injection directive",
+        })
+        return
+      }
+      // Warn on duplicate skill names
+      if (skills[info.name]) {
+        log.warn("duplicate skill name", {
+          name: info.name,
+          existing: skills[info.name].location,
+          duplicate: info.location,
+        })
+      }
+      skills[info.name] = info
+    }
+
+    // `fallback` is set for locally authored skills (learned/user): a SKILL.md
+    // saved without valid frontmatter is recovered by deriving its name from the
+    // directory and its description from the first heading, so a hand-written
+    // note still loads and is invocable by name. For catalog/bundled skills a
+    // parse failure is junk and skipped — but now logged, never silently dropped.
+    const addSkill = async (match: string, opts?: { fallback?: boolean }) => {
       const md = await ConfigMarkdown.parse(match).catch((err) => {
         const message = ConfigMarkdown.FrontmatterError.isInstance(err)
           ? err.data.message
@@ -90,35 +116,42 @@ export namespace Skill {
       const parsed = Info.pick({ name: true, description: true, category: true, tags: true, entry: true }).safeParse(
         md.data,
       )
-      if (!parsed.success) return
-
-      // Block skills with injection-like descriptions
-      const desc = (parsed.data.description ?? "").toLowerCase()
-      if (desc.includes("always run this skill") || desc.includes("must always run")) {
-        log.warn("blocked skill with injection pattern", {
+      if (parsed.success) {
+        commit({
           name: parsed.data.name,
-          reason: "description contains injection directive",
+          description: parsed.data.description,
+          location: match,
+          category: parsed.data.category,
+          tags: parsed.data.tags,
+          entry: parsed.data.entry,
         })
         return
       }
 
-      // Warn on duplicate skill names
-      if (skills[parsed.data.name]) {
-        log.warn("duplicate skill name", {
-          name: parsed.data.name,
-          existing: skills[parsed.data.name].location,
-          duplicate: match,
-        })
+      if (!opts?.fallback) {
+        log.warn("skipped skill with missing/invalid frontmatter", { skill: match })
+        return
       }
 
-      skills[parsed.data.name] = {
-        name: parsed.data.name,
-        description: parsed.data.description,
-        location: match,
-        category: parsed.data.category,
-        tags: parsed.data.tags,
-        entry: parsed.data.entry,
+      const dirName = path.basename(path.dirname(match))
+      const name = dirName
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, "-")
+        .replace(/(^-+|-+$)/g, "")
+        .slice(0, 64)
+      if (!UserSkillName.safeParse(name).success) {
+        log.warn("cannot derive fallback skill name", { skill: match, dirName })
+        return
       }
+      const body = (md.content ?? "").trim()
+      const firstLine =
+        body
+          .split("\n")
+          .map((l) => l.trim())
+          .find((l) => l.length > 0) ?? name
+      const description = firstLine.replace(/^#+\s*/, "").replace(/^>\s*/, "").slice(0, 200)
+      log.warn("loaded skill via frontmatter fallback", { skill: match, name })
+      commit({ name, description, location: match })
     }
 
     // Scan .claude/skills/ directories (project-level)
@@ -236,12 +269,12 @@ export namespace Skill {
     const learnedDir = path.join(Global.Path.data, "learned-skills")
 
     // Sync from cloud: fetch learned skills index and write any missing to disk.
-    // Gated on the same flag as the skill index above so it is one consistent
-    // "no server-side skill I/O" switch — this keeps skill discovery from
-    // blocking on a slow/unreachable backend (#138) and makes it deterministic
-    // in tests (preload sets the flag). The local learned-skills scan below still
-    // runs regardless.
-    const cloudLearned = Flag.OPENSCIENCE_DISABLE_BUNDLED_SKILLS
+    // Gated on its own flag (implied by the bundled-skills master switch) so the
+    // learned-skill pull can be disabled while keeping the bundled catalog — this
+    // stops cloud noise from re-seeding locally and makes local learned-skills the
+    // source of truth. Also keeps discovery from blocking on a slow/unreachable
+    // backend (#138) and deterministic in tests. The local scan below still runs.
+    const cloudLearned = Flag.OPENSCIENCE_DISABLE_LEARNED_SKILL_SYNC
       ? null
       : await OpenScience.fetchLearnedSkills().catch(() => null)
     if (cloudLearned) {
@@ -269,7 +302,7 @@ export namespace Skill {
         onlyFiles: true,
         followSymlinks: true,
       })) {
-        await addSkill(match)
+        await addSkill(match, { fallback: true })
         learnedCount++
       }
       if (learnedCount > 0) {
@@ -286,7 +319,7 @@ export namespace Skill {
         onlyFiles: true,
         followSymlinks: true,
       })) {
-        await addSkill(match)
+        await addSkill(match, { fallback: true })
         userCount++
       }
       if (userCount > 0) {
