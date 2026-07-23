@@ -148,5 +148,42 @@ export const ConfigRoutes = lazy(() =>
         await Config.removeProvider(id, scope)
         return c.json({ success: true as const })
       },
+    )
+    .patch(
+      "/enabled-providers",
+      describeRoute({
+        summary: "Amend enabled_providers whitelist",
+        description:
+          "Add/remove provider ids in the enabled_providers whitelist. No-op when the config has no whitelist.",
+        operationId: "config.enabledProviders.patch",
+        responses: {
+          200: {
+            description: "Resulting whitelist (null when no whitelist is configured)",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ enabled_providers: z.string().array().nullable() })),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "json",
+        z.object({
+          add: z.string().array().optional(),
+          remove: z.string().array().optional(),
+          scope: Config.Scope.optional(),
+        }),
+      ),
+      async (c) => {
+        const { add = [], remove = [], scope = "global" } = c.req.valid("json")
+        const current = scope === "global" ? await Config.getGlobal() : await Config.get()
+        const list = current.enabled_providers
+        if (!list) return c.json({ enabled_providers: null })
+        const next = [...new Set([...list.filter((x) => !remove.includes(x)), ...add])]
+        await Config.setEnabledProviders(next, scope)
+        return c.json({ enabled_providers: next })
+      },
     ),
 )

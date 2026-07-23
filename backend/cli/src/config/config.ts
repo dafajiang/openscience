@@ -1537,6 +1537,12 @@ export namespace Config {
     return patchConfigPath(scope, ["provider", id], undefined)
   }
 
+  /** Replace the enabled_providers whitelist. Pass undefined to drop the key
+   *  (whitelist off = catalog fully visible). */
+  export async function setEnabledProviders(ids: string[] | undefined, scope: Scope = "global") {
+    return patchConfigPath(scope, ["enabled_providers"], ids)
+  }
+
   /**
    * Execution-sandbox policy resolved from GLOBAL + MANAGED (admin) config only.
    * Project config is deliberately excluded: the sandbox is a machine-wide safety
