@@ -119,6 +119,9 @@ export const ConfigRoutes = lazy(() =>
         const { id } = c.req.valid("param")
         const { provider, scope = "global" } = c.req.valid("json")
         await Config.setProvider(id, provider, scope)
+        // patchConfigPath disposes Instances but Provider keeps a module-level
+        // state cache that only invalidate()/directory-switch clears.
+        Provider.invalidate()
         return c.json({ success: true as const })
       },
     )
@@ -146,6 +149,7 @@ export const ConfigRoutes = lazy(() =>
         const { id } = c.req.valid("param")
         const { scope = "global" } = c.req.valid("query")
         await Config.removeProvider(id, scope)
+        Provider.invalidate()
         return c.json({ success: true as const })
       },
     )
@@ -183,6 +187,7 @@ export const ConfigRoutes = lazy(() =>
         if (!list) return c.json({ enabled_providers: null })
         const next = [...new Set([...list.filter((x) => !remove.includes(x)), ...add])]
         await Config.setEnabledProviders(next, scope)
+        Provider.invalidate()
         return c.json({ enabled_providers: next })
       },
     ),
