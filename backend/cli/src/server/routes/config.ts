@@ -88,5 +88,65 @@ export const ConfigRoutes = lazy(() =>
           default: mapValues(providers, (item) => Provider.sort(Object.values(item.models))[0].id),
         })
       },
+    )
+    .put(
+      "/provider/:id",
+      describeRoute({
+        summary: "Persist config provider",
+        description: "Persistently add or update a provider block in config.",
+        operationId: "config.provider.set",
+        responses: {
+          200: {
+            description: "Provider persisted successfully",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ success: z.literal(true) })),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator("param", z.object({ id: z.string() })),
+      validator(
+        "json",
+        z.object({
+          provider: Config.Provider,
+          scope: Config.Scope.optional(),
+        }),
+      ),
+      async (c) => {
+        const { id } = c.req.valid("param")
+        const { provider, scope = "global" } = c.req.valid("json")
+        await Config.setProvider(id, provider, scope)
+        return c.json({ success: true as const })
+      },
+    )
+    .delete(
+      "/provider/:id",
+      describeRoute({
+        summary: "Remove config provider",
+        description: "Remove a provider block from config.",
+        operationId: "config.provider.remove",
+        responses: {
+          200: {
+            description: "Provider removed",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ success: z.literal(true) })),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator("param", z.object({ id: z.string() })),
+      validator("query", z.object({ scope: Config.Scope.optional() })),
+      async (c) => {
+        const { id } = c.req.valid("param")
+        const { scope = "global" } = c.req.valid("query")
+        await Config.removeProvider(id, scope)
+        return c.json({ success: true as const })
+      },
     ),
 )
