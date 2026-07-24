@@ -81,13 +81,23 @@ At the START of the task, before Stage 1, set up the graph:
 2. **Load prior graph state — optional, best-effort.** Run `atlas doctor --format=json`. If it
    reports the `atlas` CLI is unavailable/unauthenticated, skip the `atlas ...` commands below
    and continue — this does NOT undo step 1, which already created the graph. If doctor is OK,
-   run `atlas nodes:list --format=json` to load prior hypotheses, runs, and decisions.
-When the `atlas` CLI is available (step 2), as you reach milestones record each as a graph node
-with `atlas nodes:create` — one node per hypothesis, planned experiment, or completed run
-(success OR failure), setting its `kind` accordingly; attach artifacts/results with
-`atlas evidence:add` and connect related nodes with `atlas link:add`. Re-run `atlas nodes:list`
-to drive the next cycle. This is additive: keep writing your local markdown and files exactly
-as before.
+   run `atlas node:list --format=json` to load prior hypotheses, runs, and decisions.
+When the `atlas` CLI is available (step 2), record milestones as first-class TYPED nodes,
+passing the `--project_id` from step 1 and `--format=json` (capture the returned `node_id`/slug
+to link later nodes):
+- **Hypothesis** → `atlas hypothesis:add --project_id <id> --claim "<one-sentence falsifiable claim>"`
+  (optional `--rationale`, `--expected_observations`, `--disconfirmers`, `--status`).
+- **Planned experiment** → `atlas experiment:plan --project_id <id> --hypothesis_id <hyp>`
+  (optional `--title`, `--metric`, `--success_criterion`, `--config`, `--risks`).
+- **Completed run** (success OR failure) → `atlas run:record --hypothesis_id <hyp>`
+  (optional `--metrics_json`, `--outcome`, `--failure_mode`; auto-captures git state + EVAL.md).
+- **Decision** → `atlas decision:add --project_id <id> --decision "<one sentence>"`
+  (optional `--basis <node ids>`, `--alternatives`, `--confidence`).
+Attach artifacts/results with `atlas evidence:add --node_id <node> --items ...` and connect
+related nodes with `atlas link:add --node_id <child> --parent_id <parent>`. Re-run
+`atlas node:list` to drive the next cycle. (Prefer these typed commands over the generic
+`atlas node:create`, which requires a full `--payload_json` envelope.) This is additive: keep
+writing your local markdown and files exactly as before.
 
 ### Stage 1: SCOPE
 Define the research question, hypothesis, and success criteria.
