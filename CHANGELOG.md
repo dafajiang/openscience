@@ -15,8 +15,8 @@ tagged release also ships native binaries for Linux, macOS, and Windows.
   project as their author. Each now carries its original author and source
   in its frontmatter (`metadata.upstream*`), `backend/cli/skills/ATTRIBUTION.md`
   lists them all with upstream paths and licenses, and `NOTICE` and the
-  README credit the sources: OpenCode, the harness this project is built on
-  (MIT); K-Dense Inc.'s [Scientific Agent Skills](https://github.com/K-Dense-AI/scientific-agent-skills)
+  README credit the sources: OpenCode, which inspired this project (MIT);
+  K-Dense Inc.'s [Scientific Agent Skills](https://github.com/K-Dense-AI/scientific-agent-skills)
   and [Claude Scientific Writer](https://github.com/K-Dense-AI/claude-scientific-writer)
   (MIT; 180 skills); Orchestra Research's [AI Research Skills](https://github.com/Orchestra-Research/AI-Research-SKILLs)
   (MIT; 79 skills); Hugging Face's skills (Apache-2.0); Anthropic's document

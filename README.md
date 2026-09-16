@@ -181,7 +181,7 @@ The desktop app updates itself. For the CLI, run `openscience upgrade`, or `npm 
 
 ## Acknowledgements
 
-OpenScience is inspired by, and built on, [OpenCode](https://opencode.ai) by [Anomaly](https://github.com/anomalyco/opencode). The agent loop, tool runtime, provider layer, session storage, SDK and plugin packages, the shared UI components and the desktop shell started as a fork of OpenCode (MIT), and the landing site follows the opencode.ai layout. Thank you to the OpenCode team for the harness this grew from.
+OpenScience is inspired by [OpenCode](https://opencode.ai) by [Anomaly](https://github.com/anomalyco/opencode) and shares its commitment to excellent open-source agents. We want to bring strong, open-source scientific agents to everyone.
 
 Most of the bundled skills come from open collections written by other people:
 

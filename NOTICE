@@ -7,14 +7,12 @@ Licensed under the Apache License, Version 2.0.
 It bundles or accesses the following third-party software and services.
 
 --------------------------------------------------------------------------------
-OpenCode (the agent harness OpenScience is built on)
+OpenCode
 https://github.com/anomalyco/opencode · https://opencode.ai
 
-OpenScience began as a fork of OpenCode. The research loop, tool runtime,
-provider layer, session storage, local server, plugin and SDK packages under
-backend/cli, tooling/plugin and tooling/sdk, the shared component library under
-frontend/ui, and the desktop shell under frontend/desktop are derived from it,
-and the landing site follows the opencode.ai layout.
+OpenScience is inspired by OpenCode and its work toward excellent open-source
+agents. OpenScience applies that inspiration to making strong, open-source
+scientific agents available to everyone.
 
 MIT License
 
