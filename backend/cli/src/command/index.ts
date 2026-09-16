@@ -1,14 +1,30 @@
 import { BusEvent } from "@/bus/bus-event"
+import path from "node:path"
 import z from "zod"
 import { Config } from "../config/config"
+import { ConfigMarkdown } from "../config/markdown"
 import { Instance } from "../project/instance"
 import { Identifier } from "../id/id"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_REVIEW from "./template/review.txt"
-import PROMPT_LEARN from "./template/learn.txt"
+import PROMPT_REPRODUCE from "./template/reproduce.txt"
+import PROMPT_LITERATURE from "./template/literature.txt"
 import { MCP } from "../mcp"
+import { State } from "../project/state"
+import { BundledSkills } from "../skill/bundled"
 
 export namespace Command {
+  async function workflow(name: string) {
+    const root = await BundledSkills.root()
+    if (!root) throw new Error("Bundled research workflow skill is unavailable")
+    const dir = path.join(root, "research", "research-workflows")
+    const [skill, reference] = await Promise.all([
+      ConfigMarkdown.parse(path.join(dir, "SKILL.md")),
+      Bun.file(path.join(dir, "references", `${name}.md`)).text(),
+    ])
+    return [skill.content.trim(), reference.trim()].join("\n\n")
+  }
+
   export const Event = {
     Executed: BusEvent.define(
       "command.executed",
@@ -28,6 +44,9 @@ export namespace Command {
       agent: z.string().optional(),
       model: z.string().optional(),
       mcp: z.boolean().optional(),
+      source: z.enum(["builtin", "project", "mcp"]).optional(),
+      category: z.enum(["session", "research", "evidence", "output", "project"]).optional(),
+      usage: z.string().optional(),
       // Surface this command in the composer slash menu. Only no-argument action
       // commands (e.g. /compact) should set it — arg-taking prompt-template
       // commands can't receive their args from that menu.
@@ -57,46 +76,119 @@ export namespace Command {
 
   export const Default = {
     INIT: "init",
+    PLAN: "plan",
+    GOAL: "goal",
     REVIEW: "review",
-    LEARN: "learn",
+    REPRODUCE: "reproduce",
+    LITERATURE: "literature",
+    STOP: "stop",
     COMPACT: "compact",
     HANDOFF: "handoff",
+    CHECKPOINT: "checkpoint",
   } as const
 
-  const state = Instance.state(async () => {
-    const cfg = await Config.get()
+  const compute = async () => {
+    // Command templates may contain executable shell interpolation (`!` +
+    // backticks). Project-owned command definitions therefore belong to the
+    // same trust boundary as every other executable project setting.
+    const cfg = await Config.getExecution()
 
     const result: Record<string, Info> = {
       [Default.INIT]: {
         name: Default.INIT,
-        description: "create/update AGENTS.md",
+        description: "Write this project's AGENTS.md: question, data, conventions, deliverables",
+        source: "builtin",
+        category: "project",
+        usage: "/init [notes]",
         get template() {
           return PROMPT_INITIALIZE.replace("${path}", Instance.worktree)
         },
         hints: hints(PROMPT_INITIALIZE),
       },
+      [Default.PLAN]: {
+        name: Default.PLAN,
+        description: "Read-only plan mode; produce a decision-ready plan before doing",
+        source: "builtin",
+        category: "research",
+        usage: "/plan [objective]",
+        agent: "plan",
+        get template() {
+          return workflow(Default.PLAN)
+        },
+        subtask: false,
+        hints: ["$ARGUMENTS"],
+      },
+      [Default.GOAL]: {
+        name: Default.GOAL,
+        description: "Set a persistent objective and work toward it until done",
+        source: "builtin",
+        category: "research",
+        usage: "/goal [objective]",
+        get template() {
+          return [
+            "The user set a persistent goal for this session.",
+            "Treat it as binding: write the deliverables checklist first with the todo tool, begin now, and continue until every item is complete or genuinely blocked.",
+            "Keep the user informed at meaningful milestones and verify the requested outcome before declaring completion.",
+            "",
+            "Objective:",
+            "$ARGUMENTS",
+          ].join("\n")
+        },
+        hints: ["$ARGUMENTS"],
+      },
+      [Default.STOP]: {
+        name: Default.STOP,
+        description: "Stop the active turn, compute, or everything in this session",
+        source: "builtin",
+        category: "session",
+        usage: "/stop [turn|compute|all]",
+        menu: true,
+        get template() {
+          return ""
+        },
+        hints: [],
+      },
       [Default.REVIEW]: {
         name: Default.REVIEW,
-        description: "review changes [commit|branch|pr], defaults to uncommitted",
+        description: "Referee the current deliverables with the peer-review skill",
+        source: "builtin",
+        category: "evidence",
+        usage: "/review [focus]",
         get template() {
-          return PROMPT_REVIEW.replace("${path}", Instance.worktree)
+          return PROMPT_REVIEW
         },
-        subtask: true,
         hints: hints(PROMPT_REVIEW),
       },
-      [Default.LEARN]: {
-        name: Default.LEARN,
-        description: "distill conversation into a reusable learned skill",
+      [Default.REPRODUCE]: {
+        name: Default.REPRODUCE,
+        description: "Reproduce a stated result with the reproduce skill",
+        source: "builtin",
+        category: "research",
+        usage: "/reproduce [claim, paper or result]",
         get template() {
-          return PROMPT_LEARN
+          return PROMPT_REPRODUCE
         },
-        hints: hints(PROMPT_LEARN),
+        hints: hints(PROMPT_REPRODUCE),
+      },
+      [Default.LITERATURE]: {
+        name: Default.LITERATURE,
+        description: "Focused literature review with the literature-review skill",
+        source: "builtin",
+        category: "research",
+        usage: "/literature [question]",
+        get template() {
+          return PROMPT_LITERATURE
+        },
+        hints: hints(PROMPT_LITERATURE),
       },
       // Action command, not a prompt template — SessionPrompt.command intercepts
       // it and runs SessionCompaction directly. The empty template is never used.
       [Default.COMPACT]: {
         name: Default.COMPACT,
-        description: "summarize the conversation so far to free up context",
+        description: "Summarize the conversation so far to free up context",
+        source: "builtin",
+        category: "session",
+        usage: "/compact [focus]",
         menu: true,
         get template() {
           return ""
@@ -105,7 +197,22 @@ export namespace Command {
       },
       [Default.HANDOFF]: {
         name: Default.HANDOFF,
-        description: "write a self-contained handoff.md for another agent, then compact",
+        description: "Write a self-contained handoff.md for another agent, then compact",
+        source: "builtin",
+        category: "session",
+        usage: "/handoff [project-relative path]",
+        menu: true,
+        get template() {
+          return ""
+        },
+        hints: [],
+      },
+      [Default.CHECKPOINT]: {
+        name: Default.CHECKPOINT,
+        description: "Capture a local recovery packet from the session state",
+        source: "builtin",
+        category: "session",
+        usage: "/checkpoint [label]",
         menu: true,
         get template() {
           return ""
@@ -117,6 +224,8 @@ export namespace Command {
     for (const [name, command] of Object.entries(cfg.command ?? {})) {
       result[name] = {
         name,
+        source: "project",
+        category: "project",
         agent: command.agent,
         model: command.model,
         description: command.description,
@@ -131,6 +240,7 @@ export namespace Command {
       result[name] = {
         name,
         mcp: true,
+        source: "mcp",
         description: prompt.description,
         get template() {
           // since a getter can't be async we need to manually return a promise here
@@ -155,7 +265,15 @@ export namespace Command {
     }
 
     return result
-  })
+  }
+
+  const state = Instance.state(compute)
+
+  /** Drop project-derived command and MCP-prompt definitions after an
+   * authority transition. The next read rebuilds against current trust. */
+  export function invalidate() {
+    State.clear(Instance.directory, compute)
+  }
 
   export async function get(name: string) {
     return state().then((x) => x[name])

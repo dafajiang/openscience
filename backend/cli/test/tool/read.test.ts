@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import path from "path"
+import fs from "fs/promises"
 import { ReadTool } from "../../src/tool/read"
 import { Instance } from "../../src/project/instance"
 import { tmpdir } from "../fixture/fixture"
 import { PermissionNext } from "../../src/permission/next"
 import { Agent } from "../../src/agent/agent"
+import { SessionFilesystem } from "../../src/session/filesystem"
 
 const FIXTURES_DIR = path.join(import.meta.dir, "fixtures")
 
@@ -123,9 +125,71 @@ describe("tool.read external_directory permission", () => {
       },
     })
   })
+
+  test("asks for external_directory permission when an internal symlink resolves outside the project", async () => {
+    await using outside = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "secret.txt"), "external secret")
+      },
+    })
+    await using tmp = await tmpdir({
+      git: true,
+      init: async (dir) => {
+        await fs.symlink(outside.path, path.join(dir, "escape"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const requests: Array<Omit<PermissionNext.Request, "id" | "sessionID" | "tool">> = []
+        const testCtx = {
+          ...ctx,
+          ask: async (req: Omit<PermissionNext.Request, "id" | "sessionID" | "tool">) => {
+            requests.push(req)
+          },
+        }
+        const read = await ReadTool.init()
+        const result = await read.execute({ filePath: path.join(tmp.path, "escape", "secret.txt") }, testCtx)
+        expect(result.output).toContain("external secret")
+        expect(requests.some((request) => request.permission === "external_directory")).toBe(true)
+      },
+    })
+  })
+
+  test("refuses a file swapped to a symlink during read approval", async () => {
+    if (process.platform === "win32") return
+    await using outside = await tmpdir({
+      init: (dir) => Bun.write(path.join(dir, "secret.txt"), "must remain private"),
+    })
+    await using tmp = await tmpdir({
+      init: (dir) => Bun.write(path.join(dir, "target.txt"), "approved public bytes"),
+    })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const target = path.join(tmp.path, "target.txt")
+        const read = await ReadTool.init()
+        await expect(
+          read.execute(
+            { filePath: target },
+            {
+              ...ctx,
+              ask: async (request) => {
+                if (request.permission !== "read") return
+                await fs.unlink(target)
+                await fs.symlink(path.join(outside.path, "secret.txt"), target)
+              },
+            },
+          ),
+        ).rejects.toBeInstanceOf(SessionFilesystem.InvalidPathError)
+        expect(await fs.readFile(path.join(outside.path, "secret.txt"), "utf8")).toBe("must remain private")
+      },
+    })
+  })
 })
 
-describe("tool.read env file permissions", () => {
+describe("tool.read env file permissions in the default contained mode", () => {
   const cases: [string, boolean][] = [
     [".env", true],
     [".env.local", true],
@@ -170,6 +234,56 @@ describe("tool.read env file permissions", () => {
 })
 
 describe("tool.read truncation", () => {
+  test("streams a bounded window from a huge sparse text file", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        const handle = await fs.open(path.join(dir, "huge.txt"), "w")
+        await handle.write(`first\nsecond\n${"padding\n".repeat(10_000)}`)
+        await handle.truncate(512 * 1024 * 1024)
+        await handle.close()
+      },
+    })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const read = await ReadTool.init()
+        const result = await read.execute({ filePath: path.join(tmp.path, "huge.txt"), limit: 1 }, ctx)
+        expect(result.output).toContain("first")
+        expect(result.output).not.toContain("second")
+        expect(result.output).toContain("File has more lines")
+        expect(result.output.length).toBeLessThan(10_000)
+        expect(result.metadata.truncated).toBe(true)
+      },
+    })
+  })
+
+  test("rejects an oversized PDF before allocating its contents", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        const handle = await fs.open(path.join(dir, "huge.pdf"), "w")
+        await handle.write("%PDF-1.7\n")
+        await handle.truncate(32 * 1024 * 1024 + 1)
+        await handle.close()
+      },
+    })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const read = await ReadTool.init()
+        await expect(read.execute({ filePath: path.join(tmp.path, "huge.pdf") }, ctx)).rejects.toThrow(
+          "PDF too large to attach (33554433 bytes > 33554432)",
+        )
+      },
+    })
+  })
+
+  test("rejects invalid line windows before touching the file", async () => {
+    const read = await ReadTool.init()
+    await expect(read.execute({ filePath: "missing.txt", offset: -1 }, ctx)).rejects.toThrow("invalid arguments")
+    await expect(read.execute({ filePath: "missing.txt", offset: 1.5 }, ctx)).rejects.toThrow("invalid arguments")
+    await expect(read.execute({ filePath: "missing.txt", limit: 10_001 }, ctx)).rejects.toThrow("invalid arguments")
+  })
+
   test("truncates large file by bytes and sets truncated metadata", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
@@ -288,7 +402,7 @@ describe("tool.read truncation", () => {
     })
   })
 
-  test("images with any dimension > 2000px are rejected to avoid poisoning session history", async () => {
+  test("Anthropic images with any dimension > 2000px are rejected to avoid poisoning session history", async () => {
     // The fixture at large-image.png is 2560x1422. Anthropic's API rejects
     // images with any dimension > 2000px in multi-image requests, and a single
     // rejected image poisons every subsequent turn in the session. The Read
@@ -297,9 +411,27 @@ describe("tool.read truncation", () => {
       directory: FIXTURES_DIR,
       fn: async () => {
         const read = await ReadTool.init()
-        await expect(read.execute({ filePath: path.join(FIXTURES_DIR, "large-image.png") }, ctx)).rejects.toThrow(
-          /Image too large to attach \(2560x1422\)/,
+        await expect(
+          read.execute(
+            { filePath: path.join(FIXTURES_DIR, "large-image.png") },
+            { ...ctx, extra: { model: { providerID: "anthropic", id: "claude-sonnet" } } },
+          ),
+        ).rejects.toThrow(/Image too large to attach \(2560x1422\)/)
+      },
+    })
+  })
+
+  test("does not apply Anthropic's image dimension limit to an OpenAI model routed through OpenRouter", async () => {
+    await Instance.provide({
+      directory: FIXTURES_DIR,
+      fn: async () => {
+        const read = await ReadTool.init()
+        const result = await read.execute(
+          { filePath: path.join(FIXTURES_DIR, "large-image.png") },
+          { ...ctx, extra: { model: { providerID: "openrouter", id: "openai/gpt-5.6-sol" } } },
         )
+        expect(result.attachments).toHaveLength(1)
+        expect(result.output).toBe("Image read successfully")
       },
     })
   })

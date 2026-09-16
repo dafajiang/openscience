@@ -2,20 +2,46 @@ import type { Ghostty, Terminal as Term, FitAddon } from "ghostty-web"
 import { ComponentProps, createEffect, createSignal, onCleanup, onMount, splitProps } from "solid-js"
 import { useSDK } from "@/context/sdk"
 import { monoFontFamily, useSettings } from "@/context/settings"
-import { SerializeAddon } from "@/addons/serialize"
 import { LocalPTY } from "@/context/terminal"
 import { connectionError } from "./terminal-error"
 import { resolveThemeVariant, useTheme, withAlpha, type HexColor } from "@synsci/ui/theme"
 import { useLanguage } from "@/context/language"
 import { showToast } from "@synsci/ui/toast"
+import { terminalMatches, type TerminalMatch } from "./terminal-search"
 
 export interface TerminalProps extends ComponentProps<"div"> {
   pty: LocalPTY
+  active?: boolean
   onSubmit?: () => void
   onCleanup?: (pty: LocalPTY) => void
   onConnect?: () => void
   onConnectError?: (error: Error) => void
+  onReady?: (controller?: TerminalController) => void
+  onOpenSearch?: () => void
 }
+
+export type TerminalSearchResult = {
+  current: number
+  total: number
+}
+
+export type TerminalController = {
+  focus: () => void
+  clearSelection: () => void
+  search: (query: string, direction?: "next" | "previous") => TerminalSearchResult
+}
+
+const REPLAY_REQUEST = "\0"
+// SGR reset, erase the screen, erase the scrollback, home the cursor. Sent through the VT stream
+// rather than Terminal.reset(): ghostty-web 0.3.0 frees and reallocates the wasm terminal there while
+// the selection manager keeps the freed handle, which silently breaks copy after every reconnect.
+const ERASE = "\x1b[0m\x1b[2J\x1b[3J\x1b[H"
+const RECONNECT_LIMIT = 5
+
+// Mirrors reconnectDelay in @/context/reconnecting-event-stream: 250 ms doubling to a 5 s cap.
+// Returns undefined once the attempt budget is spent so the caller reports the loss instead.
+export const backoff = (failures: number) =>
+  failures > RECONNECT_LIMIT ? undefined : Math.min(250 * 2 ** Math.max(0, failures - 1), 5000)
 
 let shared: Promise<{ mod: typeof import("ghostty-web"); ghostty: Ghostty }> | undefined
 
@@ -28,6 +54,10 @@ const loadGhostty = () => {
       throw err
     })
   return shared
+}
+
+export const preloadTerminal = () => {
+  void loadGhostty().catch(() => {})
 }
 
 type TerminalColors = {
@@ -58,10 +88,22 @@ export const Terminal = (props: TerminalProps) => {
   const theme = useTheme()
   const language = useLanguage()
   let container!: HTMLDivElement
-  const [local, others] = splitProps(props, ["pty", "class", "classList", "onConnect", "onConnectError"])
+  const [local, others] = splitProps(props, [
+    "pty",
+    "active",
+    "class",
+    "classList",
+    "onConnect",
+    "onConnectError",
+    "onSubmit",
+    "onCleanup",
+    "onReady",
+    "onOpenSearch",
+  ])
   let term: Term | undefined
-  let serializeAddon: SerializeAddon
-  let fitAddon: FitAddon
+  let fitAddon: FitAddon | undefined
+  let fitFrame: number | undefined
+  let fitTimer: number | undefined
   let handleResize: () => void
   let handleTextareaFocus: () => void
   let handleTextareaBlur: () => void
@@ -78,6 +120,29 @@ export const Terminal = (props: TerminalProps) => {
         // ignore
       }
     }
+  }
+
+  const fitTerminal = () => {
+    const fit = fitAddon
+    if (!fit || local.active === false) return
+    fit.fit()
+    if (fitFrame !== undefined) cancelAnimationFrame(fitFrame)
+    fitFrame = requestAnimationFrame(() => {
+      fitFrame = undefined
+      paintTerminal()
+      if (fitTimer !== undefined) window.clearTimeout(fitTimer)
+      fitTimer = window.setTimeout(() => {
+        fitTimer = undefined
+        fit.fit()
+        paintTerminal()
+      }, 75)
+    })
+  }
+
+  const paintTerminal = () => {
+    const t = term
+    if (!t?.renderer || !t.wasmTerm) return
+    t.renderer.render(t.wasmTerm, true, t.getViewportY(), t)
   }
 
   const getTerminalColors = (): TerminalColors => {
@@ -118,6 +183,7 @@ export const Terminal = (props: TerminalProps) => {
     const setOption = (term as unknown as { setOption?: (key: string, value: string) => void }).setOption
     if (!setOption) return
     setOption("fontFamily", font)
+    fitTerminal()
   })
 
   const focusTerminal = () => {
@@ -131,8 +197,18 @@ export const Terminal = (props: TerminalProps) => {
     if (activeElement instanceof HTMLElement && activeElement !== container) {
       activeElement.blur()
     }
+    fitTerminal()
     focusTerminal()
   }
+
+  createEffect(() => {
+    if (!local.active || !term) return
+    fitTerminal()
+    queueMicrotask(() => {
+      paintTerminal()
+      focusTerminal()
+    })
+  })
 
   onMount(() => {
     const run = async () => {
@@ -144,15 +220,6 @@ export const Terminal = (props: TerminalProps) => {
 
       const once = { value: false }
 
-      const url = new URL(sdk.url + `/pty/${local.pty.id}/connect?directory=${encodeURIComponent(sdk.directory)}`)
-      const socket = new WebSocket(url)
-      cleanups.push(() => {
-        if (socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) socket.close()
-      })
-      if (disposed) {
-        cleanup()
-        return
-      }
       const t = new mod.Terminal({
         cursorBlink: true,
         cursorStyle: "bar",
@@ -170,44 +237,112 @@ export const Terminal = (props: TerminalProps) => {
       }
       term = t
 
-      const copy = () => {
-        const selection = t.getSelection()
-        if (!selection) return false
-
+      const fallback = (value: string) => {
         const body = document.body
-        if (body) {
-          const textarea = document.createElement("textarea")
-          textarea.value = selection
-          textarea.setAttribute("readonly", "")
-          textarea.style.position = "fixed"
-          textarea.style.opacity = "0"
-          body.appendChild(textarea)
-          textarea.select()
-          const copied = document.execCommand("copy")
-          body.removeChild(textarea)
-          if (copied) return true
-        }
+        if (!body) return false
+        const textarea = document.createElement("textarea")
+        textarea.value = value
+        textarea.setAttribute("readonly", "")
+        textarea.style.position = "fixed"
+        textarea.style.opacity = "0"
+        body.appendChild(textarea)
+        textarea.select()
+        const copied = document.execCommand("copy")
+        body.removeChild(textarea)
+        return copied
+      }
 
+      const write = (value: string) => {
+        if (!value) return Promise.resolve(false)
+        if (fallback(value)) return Promise.resolve(true)
         const clipboard = navigator.clipboard
         if (clipboard?.writeText) {
-          clipboard.writeText(selection).catch(() => {})
-          return true
+          return clipboard.writeText(value).then(
+            () => true,
+            () => false,
+          )
         }
-
-        return false
+        return Promise.resolve(false)
       }
+
+      const state = {
+        query: "",
+        index: -1,
+        matches: [] as TerminalMatch[],
+      }
+
+      const controller: TerminalController = {
+        focus: () => {
+          fitTerminal()
+          focusTerminal()
+        },
+        clearSelection: () => t.clearSelection(),
+        search: (query, direction = "next") => {
+          const needle = query.toLocaleLowerCase()
+          if (!needle) {
+            state.query = ""
+            state.index = -1
+            state.matches = []
+            t.clearSelection()
+            return { current: 0, total: 0 }
+          }
+
+          if (state.query !== needle) {
+            state.query = needle
+            state.index = -1
+            const lines = Array.from(
+              { length: t.buffer.active.length },
+              (_, row) => t.buffer.active.getLine(row)?.translateToString(true) ?? "",
+            )
+            state.matches = terminalMatches(lines, query)
+          }
+
+          if (!state.matches.length) {
+            t.clearSelection()
+            return { current: 0, total: 0 }
+          }
+
+          const offset = direction === "previous" ? -1 : 1
+          state.index = (state.index + offset + state.matches.length) % state.matches.length
+          const match = state.matches[state.index]
+          t.select(match.column, match.row, match.length)
+          t.scrollToLine(match.row)
+          return { current: state.index + 1, total: state.matches.length }
+        },
+      }
+
+      local.onReady?.(controller)
+      cleanups.push(() => local.onReady?.())
 
       t.attachCustomKeyEventHandler((event) => {
         const key = event.key.toLowerCase()
 
         if (event.ctrlKey && event.shiftKey && !event.metaKey && key === "c") {
-          copy()
+          void write(t.getSelection())
           return true
         }
 
         if (event.metaKey && !event.ctrlKey && !event.altKey && key === "c") {
           if (!t.hasSelection()) return true
-          copy()
+          void write(t.getSelection())
+          return true
+        }
+
+        if (event.ctrlKey && !event.shiftKey && !event.metaKey && key === "insert") {
+          void write(t.getSelection())
+          return true
+        }
+
+        if (
+          (event.metaKey && !event.ctrlKey && !event.altKey && key === "f") ||
+          (event.ctrlKey && event.shiftKey && !event.metaKey && key === "f")
+        ) {
+          local.onOpenSearch?.()
+          return true
+        }
+
+        if (event.metaKey && !event.ctrlKey && !event.altKey && key === "a") {
+          t.selectAll()
           return true
         }
 
@@ -220,16 +355,21 @@ export const Terminal = (props: TerminalProps) => {
       })
 
       const fit = new mod.FitAddon()
-      const serializer = new SerializeAddon()
       cleanups.push(() => (fit as unknown as { dispose?: VoidFunction }).dispose?.())
-      t.loadAddon(serializer)
       t.loadAddon(fit)
       fitAddon = fit
-      serializeAddon = serializer
 
       t.open(container)
       container.addEventListener("pointerdown", handlePointerDown)
       cleanups.push(() => container.removeEventListener("pointerdown", handlePointerDown))
+      const handlePointerUp = () => {
+        queueMicrotask(() => {
+          if (!t.hasSelection()) return
+          void write(t.getSelection())
+        })
+      }
+      container.addEventListener("pointerup", handlePointerUp, true)
+      cleanups.push(() => container.removeEventListener("pointerup", handlePointerUp, true))
 
       handleTextareaFocus = () => {
         t.options.cursorBlink = true
@@ -243,26 +383,95 @@ export const Terminal = (props: TerminalProps) => {
       cleanups.push(() => t.textarea?.removeEventListener("focus", handleTextareaFocus))
       cleanups.push(() => t.textarea?.removeEventListener("blur", handleTextareaBlur))
 
-      focusTerminal()
+      if (local.active !== false) focusTerminal()
 
-      if (local.pty.buffer) {
-        if (local.pty.rows && local.pty.cols) {
-          t.resize(local.pty.cols, local.pty.rows)
-        }
-        t.write(local.pty.buffer, () => {
-          if (local.pty.scrollY) {
-            t.scrollToLine(local.pty.scrollY)
-          }
-          fitAddon.fit()
+      if (local.pty.rows && local.pty.cols) t.resize(local.pty.cols, local.pty.rows)
+
+      const link = {
+        socket: undefined as WebSocket | undefined,
+        timer: undefined as number | undefined,
+        failures: 0,
+        detach: () => {},
+      }
+      const replay = { painted: false }
+      const handleMessage = (event: MessageEvent) => {
+        // Data proves the link works, so only now does the retry budget refill.
+        link.failures = 0
+        t.write(event.data, () => {
+          if (replay.painted) return
+          replay.painted = true
+          fitTerminal()
+          paintTerminal()
         })
       }
+      const url = new URL(sdk.request.url(`/pty/${local.pty.id}/connect`))
+      const connect = () => {
+        if (disposed) return
+        link.timer = undefined
+        // A superseded socket is closed and silent; drop its listeners anyway rather than leak them.
+        link.detach()
+        const socket = new WebSocket(url)
+        const handleOpen = () => {
+          // The server replays its whole buffer to every fresh subscriber, so erase the stale
+          // screen and scrollback first or the scrollback doubles on each reconnect.
+          if (link.failures) t.write(ERASE)
+          local.onConnect?.()
+          fitTerminal()
+          socket.send(REPLAY_REQUEST)
+          sdk.client.pty
+            .update({
+              ptyID: local.pty.id,
+              size: {
+                cols: t.cols,
+                rows: t.rows,
+              },
+            })
+            .catch(() => {})
+        }
+        const handleError = (error: Event) => {
+          if (disposed) return
+          // A socket error is always followed by a close event, which owns the retry.
+          console.error("WebSocket error:", error)
+        }
+        const handleClose = (event: CloseEvent) => {
+          if (disposed) return
+          // Normal closure (code 1000) means PTY process exited - server event handles cleanup
+          if (event.code === 1000) return
+          // For other codes (network issues, server restart), retry with backoff before reporting once
+          link.failures += 1
+          const delay = backoff(link.failures)
+          if (delay !== undefined) {
+            link.timer = window.setTimeout(connect, delay)
+            return
+          }
+          if (once.value) return
+          once.value = true
+          local.onConnectError?.(new Error(`WebSocket closed abnormally: ${event.code}`))
+        }
+        socket.addEventListener("open", handleOpen)
+        socket.addEventListener("message", handleMessage)
+        socket.addEventListener("error", handleError)
+        socket.addEventListener("close", handleClose)
+        link.socket = socket
+        link.detach = () => {
+          socket.removeEventListener("open", handleOpen)
+          socket.removeEventListener("message", handleMessage)
+          socket.removeEventListener("error", handleError)
+          socket.removeEventListener("close", handleClose)
+        }
+      }
+      cleanups.push(() => {
+        if (link.timer !== undefined) window.clearTimeout(link.timer)
+        link.timer = undefined
+        link.detach()
+        const socket = link.socket
+        if (!socket) return
+        if (socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) socket.close()
+      })
+      connect()
 
-      fit.observeResize()
-      handleResize = () => fit.fit()
-      window.addEventListener("resize", handleResize)
-      cleanups.push(() => window.removeEventListener("resize", handleResize))
       const onResize = t.onResize(async (size) => {
-        if (socket.readyState === WebSocket.OPEN) {
+        if (link.socket?.readyState === WebSocket.OPEN) {
           await sdk.client.pty
             .update({
               ptyID: local.pty.id,
@@ -275,10 +484,14 @@ export const Terminal = (props: TerminalProps) => {
         }
       })
       cleanups.push(() => (onResize as unknown as { dispose?: VoidFunction }).dispose?.())
+      fit.observeResize()
+      handleResize = fitTerminal
+      window.addEventListener("resize", handleResize)
+      cleanups.push(() => window.removeEventListener("resize", handleResize))
+      fitTerminal()
       const onData = t.onData((data) => {
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.send(data)
-        }
+        const socket = link.socket
+        if (socket?.readyState === WebSocket.OPEN) socket.send(data)
       })
       cleanups.push(() => (onData as unknown as { dispose?: VoidFunction }).dispose?.())
       const onKey = t.onKey((key) => {
@@ -287,53 +500,6 @@ export const Terminal = (props: TerminalProps) => {
         }
       })
       cleanups.push(() => (onKey as unknown as { dispose?: VoidFunction }).dispose?.())
-      // t.onScroll((ydisp) => {
-      // console.log("Scroll position:", ydisp)
-      // })
-
-      const handleOpen = () => {
-        local.onConnect?.()
-        sdk.client.pty
-          .update({
-            ptyID: local.pty.id,
-            size: {
-              cols: t.cols,
-              rows: t.rows,
-            },
-          })
-          .catch(() => {})
-      }
-      socket.addEventListener("open", handleOpen)
-      cleanups.push(() => socket.removeEventListener("open", handleOpen))
-
-      const handleMessage = (event: MessageEvent) => {
-        t.write(event.data)
-      }
-      socket.addEventListener("message", handleMessage)
-      cleanups.push(() => socket.removeEventListener("message", handleMessage))
-
-      const handleError = (error: Event) => {
-        if (disposed) return
-        if (once.value) return
-        once.value = true
-        console.error("WebSocket error:", error)
-        local.onConnectError?.(connectionError(error))
-      }
-      socket.addEventListener("error", handleError)
-      cleanups.push(() => socket.removeEventListener("error", handleError))
-
-      const handleClose = (event: CloseEvent) => {
-        if (disposed) return
-        // Normal closure (code 1000) means PTY process exited - server event handles cleanup
-        // For other codes (network issues, server restart), trigger error handler
-        if (event.code !== 1000) {
-          if (once.value) return
-          once.value = true
-          local.onConnectError?.(new Error(`WebSocket closed abnormally: ${event.code}`))
-        }
-      }
-      socket.addEventListener("close", handleClose)
-      cleanups.push(() => socket.removeEventListener("close", handleClose))
     }
 
     void run().catch((err) => {
@@ -349,21 +515,16 @@ export const Terminal = (props: TerminalProps) => {
 
   onCleanup(() => {
     disposed = true
+    if (fitFrame !== undefined) cancelAnimationFrame(fitFrame)
+    if (fitTimer !== undefined) window.clearTimeout(fitTimer)
     const t = term
-    if (serializeAddon && props.onCleanup && t) {
-      const buffer = (() => {
-        try {
-          return serializeAddon.serialize()
-        } catch {
-          return ""
-        }
-      })()
+    if (props.onCleanup && t) {
       props.onCleanup({
         ...local.pty,
-        buffer,
+        buffer: undefined,
         rows: t.rows,
         cols: t.cols,
-        scrollY: t.getViewportY(),
+        scrollY: undefined,
       })
     }
 

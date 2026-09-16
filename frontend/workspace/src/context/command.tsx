@@ -8,8 +8,6 @@ import { Persist, persisted } from "@/utils/persist"
 
 const IS_MAC = typeof navigator === "object" && /(Mac|iPod|iPhone|iPad)/.test(navigator.platform)
 
-const PALETTE_ID = "command.palette"
-const DEFAULT_PALETTE_KEYBIND = "mod+shift+p"
 const SUGGESTED_PREFIX = "suggested."
 
 function actionId(id: string) {
@@ -29,8 +27,16 @@ function signature(key: string, ctrl: boolean, meta: boolean, shift: boolean, al
   return `${key}:${mask}`
 }
 
+// Shift changes `event.key` for symbol keys (Shift+` reports "~" on US layouts),
+// so a binding written as ctrl+shift+` never matched. The physical key code is
+// layout-stable for the one symbol key we bind.
+function eventKey(event: KeyboardEvent) {
+  if (event.code === "Backquote") return "`"
+  return normalizeKey(event.key)
+}
+
 function signatureFromEvent(event: KeyboardEvent) {
-  return signature(normalizeKey(event.key), event.ctrlKey, event.metaKey, event.shiftKey, event.altKey)
+  return signature(eventKey(event), event.ctrlKey, event.metaKey, event.shiftKey, event.altKey)
 }
 
 export type KeybindConfig = string
@@ -110,10 +116,10 @@ export function parseKeybind(config: string): Keybind[] {
 }
 
 export function matchKeybind(keybinds: Keybind[], event: KeyboardEvent): boolean {
-  const eventKey = normalizeKey(event.key)
+  const key = eventKey(event)
 
   for (const kb of keybinds) {
-    const keyMatch = kb.key === eventKey
+    const keyMatch = kb.key === key
     const ctrlMatch = kb.ctrl === (event.ctrlKey || false)
     const metaMatch = kb.meta === (event.metaKey || false)
     const shiftMatch = kb.shift === (event.shiftKey || false)
@@ -127,7 +133,7 @@ export function matchKeybind(keybinds: Keybind[], event: KeyboardEvent): boolean
   return false
 }
 
-export function formatKeybind(config: string): string {
+function formatKeybind(config: string): string {
   if (!config || config === "none") return ""
 
   const keybinds = parseKeybind(config)
@@ -234,12 +240,6 @@ export const { use: useCommand, provider: CommandProvider } = createSimpleContex
 
     const suspended = () => store.suspendCount > 0
 
-    const palette = createMemo(() => {
-      const config = settings.keybinds.get(PALETTE_ID) ?? DEFAULT_PALETTE_KEYBIND
-      const keybinds = parseKeybind(config)
-      return new Set(keybinds.map((kb) => signature(kb.key, kb.ctrl, kb.meta, kb.shift, kb.alt)))
-    })
-
     const keymap = createMemo(() => {
       const map = new Map<string, CommandOption>()
       for (const option of options()) {
@@ -267,21 +267,10 @@ export const { use: useCommand, provider: CommandProvider } = createSimpleContex
       }
     }
 
-    const showPalette = () => {
-      run("file.open", "palette")
-    }
-
     const handleKeyDown = (event: KeyboardEvent) => {
       if (suspended() || dialog.active) return
 
       const sig = signatureFromEvent(event)
-
-      if (palette().has(sig)) {
-        event.preventDefault()
-        showPalette()
-        return
-      }
-
       const option = keymap().get(sig)
       if (!option) return
       event.preventDefault()
@@ -308,10 +297,6 @@ export const { use: useCommand, provider: CommandProvider } = createSimpleContex
         run(id, source)
       },
       keybind(id: string) {
-        if (id === PALETTE_ID) {
-          return formatKeybind(settings.keybinds.get(PALETTE_ID) ?? DEFAULT_PALETTE_KEYBIND)
-        }
-
         const base = actionId(id)
         const option = options().find((x) => actionId(x.id) === base)
         if (option?.keybind) return formatKeybind(option.keybind)
@@ -321,7 +306,6 @@ export const { use: useCommand, provider: CommandProvider } = createSimpleContex
         if (!config) return ""
         return formatKeybind(config)
       },
-      show: showPalette,
       keybinds(enabled: boolean) {
         setStore("suspendCount", (count) => count + (enabled ? -1 : 1))
       },

@@ -1,311 +1,382 @@
-// General — Account, Model defaults, and Licensing, plus the appearance/theme
-// controls. Everything here is wired to a real endpoint:
-//   • Account   → client.account.get / client.account.logout, billing link.
-//   • Model      → global config `model` / `small_model` (client.global.config.update
-//                  via useGlobalSync().updateConfig) + the reasoning effort store.
-//   • Licensing  → /settings/preferences (real JSON store, persisted to ~/.openscience).
-//   • Appearance → the extracted AppearanceSections (theme, sounds, updates, …).
-import { Component, Show, createMemo, createSignal, onMount, type JSX } from "solid-js"
 import { Button } from "@synsci/ui/button"
 import { Select } from "@synsci/ui/select"
-import { showToast } from "@synsci/ui/toast"
+import { useDialog } from "@synsci/ui/context/dialog"
+import { Show, createMemo, createSignal, onCleanup, onMount, type Component, type JSX } from "solid-js"
+import { confirmDialog } from "@/atlas/dialogs"
+import { URLS } from "@/config/urls"
 import { useGlobalSDK } from "@/context/global-sdk"
 import { useGlobalSync } from "@/context/global-sync"
-import { useModels } from "@/context/models"
 import { usePlatform } from "@/context/platform"
-import { useServer } from "@/context/server"
-import { URLS } from "@/config/urls"
-import { FONT_CODE, FONT_SANS } from "@/styles/tokens"
 import { AppearanceSections } from "../settings-general"
+import { PanelBody, PanelHeader, PanelScroll, Section } from "./_shared"
 import { settingsApi } from "./api"
+import { LoginApproval } from "./LoginApproval"
+import { walletBalanceLabel } from "./credit-balance"
+import { ProviderLogo } from "./ProviderLogo"
+import { ACCOUNT_DEADLINE_MS, withAccountDeadline } from "./account-deadline"
+import "./preference-panels.css"
+
+type FundingOrganization = {
+  organization_id: string
+  name: string
+  is_personal: boolean
+  status: string
+  membership_status: string
+  funding_available?: boolean
+  use_shared_wallet?: boolean
+}
+
+type FundingContext = {
+  type: "personal" | "organization"
+  organization_id?: string
+  available: boolean
+  locked: boolean
+  organizations: FundingOrganization[]
+}
 
 type Account = {
-  session?: boolean
-  user?: Record<string, unknown> & { email?: string; subscription_plan?: string }
-  balance_usd?: number
-  billing_mode?: { mode: "byok" | "managed" } | null
+  session: boolean
+  /** True when these are the stored values and the server is reading newer ones. */
+  refreshing?: boolean
+  refreshed_at?: number | null
+  /** Why the server's latest refresh failed while stored values are shown. */
+  error?: string
+  user?: Record<string, unknown> & { email?: string }
+  balance_usd: number | null
+  available_usd?: number | null
+  funding_context: FundingContext
+  credential?: { type: "personal" | "organization"; legacy: boolean } | null
+  credential_sync?: SyncStatus
 }
+type SyncStatus = { state: "disconnected" | "syncing" | "ready" | "error"; error?: string }
 
-type Preferences = {
-  reasoning_effort: "minimal" | "low" | "medium" | "high"
-  intent: "commercial" | "non-commercial"
-  extra_budget_usd: number
-}
+type LoginResult = { ok: boolean; error?: string }
+type WorkspaceOption = { value: string; label: string }
 
-const REASONING = [
-  { value: "minimal", label: "Minimal" },
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-] as const
+const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 export default function General() {
   const sdk = useGlobalSDK()
   const sync = useGlobalSync()
-  const models = useModels()
   const platform = usePlatform()
-  const server = useServer()
-
-  const fetchFn = () => platform.fetch ?? fetch
-  const base = () => server.url
-
-  const [account, setAccount] = createSignal<Account | undefined>()
-  const [prefs, setPrefs] = createSignal<Preferences | undefined>()
+  const dialog = useDialog()
+  const fetchFn = platform.fetch ?? fetch
+  const [account, setAccount] = createSignal<Account>()
   const [error, setError] = createSignal<string>()
-  const [busy, setBusy] = createSignal(false)
+  const [busy, setBusy] = createSignal<"login" | "logout" | "workspace" | "sync">()
 
-  const loadAccount = async () => {
-    try {
-      const res = await sdk.client.account.get()
-      setAccount(((res as any).data ?? res) as Account)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-  const loadPrefs = async () => {
-    try {
-      setPrefs(await settingsApi<Preferences>(base(), fetchFn(), "/settings/preferences"))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-  onMount(() => {
+  const loadAccount = () =>
+    withAccountDeadline((signal) => settingsApi<Account>(sdk.url, fetchFn, "/account", { signal }), ACCOUNT_DEADLINE_MS)
+      .then(setAccount)
+      .catch((cause) => setError(errorMessage(cause)))
+
+  const refreshAccount = () => {
+    setError(undefined)
     void loadAccount()
-    void loadPrefs()
+  }
+
+  const syncCredentials = async () => {
+    if (busy()) return
+    setBusy("sync")
+    setError(undefined)
+    try {
+      const result = await withAccountDeadline(
+        (signal) => settingsApi<SyncStatus>(sdk.url, fetchFn, "/account/sync", { method: "POST", signal }),
+        ACCOUNT_DEADLINE_MS,
+      )
+      setAccount((current) => current && { ...current, credential_sync: result })
+      if (result.state !== "ready") throw new Error(result.error ?? "Sign in to sync workspace credentials.")
+      void sync
+        .refreshProviders()
+        .catch((cause) => setError(`Credentials synced, but models could not refresh: ${errorMessage(cause)}`))
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const login = async (context: "login" | "workspace") => {
+    if (busy()) return
+    setBusy(context)
+    setError(undefined)
+    try {
+      const result = await settingsApi<LoginResult>(sdk.url, fetchFn, "/account/login-browser", { method: "POST" })
+      if (!result.ok) throw new Error(result.error || "Sign in did not complete. Try again.")
+      window.dispatchEvent(new Event("openscience:account-changed"))
+      void sync
+        .refreshProviders()
+        .catch((cause) => setError(`Account connected, but models could not refresh: ${errorMessage(cause)}`))
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const logout = async () => {
+    if (busy()) return
+    const confirmed = await confirmDialog(dialog, {
+      title: "Disconnect Ace account?",
+      message: "This disconnects this device. Local projects, files, and your provider connections stay here.",
+      confirmLabel: "Disconnect",
+      danger: true,
+    })
+    if (!confirmed) return
+    setBusy("logout")
+    setError(undefined)
+    try {
+      await settingsApi<boolean>(sdk.url, fetchFn, "/account/logout", { method: "POST" })
+      window.dispatchEvent(new Event("openscience:account-changed"))
+      void sync
+        .refreshProviders()
+        .catch((cause) => setError(`Account disconnected, but models could not refresh: ${errorMessage(cause)}`))
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const workspaceOptions = createMemo<WorkspaceOption[]>(() => {
+    const context = account()?.funding_context
+    if (!context) return []
+    const personal: WorkspaceOption = { value: "personal", label: "Personal" }
+    const organizations = context.organizations
+      .filter(
+        (organization) =>
+          !organization.is_personal &&
+          organization.status === "active" &&
+          organization.membership_status === "active" &&
+          organization.funding_available !== false &&
+          organization.use_shared_wallet !== false,
+      )
+      .map((organization) => ({ value: organization.organization_id, label: organization.name }))
+    return [personal, ...organizations]
+  })
+  const workspaceValue = createMemo(() => {
+    const context = account()?.funding_context
+    const selected = context?.organizations.find((item) => item.organization_id === context.organization_id)
+    return selected?.is_personal ? "personal" : (context?.organization_id ?? "personal")
+  })
+  const workspace = createMemo(() => workspaceOptions().find((option) => option.value === workspaceValue()))
+  const workspaceLabel = createMemo(() => {
+    const context = account()?.funding_context
+    const selected = context?.organizations.find((item) => item.organization_id === context.organization_id)
+    return selected?.name ?? workspace()?.label ?? (context?.organization_id ? "Selected workspace" : "Personal")
+  })
+  const canDirectlySwitchWorkspace = createMemo(
+    () =>
+      account()?.credential?.type === "organization" &&
+      account()?.credential?.legacy === false &&
+      account()?.funding_context.locked === false,
+  )
+  // A workspace-scoped key may only enumerate its own workspace. Browser
+  // approval discovers other memberships without widening that key's access.
+  const needsBrowserWorkspaceApproval = createMemo(() => Boolean(account()?.session) && !canDirectlySwitchWorkspace())
+
+  const setWorkspace = async (option: WorkspaceOption | undefined) => {
+    if (!option || busy() || option.value === workspaceValue()) return
+    if (!canDirectlySwitchWorkspace()) {
+      await login("workspace")
+      return
+    }
+    setBusy("workspace")
+    setError(undefined)
+    try {
+      const funding_context = await settingsApi<FundingContext>(sdk.url, fetchFn, "/account/funding-context", {
+        method: "PUT",
+        body: JSON.stringify({ organization_id: option.value === "personal" ? null : option.value }),
+      })
+      setAccount((current) => (current ? { ...current, funding_context } : current))
+      window.dispatchEvent(new Event("openscience:account-changed"))
+      void sync
+        .refreshProviders()
+        .catch((cause) => setError(`Workspace changed, but models could not refresh: ${errorMessage(cause)}`))
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  // The server stored a newer summary after serving the previous one; the
+  // re-read keeps the current values on screen until the new ones land.
+  const unsubscribeAccount = sync.onAccountRefreshed(refreshAccount)
+  onMount(() => {
+    refreshAccount()
+    window.addEventListener("focus", refreshAccount)
+    window.addEventListener("openscience:account-changed", refreshAccount)
+  })
+  onCleanup(() => {
+    window.removeEventListener("focus", refreshAccount)
+    window.removeEventListener("openscience:account-changed", refreshAccount)
+    unsubscribeAccount()
   })
 
-  const savePref = async (patch: Partial<Preferences>) => {
-    const next = await settingsApi<Preferences>(base(), fetchFn(), "/settings/preferences", {
-      method: "PATCH",
-      body: JSON.stringify(patch),
+  const email = () => {
+    if (!account()) return error() ? "Account unavailable" : "Checking…"
+    if (!account()!.session) return "Not connected"
+    return account()!.user?.email || "Connected"
+  }
+  const wallet = () => {
+    if (!account()) return error() ? "Unavailable" : "Checking…"
+    const label = walletBalanceLabel({
+      signedIn: account()!.session,
+      balanceUsd: account()!.balance_usd,
+      availableUsd: account()!.available_usd,
     })
-    setPrefs(next)
-  }
-
-  const signOut = async () => {
-    if (!window.confirm("Disconnect this local server from OpenScience?")) return
-    setBusy(true)
-    try {
-      const res = await sdk.client.account.logout()
-      if (res.error)
-        throw new Error(typeof res.error === "string" ? res.error : "The server could not clear the session")
-      setAccount({ session: false })
-    } catch (err) {
-      showToast({ variant: "error", title: "Sign out failed", description: message(err) })
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  // Model catalog → dropdown options (provider/model). Persisted to real config.
-  const modelOptions = createMemo(() =>
-    models
-      .list()
-      .map((m) => ({ value: `${m.provider.id}/${m.id}`, label: `${m.name} · ${m.provider.name}` }))
-      .sort((a, b) => a.label.localeCompare(b.label)),
-  )
-  const defaultModel = () => sync.data.config.model
-  const subagentModel = () => sync.data.config.small_model
-  const setDefaultModel = (value: string) => void sync.updateConfig({ model: value })
-  const setSubagentModel = (value: string) => void sync.updateConfig({ small_model: value })
-
-  const plan = () => (account()?.user?.subscription_plan as string | undefined) ?? undefined
-  const org = () => {
-    const u = account()?.user ?? {}
-    return (u.organization ?? u.org ?? u.team ?? u.organization_name) as string | undefined
+    return account()!.refreshing ? `${label} · Refreshing…` : label
   }
 
   return (
-    <div class="flex flex-col h-full overflow-y-auto no-scrollbar px-4 pb-10 sm:px-8">
-      <div class="sticky top-0 z-10 bg-[linear-gradient(to_bottom,var(--surface-raised-stronger-non-alpha)_calc(100%_-_24px),transparent)]">
-        <div class="flex flex-col gap-1 pt-8 pb-8 max-w-[760px]">
-          <h2 class="text-16-medium text-text-strong">General</h2>
-          <p class="text-13-regular text-text-weak">Your account, default models, licensing, and appearance.</p>
-        </div>
-      </div>
+    <PanelScroll>
+      <div class="settings-preferences-panel settings-preferences-panel--general">
+        <PanelHeader title="General" description="Ace account and app preferences." />
+        <PanelBody>
+          <Show when={error()}>
+            <div class="settings-alert" data-tone="critical" role="alert">
+              {error()}
+            </div>
+          </Show>
 
-      <div class="flex flex-col gap-8 w-full max-w-[760px]">
-        <Show when={error()}>
-          <div
-            style={{
-              "font-family": FONT_SANS,
-              "font-size": "12px",
-              color: "var(--color-error)",
-              border: "1px solid var(--color-error-muted)",
-              "border-radius": "4px",
-              padding: "10px 12px",
-            }}
+          <Section
+            id="ace-account"
+            title="Ace account"
+            description="Your optional Synthetic Sciences sign-in and purchased Wallet balance."
           >
-            {error()}
-          </div>
-        </Show>
-
-        {/* Account */}
-        <Section title="Account" description="Your OpenScience identity and subscription.">
-          <div class="border border-border-weak-base rounded-[4px] overflow-hidden bg-surface-base/40">
-            <Row title="Email">
-              <span class="text-13-regular text-text-strong">
-                {(account()?.user?.email as string) ?? (account()?.session === false ? "Not connected" : "—")}
-              </span>
-            </Row>
-            <Row title="Plan">
-              <span class="text-13-regular text-text-strong capitalize">{plan() ?? "Free"}</span>
-            </Row>
-            <Show when={org()}>
-              <Row title="Organization">
-                <span class="text-13-regular text-text-strong">{org()}</span>
-              </Row>
-            </Show>
-            <Row title="Billing" description="Manage your subscription, wallet, and invoices.">
-              <Button size="small" variant="secondary" onClick={() => platform.openLink(URLS.dashboardCli)}>
-                manage billing
-              </Button>
-            </Row>
-            <Row title="Session" description="Disconnect this machine from OpenScience.">
-              <Button
-                size="small"
-                variant="secondary"
-                disabled={busy() || account()?.session === false}
-                onClick={() => void signOut()}
-              >
-                sign out
-              </Button>
-            </Row>
-            <Show when={account()?.session === false}>
-              <div class="px-4 py-3">
-                <p class="text-12-regular text-text-weak">
-                  Signed out — run{" "}
-                  <code style={{ "font-family": FONT_CODE, "font-size": "11px" }}>openscience connect login</code> in a
-                  terminal to reconnect this machine.
-                </p>
+            <div class="settings-card settings-preferences-card settings-account-card">
+              <div class="settings-row settings-preference-row">
+                <span class="settings-preference-icon settings-account-logo" aria-hidden="true">
+                  <ProviderLogo id="synsci" label="Ace" />
+                </span>
+                <div class="settings-row-copy">
+                  <strong>{email()}</strong>
+                  <span>
+                    {account()?.session ? "Connected on this device" : "Sign in for Ace or workspace credentials"}
+                  </span>
+                </div>
+                <div class="settings-preference-row__actions">
+                  <Show
+                    when={account()?.session}
+                    fallback={
+                      <div class="flex flex-col items-end">
+                        <Button
+                          size="small"
+                          variant="primary"
+                          disabled={Boolean(busy())}
+                          onClick={() => void login("login")}
+                        >
+                          {busy() === "login" ? "Waiting for browser…" : "Sign in"}
+                        </Button>
+                        <LoginApproval active={busy() === "login"} openLink={(url) => platform.openLink(url)} />
+                      </div>
+                    }
+                  >
+                    <Button size="small" variant="secondary" disabled={Boolean(busy())} onClick={() => void logout()}>
+                      {busy() === "logout" ? "Disconnecting…" : "Disconnect"}
+                    </Button>
+                  </Show>
+                </div>
               </div>
-            </Show>
-          </div>
-        </Section>
 
-        {/* Model */}
-        <Section title="Model" description="Defaults applied to new sessions and background tasks.">
-          <div class="border border-border-weak-base rounded-[4px] overflow-hidden bg-surface-base/40">
-            <Row title="Default model" description="Primary model used when a session starts.">
-              <Select
-                options={modelOptions()}
-                current={modelOptions().find((o) => o.value === defaultModel())}
-                value={(o) => o.value}
-                label={(o) => o.label}
-                onSelect={(o) => o && setDefaultModel(o.value)}
-                variant="secondary"
-                size="small"
-                triggerVariant="settings"
-                placeholder="Auto"
-              />
-            </Row>
-            <Row title="Subagent model" description="Model for titles, summaries, and subagent tasks (small_model).">
-              <Select
-                options={modelOptions()}
-                current={modelOptions().find((o) => o.value === subagentModel())}
-                value={(o) => o.value}
-                label={(o) => o.label}
-                onSelect={(o) => o && setSubagentModel(o.value)}
-                variant="secondary"
-                size="small"
-                triggerVariant="settings"
-                placeholder="Auto"
-              />
-            </Row>
-            <Row title="Reasoning effort" description="Thinking budget for models that support it.">
-              <Select
-                options={[...REASONING]}
-                current={REASONING.find((o) => o.value === prefs()?.reasoning_effort) ?? REASONING[2]}
-                value={(o) => o.value}
-                label={(o) => o.label}
-                onSelect={(o) => o && void savePref({ reasoning_effort: o.value })}
-                variant="secondary"
-                size="small"
-                triggerVariant="settings"
-              />
-            </Row>
-          </div>
-        </Section>
+              <AccountRow title="Purchased Wallet" description="Available purchased funds for Ace.">
+                <span class="settings-account-value">{wallet()}</span>
+                <Button size="small" variant="secondary" onClick={() => platform.openLink(URLS.dashboardBilling)}>
+                  Manage billing
+                </Button>
+              </AccountRow>
 
-        {/* Licensing */}
-        <Section title="Licensing" description="How you intend to use outputs from OpenScience.">
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            <IntentCard
-              active={prefs()?.intent === "non-commercial"}
-              title="Non-commercial"
-              body="Research, evaluation, and personal projects."
-              onClick={() => void savePref({ intent: "non-commercial" })}
-            />
-            <IntentCard
-              active={prefs()?.intent === "commercial"}
-              title="Commercial"
-              body="Use in a product or for-profit work."
-              onClick={() => void savePref({ intent: "commercial" })}
-            />
-          </div>
-        </Section>
+              <Show when={account()?.session && account()?.funding_context}>
+                <AccountRow
+                  title="Workspace credentials"
+                  description="Synced to this device. Local keys take priority."
+                >
+                  <span class="settings-account-value" aria-live="polite">
+                    {busy() === "sync"
+                      ? "Syncing…"
+                      : account()?.credential_sync?.state === "ready"
+                        ? "Up to date"
+                        : account()?.credential_sync?.state === "error"
+                          ? "Sync unavailable"
+                          : "Ready to sync"}
+                  </span>
+                  <Button
+                    size="small"
+                    variant="secondary"
+                    disabled={Boolean(busy())}
+                    onClick={() => void syncCredentials()}
+                  >
+                    {account()?.credential_sync?.state === "error" ? "Retry sync" : "Sync now"}
+                  </Button>
+                </AccountRow>
+                <AccountRow
+                  title="Funding workspace"
+                  description={
+                    needsBrowserWorkspaceApproval()
+                      ? "Ace uses this Wallet. Switching requires browser approval."
+                      : "Ace uses this Wallet, with no automatic fallback to another workspace."
+                  }
+                >
+                  <Show
+                    when={canDirectlySwitchWorkspace() && workspaceOptions().length > 1}
+                    fallback={
+                      <span class="settings-account-value">
+                        {workspaceLabel()}
+                        {account()!.funding_context.available ? "" : " · Unavailable"}
+                      </span>
+                    }
+                  >
+                    <div class="settings-account-workspace">
+                      <Select
+                        aria-label="Funding workspace"
+                        options={workspaceOptions()}
+                        current={workspace()}
+                        value={(option) => option.value}
+                        label={(option) => option.label}
+                        disabled={busy() === "workspace"}
+                        onSelect={(option) => void setWorkspace(option)}
+                        variant="secondary"
+                        size="small"
+                        triggerVariant="settings"
+                      />
+                    </div>
+                  </Show>
+                  <Show when={needsBrowserWorkspaceApproval()}>
+                    <div class="flex flex-col items-end">
+                      <Button
+                        size="small"
+                        variant="secondary"
+                        disabled={Boolean(busy())}
+                        onClick={() => void login("workspace")}
+                      >
+                        {busy() === "workspace" ? "Waiting for browser…" : "Switch workspace"}
+                      </Button>
+                      <LoginApproval active={busy() === "workspace"} openLink={(url) => platform.openLink(url)} />
+                    </div>
+                  </Show>
+                </AccountRow>
+              </Show>
+            </div>
+          </Section>
 
-        {/* Appearance / theme / notifications / sounds / updates */}
-        <AppearanceSections />
+          <AppearanceSections />
+        </PanelBody>
       </div>
-    </div>
+    </PanelScroll>
   )
 }
 
-function message(err: unknown) {
-  return err instanceof Error ? err.message : String(err)
-}
-
-const Section: Component<{ title: string; description?: string; children: JSX.Element }> = (props) => (
-  <div class="flex flex-col gap-3">
-    <div class="flex flex-col gap-0.5">
-      <h3 class="text-13-medium text-text-weak tracking-wide">{props.title}</h3>
-      <Show when={props.description}>
-        <p class="text-12-regular text-text-weak">{props.description}</p>
-      </Show>
+const AccountRow: Component<{
+  title: string
+  description: string
+  children: JSX.Element
+}> = (props) => (
+  <div class="settings-row settings-preference-row">
+    <div class="settings-row-copy">
+      <strong>{props.title}</strong>
+      <span>{props.description}</span>
     </div>
-    {props.children}
+    <div class="settings-preference-row__actions">{props.children}</div>
   </div>
-)
-
-const Row: Component<{ title: string; description?: string; children: JSX.Element }> = (props) => (
-  <div class="flex flex-wrap items-center justify-between gap-4 px-4 py-3.5 border-b border-border-weak-base last:border-none">
-    <div class="flex flex-col gap-0.5 min-w-0">
-      <span class="text-14-medium text-text-strong">{props.title}</span>
-      <Show when={props.description}>
-        <span class="text-12-regular text-text-weak">{props.description}</span>
-      </Show>
-    </div>
-    <div class="flex-shrink-0">{props.children}</div>
-  </div>
-)
-
-const IntentCard: Component<{ active: boolean; title: string; body: string; onClick: () => void }> = (props) => (
-  <button
-    type="button"
-    onClick={props.onClick}
-    style={{
-      all: "unset",
-      cursor: "pointer",
-      display: "flex",
-      "flex-direction": "column",
-      gap: "5px",
-      padding: "14px 16px",
-      "border-radius": "4px",
-      border: "1px solid var(--color-border)",
-      "box-shadow": props.active ? "inset 0 0 0 1px var(--color-text-interactive-base, var(--color-text))" : "none",
-      background: props.active ? "var(--color-surface-interactive-weak, var(--color-accent-subtle))" : "transparent",
-      transition: "border-color 120ms, box-shadow 120ms, background 120ms",
-    }}
-  >
-    <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between" }}>
-      <span class="text-14-medium text-text-strong">{props.title}</span>
-      <Show when={props.active}>
-        <span style={{ "font-family": FONT_SANS, "font-size": "11px", color: "var(--color-text-muted)" }}>active</span>
-      </Show>
-    </div>
-    <span class="text-12-regular text-text-weak" style={{ "line-height": 1.5 }}>
-      {props.body}
-    </span>
-  </button>
 )

@@ -8,8 +8,8 @@
  * (best-effort, in parallel) with a title and experimental metadata from the
  * data API. Enrichment failures degrade gracefully to the bare identifier.
  */
-import type { Connector, ConnectorHit, FetchOptions, SearchOptions } from "../types"
-import { getJSON, orFallback } from "../http"
+import type { Connector, ConnectorHit, FetchedFile, FetchOptions, SearchOptions } from "../types"
+import { getJSON, getText } from "../http"
 import { asArray, clampLimit, firstString, toRaw } from "./util"
 
 interface SearchResult {
@@ -29,6 +29,8 @@ interface EntryCore {
 }
 
 const DATA_ENTRY = "https://data.rcsb.org/rest/v1/core/entry"
+// Coordinates live on a different host from the JSON entry record.
+const FILES = "https://files.rcsb.org/download"
 
 async function enrich(id: string, signal?: AbortSignal): Promise<ConnectorHit> {
   const base: ConnectorHit = {
@@ -47,8 +49,13 @@ async function enrich(id: string, signal?: AbortSignal): Promise<ConnectorHit> {
       summary: parts.length ? parts.join(", ") : undefined,
       extra: toRaw(e),
     }
-  } catch {
-    return base
+  } catch (error) {
+    signal?.throwIfAborted()
+    return {
+      ...base,
+      summary: "Search matched this identifier; record enrichment was unavailable.",
+      extra: { enrichment: "unavailable" },
+    }
   }
 }
 
@@ -67,11 +74,7 @@ export const rcsbPdb: Connector = {
       request_options: { paginate: { start: 0, rows } },
     }
     const url = `https://search.rcsb.org/rcsbsearch/v2/query?json=${encodeURIComponent(JSON.stringify(payload))}`
-    const data = await orFallback(
-      getJSON<SearchResponse>(url, { signal: opts?.signal }),
-      {} as SearchResponse,
-      opts?.signal,
-    )
+    const data = await getJSON<SearchResponse>(url, { signal: opts?.signal })
     const hits = asArray<SearchResult>(data.result_set).filter((r) => typeof r.identifier === "string")
     const enriched = await Promise.all(
       hits.map(async (r) => {
@@ -84,5 +87,13 @@ export const rcsbPdb: Connector = {
 
   async fetch(id, opts?: FetchOptions): Promise<unknown> {
     return getJSON(`${DATA_ENTRY}/${encodeURIComponent(id)}`, { signal: opts?.signal })
+  },
+
+  formats: ["pdb", "cif"],
+
+  async fetchFile(id, format, opts?: FetchOptions): Promise<FetchedFile> {
+    const name = `${id.toUpperCase()}.${format}`
+    const body = await getText(`${FILES}/${encodeURIComponent(name)}`, { signal: opts?.signal })
+    return { body, contentType: format === "cif" ? "chemical/x-cif" : "chemical/x-pdb", filename: name }
   },
 }

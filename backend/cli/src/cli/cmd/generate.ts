@@ -1,7 +1,7 @@
 import { Server } from "../../server/server"
-import type { CommandModule } from "yargs"
+import { cmd } from "./cmd"
 
-export const GenerateCommand = {
+export const GenerateCommand = cmd({
   command: "generate",
   handler: async () => {
     const specs = await Server.openapi()
@@ -14,7 +14,7 @@ export const GenerateCommand = {
           {
             lang: "js",
             source: [
-              `import { createOpenScienceClient } from "@synsci/sdk`,
+              `import { createOpenScienceClient } from "@synsci/sdk"`,
               ``,
               `const client = createOpenScienceClient()`,
               `await client.${operation.operationId}({`,
@@ -35,4 +35,4 @@ export const GenerateCommand = {
       })
     })
   },
-} satisfies CommandModule
+})

@@ -1,8 +1,9 @@
-import { type JSX, Show, For, onMount, onCleanup } from "solid-js"
-import { Portal } from "solid-js/web"
-import { FONT_MONO, FONT_SANS, FONT_SERIF } from "@/styles/tokens"
+import { createEffect, type JSX, For, onCleanup } from "solid-js"
+import { Dialog as Kobalte } from "@kobalte/core/dialog"
+import { FONT_SANS } from "@/styles/tokens"
 import { IconX } from "@/atlas/shared/Icon"
 import { AgentIcon } from "@/atlas/shared/AgentIcon"
+import { useCommand } from "@/context/command"
 
 interface HelpOverlayProps {
   open: boolean
@@ -11,42 +12,65 @@ interface HelpOverlayProps {
 
 const SECTIONS: Array<{ title: string; rows: Array<{ keys: string[]; label: string }> }> = [
   {
-    title: "navigation",
+    title: "Navigation",
     rows: [
-      { keys: ["⌘", "K"], label: "command palette" },
-      { keys: ["⌘", "N"], label: "open folder / new project" },
-      { keys: ["?"], label: "open this help" },
+      { keys: ["⌘", "K"], label: "Open the command palette" },
+      { keys: ["⌘", "N"], label: "Create a project or session" },
+      { keys: ["?"], label: "Open keyboard shortcuts" },
     ],
   },
   {
-    title: "chat",
+    title: "Chat",
     rows: [
-      { keys: ["↵"], label: "send message" },
-      { keys: ["⇧", "↵"], label: "newline in composer" },
-      { keys: ["/"], label: "skill menu" },
-      { keys: ["esc"], label: "close modal" },
+      { keys: ["↵"], label: "Send message" },
+      { keys: ["⇧", "↵"], label: "Insert a new line" },
+      { keys: ["/"], label: "Open skills and commands" },
+      { keys: ["Esc"], label: "Close the active dialog" },
     ],
   },
   {
-    title: "sessions",
-    rows: [{ keys: ["dbl-click"], label: "rename a session" }],
+    title: "Sessions",
+    rows: [{ keys: ["Double-click"], label: "Rename a session" }],
   },
 ]
 
 export function HelpOverlay(props: HelpOverlayProps): JSX.Element {
-  onMount(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && props.open) props.onClose()
-    }
-    window.addEventListener("keydown", onKey)
-    onCleanup(() => window.removeEventListener("keydown", onKey))
+  const command = useCommand()
+  let closeRef: HTMLButtonElement | undefined
+  let restoreFocus: HTMLElement | undefined
+
+  createEffect(() => {
+    if (!props.open) return
+    command.keybinds(false)
+    onCleanup(() => command.keybinds(true))
   })
 
   return (
-    <Show when={props.open}>
-      <Portal>
-        <div class="atlas-overlay" onClick={props.onClose} />
-        <div class="atlas-modal" style={{ width: "560px", "max-width": "94vw" }} onClick={(e) => e.stopPropagation()}>
+    <Kobalte
+      modal
+      open={props.open}
+      onOpenChange={(open) => {
+        if (!open) props.onClose()
+      }}
+    >
+      <Kobalte.Portal>
+        <Kobalte.Overlay class="atlas-overlay" />
+        <Kobalte.Content
+          class="atlas-modal"
+          role="dialog"
+          aria-modal="true"
+          style={{ width: "560px", "max-width": "94vw" }}
+          onOpenAutoFocus={(event) => {
+            event.preventDefault()
+            const active = document.activeElement
+            restoreFocus = active instanceof HTMLElement && active !== document.body ? active : undefined
+            closeRef?.focus()
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            if (restoreFocus?.isConnected) restoreFocus.focus()
+          }}
+        >
           <div
             style={{
               display: "flex",
@@ -56,30 +80,40 @@ export function HelpOverlay(props: HelpOverlayProps): JSX.Element {
               "border-bottom": "1px solid var(--color-border)",
             }}
           >
-            <AgentIcon size={20} strokeWidth={1.5} animated={true} />
-            <span
+            <AgentIcon size={20} strokeWidth={1.5} />
+            <Kobalte.Title
               style={{
-                "font-family": FONT_SERIF,
+                "font-family": FONT_SANS,
                 "font-size": "22px",
+                "font-weight": "var(--font-weight-medium)",
+                "line-height": 1.2,
                 "letter-spacing": "-0.01em",
+                margin: 0,
                 color: "var(--color-text)",
               }}
             >
-              keyboard shortcuts
-            </span>
+              Keyboard shortcuts
+            </Kobalte.Title>
             <span style={{ flex: 1 }} />
-            <button
-              onClick={props.onClose}
+            <Kobalte.CloseButton
+              ref={closeRef}
+              type="button"
+              aria-label="Close keyboard shortcuts"
               style={{
                 all: "unset",
+                "box-sizing": "border-box",
                 cursor: "pointer",
                 color: "var(--color-text-faint)",
                 display: "inline-flex",
-                padding: "4px",
+                width: "40px",
+                height: "40px",
+                "align-items": "center",
+                "justify-content": "center",
+                "border-radius": "6px",
               }}
             >
               <IconX size={14} strokeWidth={1.5} />
-            </button>
+            </Kobalte.CloseButton>
           </div>
           <div
             class="atlas-scroll"
@@ -97,10 +131,9 @@ export function HelpOverlay(props: HelpOverlayProps): JSX.Element {
                 <section style={{ display: "flex", "flex-direction": "column", gap: "8px" }}>
                   <div
                     style={{
-                      "font-family": FONT_MONO,
+                      "font-family": FONT_SANS,
                       "font-size": "10px",
-                      "letter-spacing": "0.08em",
-                      "text-transform": "uppercase",
+                      "letter-spacing": "normal",
                       color: "var(--color-text-faint)",
                     }}
                   >
@@ -121,7 +154,7 @@ export function HelpOverlay(props: HelpOverlayProps): JSX.Element {
                             {(k) => (
                               <kbd
                                 style={{
-                                  "font-family": FONT_MONO,
+                                  "font-family": FONT_SANS,
                                   "font-size": "10px",
                                   padding: "2px 6px",
                                   border: "1px solid var(--color-border)",
@@ -153,8 +186,8 @@ export function HelpOverlay(props: HelpOverlayProps): JSX.Element {
               )}
             </For>
           </div>
-        </div>
-      </Portal>
-    </Show>
+        </Kobalte.Content>
+      </Kobalte.Portal>
+    </Kobalte>
   )
 }

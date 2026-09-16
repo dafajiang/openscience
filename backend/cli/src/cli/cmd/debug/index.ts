@@ -9,6 +9,7 @@ import { ScrapCommand } from "./scrap"
 import { SkillCommand } from "./skill"
 import { SnapshotCommand } from "./snapshot"
 import { AgentCommand } from "./agent"
+import { CapabilityCanaryCommand } from "./capability-canary"
 
 export const DebugCommand = cmd({
   command: "debug",
@@ -23,16 +24,19 @@ export const DebugCommand = cmd({
       .command(SkillCommand)
       .command(SnapshotCommand)
       .command(AgentCommand)
+      .command(CapabilityCanaryCommand)
       .command(PathsCommand)
-      .command({
-        command: "wait",
-        describe: "wait indefinitely (for debugging)",
-        async handler() {
-          await bootstrap(process.cwd(), async () => {
-            await new Promise((resolve) => setTimeout(resolve, 1_000 * 60 * 60 * 24))
-          })
-        },
-      })
+      .command(
+        cmd({
+          command: "wait",
+          describe: "wait indefinitely (for debugging)",
+          async handler() {
+            await bootstrap(process.cwd(), async () => {
+              await new Promise((resolve) => setTimeout(resolve, 1_000 * 60 * 60 * 24))
+            })
+          },
+        }),
+      )
       .demandCommand(),
   async handler() {},
 })
@@ -40,9 +44,10 @@ export const DebugCommand = cmd({
 const PathsCommand = cmd({
   command: "paths",
   describe: "show global paths (data, config, cache, state)",
-  handler() {
+  async handler() {
+    // dataTarget resolves the managed data-root link; print the path, not the promise.
     for (const [key, value] of Object.entries(Global.Path)) {
-      console.log(key.padEnd(10), value)
+      console.log(key.padEnd(10), await value)
     }
   },
 })

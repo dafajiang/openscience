@@ -3,6 +3,7 @@ import { BunProc } from "../bun"
 import { Instance } from "../project/instance"
 import { Filesystem } from "../util/filesystem"
 import { Flag } from "@/flag/flag"
+import { ProjectTrust } from "@/project/trust"
 
 export interface Info {
   name: string
@@ -10,6 +11,14 @@ export interface Info {
   environment?: Record<string, string>
   extensions: string[]
   enabled(): Promise<boolean>
+  /** The formatter resolves project binaries or may load executable project config/plugins. */
+  project?: boolean
+}
+
+async function projectBinary(bin: string) {
+  const local = Instance.containsPath(bin) || (await Instance.containsCanonicalPath(bin))
+  if (!local) return
+  await ProjectTrust.require(Instance.project, "project_formatter")
 }
 
 export const gofmt: Info = {
@@ -25,6 +34,7 @@ export const mix: Info = {
   name: "mix",
   command: ["mix", "format", "$FILE"],
   extensions: [".ex", ".exs", ".eex", ".heex", ".leex", ".neex", ".sface"],
+  project: true,
   async enabled() {
     return Bun.which("mix") !== null
   },
@@ -33,6 +43,7 @@ export const mix: Info = {
 export const prettier: Info = {
   name: "prettier",
   command: [BunProc.which(), "x", "prettier", "--write", "$FILE"],
+  project: true,
   environment: {
     BUN_BE_BUN: "1",
   },
@@ -78,6 +89,7 @@ export const prettier: Info = {
 export const oxfmt: Info = {
   name: "oxfmt",
   command: [BunProc.which(), "x", "oxfmt", "$FILE"],
+  project: true,
   environment: {
     BUN_BE_BUN: "1",
   },
@@ -97,6 +109,7 @@ export const oxfmt: Info = {
 export const biome: Info = {
   name: "biome",
   command: [BunProc.which(), "x", "@biomejs/biome", "check", "--write", "$FILE"],
+  project: true,
   environment: {
     BUN_BE_BUN: "1",
   },
@@ -207,7 +220,8 @@ export const rlang: Info = {
     if (airPath == null) return false
 
     try {
-      const proc = Bun.spawn(["air", "--help"], {
+      await projectBinary(airPath)
+      const proc = Bun.spawn([airPath, "--help"], {
         stdout: "pipe",
         stderr: "pipe",
       })
@@ -231,8 +245,10 @@ export const uvformat: Info = {
   extensions: [".py", ".pyi"],
   async enabled() {
     if (await ruff.enabled()) return false
-    if (Bun.which("uv") !== null) {
-      const proc = Bun.spawn(["uv", "format", "--help"], { stderr: "pipe", stdout: "pipe" })
+    const bin = Bun.which("uv")
+    if (bin !== null) {
+      await projectBinary(bin)
+      const proc = Bun.spawn([bin, "format", "--help"], { stderr: "pipe", stdout: "pipe" })
       const code = await proc.exited
       return code === 0
     }
@@ -244,6 +260,7 @@ export const rubocop: Info = {
   name: "rubocop",
   command: ["rubocop", "--autocorrect", "$FILE"],
   extensions: [".rb", ".rake", ".gemspec", ".ru"],
+  project: true,
   async enabled() {
     return Bun.which("rubocop") !== null
   },
@@ -253,6 +270,7 @@ export const standardrb: Info = {
   name: "standardrb",
   command: ["standardrb", "--fix", "$FILE"],
   extensions: [".rb", ".rake", ".gemspec", ".ru"],
+  project: true,
   async enabled() {
     return Bun.which("standardrb") !== null
   },
@@ -345,6 +363,7 @@ export const pint: Info = {
   name: "pint",
   command: ["./vendor/bin/pint", "$FILE"],
   extensions: [".php"],
+  project: true,
   async enabled() {
     const items = await Filesystem.findUp("composer.json", Instance.directory, Instance.worktree)
     for (const item of items) {

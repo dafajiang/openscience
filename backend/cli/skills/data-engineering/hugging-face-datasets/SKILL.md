@@ -7,6 +7,14 @@ author: Synthetic Sciences
 license: MIT
 tags: [Hugging Face, Datasets, Data Loading, Data Processing]
 dependencies: [huggingface-hub, duckdb, datasets, pandas]
+metadata:
+  upstream: huggingface/skills
+  upstream-url: https://github.com/huggingface/skills
+  upstream-path: skills/huggingface-datasets
+  upstream-license: Apache-2.0
+  upstream-relationship: adapted and rewritten
+  skill-author: Synthetic Sciences
+  adapted-by: Synthetic Sciences
 ---
 
 # Overview
@@ -21,7 +29,7 @@ This skill provides tools to manage datasets on the Hugging Face Hub with a focu
 
 # Dependencies
 # This skill uses PEP 723 scripts with inline dependency management
-# Scripts auto-install requirements when run with: uv run scripts/script_name.py
+# Scripts auto-install requirements when run with: uv run scripts/<script>.py
 
 - uv (Python package manager)
 - Getting Started: See "Usage Instructions" below for PEP 723 usage
@@ -62,7 +70,7 @@ The skill includes two Python scripts that use PEP 723 inline dependency managem
 
 > **All paths are relative to the directory containing this SKILL.md
 file.**
-> Scripts are run with: `uv run scripts/script_name.py [arguments]`
+> Scripts are run with: `uv run scripts/<script>.py [arguments]`
 
 - `scripts/dataset_manager.py` - Dataset creation and management
 - `scripts/sql_manager.py` - SQL-based dataset querying and transformation
@@ -87,7 +95,7 @@ HuggingFace token is auto-injected by openscience when connected via the dashboa
 [ -n "$HF_TOKEN" ] && echo "HF_TOKEN set" || echo "NOT SET"
 ```
 
-If not set: connect HuggingFace at https://app.syntheticsciences.ai -> Services, then restart openscience.
+If not set: add your Hugging Face token in Customize → Tools or export `HF_TOKEN` locally.
 
 ## Quick Start
 

@@ -1,28 +1,6 @@
-/**
- * Which Atlas-synced env vars the CLI is allowed to apply.
- *
- * OpenScience routes every *managed* LLM call through OpenRouter — that is the
- * one provider the Atlas wallet pays for, via the proxy `OPENROUTER_BASE_URL` +
- * a `thk_*` `OPENROUTER_API_KEY`. Every other model provider (Anthropic, OpenAI,
- * Gemini, Together, Groq, Fireworks, xAI, Mistral, DeepSeek, Cerebras, and
- * Codex) is BYOK-only, configured locally with a shell `export`,
- * `openscience keys add`, or Codex OAuth.
- *
- * Atlas still emits per-provider LLM credentials over `/api/cli/sync` for the
- * hosted web agents, so the CLI must drop them on its side. Without this a
- * dashboard-stored key (or its managed proxy token) synced into the process
- * would shadow the user's own local key — the exact bug this policy fixes.
- * Compute / ML-service integrations and OpenRouter are unaffected.
- *
- * Kept dependency-free on purpose: imported by preload-env.ts, which runs its
- * side effect at module init before the rest of the app is loaded.
- */
+import { managedApiBase } from "../endpoints"
 
-/** The model-provider LLM env vars whose values are the user's OWN (BYOK)
- *  credential. Single source of truth — openscience/index.ts imports this for
- *  its subprocess-redaction set, and the sync blocklist below derives from it,
- *  so the two can never drift. OpenRouter is included (its own key is BYOK too)
- *  but kept OUT of the blocklist since it is the one managed-capable provider. */
+/** User-owned credentials that approved local subprocesses may receive. */
 export const BYOK_LLM_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "OPENAI_API_KEY",
@@ -30,6 +8,7 @@ export const BYOK_LLM_ENV_KEYS = [
   "GOOGLE_API_KEY",
   "GEMINI_API_KEY",
   "OPENROUTER_API_KEY",
+  "META_MODEL_API_KEY",
   "TOGETHER_API_KEY",
   "GROQ_API_KEY",
   "FIREWORKS_API_KEY",
@@ -37,22 +16,86 @@ export const BYOK_LLM_ENV_KEYS = [
   "MISTRAL_API_KEY",
   "DEEPSEEK_API_KEY",
   "CEREBRAS_API_KEY",
+  "PERPLEXITY_API_KEY",
 ]
 
-/** Env vars the CLI drops from Atlas sync: every BYOK model provider EXCEPT
- *  OpenRouter, each with its `*_BASE_URL` companion. Derived from
- *  BYOK_LLM_ENV_KEYS so a newly-added provider is covered automatically. */
-export const BLOCKED_SYNCED_ENV = new Set<string>(
-  BYOK_LLM_ENV_KEYS.filter((key) => key !== "OPENROUTER_API_KEY").flatMap((key) => [
-    key,
-    key.replace(/_API_KEY$/, "_BASE_URL"),
-  ]),
-)
+/** User-owned routing overrides paired with direct-provider credentials. */
+export const BYOK_LLM_BASE_URL_KEYS = [
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_BASE_URL",
+  "GOOGLE_GENERATIVE_AI_BASE_URL",
+  "GOOGLE_BASE_URL",
+  "GEMINI_BASE_URL",
+  "OPENROUTER_BASE_URL",
+  "META_MODEL_BASE_URL",
+  "TOGETHER_BASE_URL",
+  "GROQ_BASE_URL",
+  "FIREWORKS_BASE_URL",
+  "XAI_BASE_URL",
+  "MISTRAL_BASE_URL",
+  "DEEPSEEK_BASE_URL",
+  "CEREBRAS_BASE_URL",
+  "PERPLEXITY_BASE_URL",
+]
 
-/** True when an Atlas-synced env var may be applied to the CLI process.
- *  OpenRouter (the sole managed LLM route) and all compute / ML-service keys
- *  pass through; every other model-provider LLM credential is dropped because
- *  that provider is BYOK-local-only. */
-export function isSyncedEnvAllowed(key: string): boolean {
-  return !BLOCKED_SYNCED_ENV.has(key)
+/** User-owned service credentials that approved local subprocesses may receive. */
+export const SYNCED_SERVICE_ENV_KEYS = [
+  "NVIDIA_API_KEY",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "OPENALEX_MAILTO",
+  "OPENALEX_API_KEY",
+  "SEMANTIC_SCHOLAR_API_KEY",
+  "HF_TOKEN",
+  "HUGGING_FACE_HUB_TOKEN",
+  "WANDB_API_KEY",
+  "LANGSMITH_API_KEY",
+  "LANGCHAIN_API_KEY",
+  "LANGSMITH_TRACING",
+  "PINECONE_API_KEY",
+] as const
+
+/** Device-local compute credentials are injected only by the selected adapter. */
+export const LOCAL_COMPUTE_CLI_ENV_KEYS = [
+  "TENSORPOOL_KEY",
+  "TENSORPOOL_API_KEY",
+  "LAMBDA_API_KEY",
+  "LAMBDA_LABS_API_KEY",
+  "PRIME_API_KEY",
+  "PRIME_INTELLECT_API_KEY",
+  "VAST_API_KEY",
+  "RUNPOD_API_KEY",
+] as const
+
+export function managedOpenRouterBaseURL(atlasBase = managedApiBase()): string {
+  return `${atlasBase.replace(/\/+$/, "")}/api/llm/proxy/openrouter/v1`
+}
+
+/** Exact managed-proxy origin and path validation; lookalike origins fail. */
+export function isAtlasProxyURL(
+  value: unknown,
+  route = "/api/llm/proxy/",
+  atlasBase = managedApiBase(),
+): value is string {
+  if (typeof value !== "string") return false
+  try {
+    const candidate = new URL(value)
+    const atlas = new URL(atlasBase)
+    if ((candidate.protocol !== "http:" && candidate.protocol !== "https:") || candidate.origin !== atlas.origin)
+      return false
+    if (
+      candidate.username ||
+      candidate.password ||
+      candidate.search ||
+      candidate.hash ||
+      candidate.pathname.includes("%")
+    )
+      return false
+    const basePath = atlas.pathname.replace(/\/+$/, "")
+    const routePath = route.startsWith("/") ? route : `/${route}`
+    const expected = `${basePath}${routePath}`.replace(/\/{2,}/g, "/").replace(/\/+$/, "")
+    return candidate.pathname === expected || candidate.pathname.startsWith(`${expected}/`)
+  } catch {
+    return false
+  }
 }

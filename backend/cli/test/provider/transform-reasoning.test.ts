@@ -44,84 +44,83 @@ describe("ProviderTransform.options — managed OpenRouter reasoning", () => {
       providerOptions: { baseURL: PROXY_OR },
     })
     expect(result.usage).toEqual({ include: true })
-    expect(result.reasoning).toEqual({ effort: "medium" })
+    expect(result.reasoning).toEqual({ enabled: true })
     expect(result.reasoningEffort).toBeUndefined()
     expect(result.reasoningSummary).toBeUndefined()
     expect(result.include).toBeUndefined()
   })
 
-  test("Claude via OpenRouter explicitly DISABLES reasoning (unreplayable signed thinking → 400)", () => {
+  test("Claude via OpenRouter requests unified reasoning for managed inference", () => {
     const result = ProviderTransform.options({
       model: orModel("openrouter/anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4"),
       sessionID,
       providerOptions: { baseURL: PROXY_OR },
     })
-    // usage tracking still on, reasoning explicitly off → no thinking blocks, even
-    // for adaptive-thinking models that default on and past a config effort merge.
     expect(result.usage).toEqual({ include: true })
-    expect(result.reasoning).toEqual({ enabled: false })
+    expect(result.reasoning).toEqual({ enabled: true })
   })
 
-  test("Claude-OR reasoning is disabled even when only api.id (mixed-case) carries the token", () => {
-    // options() and variants() must key off the SAME both-field, lowercased predicate,
-    // or an uppercase/aliased Claude id slips options() and re-triggers the 400.
+  test("Claude via OpenRouter supports reasoning when only api.id carries a mixed-case token", () => {
     const upper = ProviderTransform.options({
       model: orModel("openrouter/some-alias", "Anthropic/Claude-Sonnet-4"),
       sessionID,
       providerOptions: { baseURL: PROXY_OR },
     })
-    expect(upper.reasoning).toEqual({ enabled: false })
-    // model.id carries the token, api.id does not → still caught (both fields checked).
+    expect(upper.reasoning).toEqual({ enabled: true })
+
     const aliased = ProviderTransform.options({
       model: orModel("openrouter/anthropic/claude-x", "vendor/opaque-slug"),
       sessionID,
       providerOptions: { baseURL: PROXY_OR },
     })
-    expect(aliased.reasoning).toEqual({ enabled: false })
+    expect(aliased.reasoning).toEqual({ enabled: true })
   })
 
-  test("Claude via OpenRouter offers no reasoning-effort variants (same predicate as options)", () => {
+  test("budget-only Claude routes do not invent an effort ladder without route metadata", () => {
     expect(
-      ProviderTransform.variants(orModel("openrouter/anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4")),
-    ).toEqual({})
-    // mixed-case api.id must also yield no picker, matching options() above.
-    expect(ProviderTransform.variants(orModel("openrouter/some-alias", "Anthropic/Claude-Sonnet-4"))).toEqual({})
+      Object.keys(
+        ProviderTransform.variants(orModel("openrouter/anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4")),
+      ),
+    ).toEqual([])
+    expect(
+      Object.keys(ProviderTransform.variants(orModel("openrouter/some-alias", "Anthropic/Claude-Sonnet-4"))),
+    ).toEqual([])
   })
 
   test("a non-Claude OR model whose id merely contains a vendor token is unaffected", () => {
-    // deepseek model, id has no claude/anthropic → keeps reasoning + effort variants.
+    // Preserve reasoning output without inventing a dial for fixed-depth R1.
     const opts = ProviderTransform.options({
       model: orModel("openrouter/deepseek/deepseek-r1", "deepseek/deepseek-r1"),
       sessionID,
       providerOptions: { baseURL: PROXY_OR },
     })
-    expect(opts.reasoning).toEqual({ effort: "medium" })
+    expect(opts.reasoning).toEqual({ enabled: true })
     expect(
       Object.keys(ProviderTransform.variants(orModel("openrouter/deepseek/deepseek-r1", "deepseek/deepseek-r1"))),
-    ).toContain("medium")
+    ).toEqual([])
   })
 
-  test("OR-routed gpt-5 uses reasoning.effort (not the OpenAI keys), even via the managed proxy", () => {
+  test("OR-routed gpt-5 preserves provider default reasoning through the managed proxy", () => {
     const result = ProviderTransform.options({
       model: orModel("openrouter/openai/gpt-5", "openai/gpt-5"),
       sessionID,
       providerOptions: { baseURL: PROXY_OR },
     })
     expect(result.usage).toEqual({ include: true })
-    expect(result.reasoning).toEqual({ effort: "medium" })
+    expect(result.reasoning).toEqual({ enabled: true })
     expect(result.reasoningEffort).toBeUndefined()
     expect(result.reasoningSummary).toBeUndefined()
     expect(result.include).toBeUndefined()
     expect(result.textVerbosity).toBeUndefined()
   })
 
-  test("OR gemini-3 keeps high effort", () => {
+  test("OR gemini-3 preserves the upstream default when no exact metadata is supplied", () => {
     const result = ProviderTransform.options({
       model: orModel("openrouter/google/gemini-3-pro", "google/gemini-3-pro"),
       sessionID,
       providerOptions: {},
     })
-    expect(result.reasoning).toEqual({ effort: "high" })
+    expect(result.reasoning).toEqual({ enabled: true })
     expect(result.usage).toEqual({ include: true })
   })
 
@@ -166,9 +165,187 @@ describe("ProviderTransform.options — BYOK / direct paths stay untouched", () 
       sessionID,
       providerOptions: { baseURL: PROXY_OAI },
     })
-    expect(result.reasoningSummary).toBe("auto")
+    expect(result.reasoningSummary).toBe("detailed")
     expect(result.include).toEqual(["reasoning.encrypted_content"])
     expect(result.reasoning).toBeUndefined()
+  })
+})
+
+describe("new model reasoning effort contracts", () => {
+  test("Grok 4.6, DeepSeek V4, and GLM 5.3 expose their real levels and defaults", () => {
+    for (const [id, expected, fallback] of [
+      ["x-ai/grok-4.6", ["low", "medium", "high", "xhigh"], "high"],
+      ["deepseek/deepseek-v4-pro", ["low", "high", "max"], "high"],
+      ["z-ai/glm-5.3", ["low", "high", "max"], "max"],
+    ] as const) {
+      const target = orModel(id, id)
+      expect(Object.keys(ProviderTransform.variants(target))).toEqual([...expected])
+      expect(ProviderTransform.options({ model: target, sessionID }).reasoning).toEqual({ effort: fallback })
+    }
+    expect(ProviderTransform.variants(orModel("unknown/reasoner", "unknown/reasoner"))).toEqual({})
+    expect(
+      ProviderTransform.variants(model({ api: { npm: "@ai-sdk/openai-compatible", id: "unknown-reasoner" } })),
+    ).toEqual({})
+  })
+
+  test("GPT-5.6 family exposes none through max on direct OpenAI and managed OpenRouter", () => {
+    const expected = ["none", "low", "medium", "high", "xhigh", "max"]
+    const direct = model({
+      id: "gpt-5.6-sol",
+      providerID: "openai",
+      release_date: "2026-07-09",
+      api: { id: "gpt-5.6-sol", url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+    })
+    const managed = orModel("openai/gpt-5.6-sol", "openai/gpt-5.6-sol", { release_date: "2026-07-09" })
+    expect(Object.keys(ProviderTransform.variants(direct))).toEqual(expected)
+    expect(Object.keys(ProviderTransform.variants(managed))).toEqual(expected)
+    expect(ProviderTransform.variants(direct).max).toEqual({
+      reasoningEffort: "max",
+      reasoningSummary: "detailed",
+      include: ["reasoning.encrypted_content"],
+    })
+    expect(ProviderTransform.variants(managed).max).toEqual({ reasoning: { effort: "max" } })
+  })
+
+  test("GPT-5.6 OpenRouter Pro routes keep the full effort ladder", () => {
+    const pro = orModel("openai/gpt-5.6-sol-pro", "openai/gpt-5.6-sol-pro", {
+      release_date: "2026-07-09",
+    })
+    expect(Object.keys(ProviderTransform.variants(pro))).toEqual(["none", "low", "medium", "high", "xhigh", "max"])
+  })
+
+  test("Codex OAuth exposes each model's exact live effort ladder", () => {
+    const codex = (id: string) =>
+      model({
+        id,
+        providerID: "openai-codex",
+        release_date: "2026-07-09",
+        api: { id, url: "https://chatgpt.com/backend-api/codex", npm: "@ai-sdk/openai" },
+      })
+    expect(Object.keys(ProviderTransform.variants(codex("gpt-5.6-sol")))).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ])
+    expect(Object.keys(ProviderTransform.variants(codex("gpt-5.6-terra")))).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ])
+    expect(Object.keys(ProviderTransform.variants(codex("gpt-5.6-luna")))).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ])
+    expect(Object.keys(ProviderTransform.variants(codex("gpt-5.5")))).toEqual(["low", "medium", "high", "xhigh"])
+    expect(ProviderTransform.variants(codex("gpt-5.6-sol")).none).toBeUndefined()
+    expect(ProviderTransform.variants(codex("gpt-5.6-sol")).ultra).toBeUndefined()
+
+    expect(ProviderTransform.options({ model: codex("gpt-5.6-sol"), sessionID, providerOptions: {} })).toMatchObject({
+      reasoningEffort: "low",
+      reasoningSummary: "detailed",
+      include: ["reasoning.encrypted_content"],
+    })
+    expect(
+      ProviderTransform.options({ model: codex("gpt-5.6-terra"), sessionID, providerOptions: {} }).reasoningEffort,
+    ).toBe("medium")
+    expect(ProviderTransform.options({ model: codex("gpt-5.4"), sessionID, providerOptions: {} }).reasoningEffort).toBe(
+      "medium",
+    )
+  })
+
+  test("public OpenAI defaults GPT-5.4 to none but GPT-5.5 and GPT-5.6 to medium", () => {
+    const openai = (id: string) =>
+      model({
+        id,
+        providerID: "openai",
+        api: { id, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+    for (const id of ["gpt-5.4", "gpt-5-4", "gpt-5.4-mini", "gpt-5-4-mini"]) {
+      expect(ProviderTransform.options({ model: openai(id), sessionID, providerOptions: {} }).reasoningEffort).toBe(
+        "none",
+      )
+    }
+    for (const id of ["gpt-5.5", "gpt-5.6", "gpt-5.6-sol"]) {
+      expect(ProviderTransform.options({ model: openai(id), sessionID, providerOptions: {} }).reasoningEffort).toBe(
+        "medium",
+      )
+    }
+  })
+
+  test("dash-normalized versioned GPT-5 Codex ids use a supported small-call effort", () => {
+    for (const id of ["gpt-5-6-sol", "gpt-5-6-terra", "gpt-5-6-luna", "gpt-5-5", "gpt-5-4", "gpt-5-4-mini"]) {
+      const codex = model({
+        id,
+        providerID: "openai-codex",
+        api: { id, url: "https://chatgpt.com/backend-api/codex", npm: "@ai-sdk/openai" },
+      })
+      expect(ProviderTransform.smallOptions(codex)).toEqual({ reasoningEffort: "low" })
+    }
+  })
+
+  test("Grok 4.5 exposes low/medium/high with provider-specific wire shapes", () => {
+    const direct = model({
+      id: "grok-4.5",
+      providerID: "xai",
+      api: { id: "grok-4.5", url: "https://api.x.ai/v1", npm: "@ai-sdk/xai" },
+    })
+    const managed = orModel("x-ai/grok-4.5", "x-ai/grok-4.5")
+    expect(ProviderTransform.variants(direct)).toEqual({
+      low: { reasoningEffort: "low" },
+      medium: { reasoningEffort: "medium" },
+      high: { reasoningEffort: "high" },
+    })
+    // Direct xAI's documented default is high. Omit the option so the provider
+    // owns that default; a selected variant still serializes an explicit effort.
+    expect(ProviderTransform.options({ model: direct, sessionID, providerOptions: {} }).reasoningEffort).toBeUndefined()
+    expect(ProviderTransform.variants(managed)).toEqual({
+      low: { reasoning: { effort: "low" } },
+      medium: { reasoning: { effort: "medium" } },
+      high: { reasoning: { effort: "high" } },
+    })
+    expect(
+      ProviderTransform.options({ model: managed, sessionID, providerOptions: { baseURL: PROXY_OR } }).reasoning,
+    ).toEqual({ effort: "high" })
+    expect(ProviderTransform.smallOptions(direct)).toEqual({ reasoningEffort: "low" })
+    expect(ProviderTransform.smallOptions(managed)).toEqual({ reasoning: { effort: "low" } })
+  })
+
+  test("Muse Spark 1.1 exposes its exact effort ladder on BYOK and legacy Meta proxy", () => {
+    const muse = model({
+      id: "muse-spark-1.1",
+      providerID: "meta",
+      api: { id: "muse-spark-1.1", url: "https://api.meta.ai/v1", npm: "@ai-sdk/openai" },
+    })
+    expect(ProviderTransform.variants(muse)).toEqual({
+      minimal: { reasoningEffort: "minimal" },
+      low: { reasoningEffort: "low" },
+      medium: { reasoningEffort: "medium" },
+      high: { reasoningEffort: "high" },
+      xhigh: { reasoningEffort: "xhigh" },
+    })
+    expect(
+      ProviderTransform.options({
+        model: muse,
+        sessionID,
+        providerOptions: { baseURL: "https://atlas.test/api/llm/proxy/meta/v1" },
+      }),
+    ).toEqual({ store: false, include: ["reasoning.encrypted_content"] })
+    expect(ProviderTransform.options({ model: muse, sessionID, providerOptions: {} }).reasoningEffort).toBeUndefined()
+    expect(ProviderTransform.smallOptions(muse)).toEqual({ reasoningEffort: "minimal" })
+    // @ai-sdk/openai's Responses implementation parses the literal `openai`
+    // options namespace even when createOpenAI({ name: "meta" }) reports its
+    // provider as `meta.responses`. Keep this pinned-SDK seam explicit so a
+    // semantic-looking remap to `meta` cannot silently drop the effort.
+    expect(ProviderTransform.providerOptions(muse, { reasoningEffort: "high" })).toEqual({
+      openai: { reasoningEffort: "high" },
+    })
   })
 })
 

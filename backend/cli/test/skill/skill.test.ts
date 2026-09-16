@@ -4,6 +4,20 @@ import { Instance } from "../../src/project/instance"
 import { tmpdir } from "../fixture/fixture"
 import path from "path"
 import fs from "fs/promises"
+import { ConfigMarkdown } from "../../src/config/markdown"
+import { ProjectTrust } from "../../src/project/trust"
+import { SkillTool } from "../../src/tool/skill"
+import type { Tool } from "../../src/tool/tool"
+import { Bus } from "../../src/bus"
+import { Session } from "../../src/session"
+
+async function trust() {
+  const status = await ProjectTrust.status(Instance.project)
+  await ProjectTrust.update(Instance.project, {
+    trusted: true,
+    root: status.root,
+  })
+}
 
 async function createGlobalSkill(homeDir: string) {
   const skillDir = path.join(homeDir, ".claude", "skills", "global-test-skill")
@@ -45,12 +59,52 @@ Instructions here.
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trust()
       const skills = await Skill.all()
       expect(skills.length).toBe(1)
       const testSkill = skills.find((s) => s.name === "test-skill")
       expect(testSkill).toBeDefined()
       expect(testSkill!.description).toBe("A test skill for verification.")
       expect(testSkill!.location).toContain("skill/test-skill/SKILL.md")
+    },
+  })
+})
+
+test("normalizes allowed-tools without granting execution authority", async () => {
+  await using tmp = await tmpdir({
+    git: true,
+    init: async (dir) => {
+      await Bun.write(
+        path.join(dir, ".openscience", "skill", "figure-skill", "SKILL.md"),
+        `---
+name: figure-skill
+description: Create a requested technical figure.
+allowed-tools: [Read, generate-image, generate_image, Bash]
+---
+
+# Figure skill
+`,
+      )
+    },
+  })
+
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await trust()
+      expect((await Skill.get("figure-skill"))?.allowed_tools).toEqual(["read", "generate_image", "bash"])
+      const tool = await SkillTool.init()
+      const result = await tool.execute({ name: "figure-skill" }, {
+        sessionID: "session_skill_allowed_tools",
+        messageID: "message_skill_allowed_tools",
+        callID: "call_skill_allowed_tools",
+        agent: "research",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => {},
+        ask: async () => {},
+      } satisfies Tool.Context)
+      expect((result.metadata as { allowedTools?: string[] }).allowedTools).toEqual(["read", "generate_image", "bash"])
     },
   })
 })
@@ -87,6 +141,7 @@ description: Second test skill.
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trust()
       const skills = await Skill.all()
       expect(skills.length).toBe(2)
       expect(skills.find((s) => s.name === "skill-one")).toBeDefined()
@@ -113,8 +168,50 @@ Just some content without YAML frontmatter.
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trust()
       const skills = await Skill.all()
       expect(skills).toEqual([])
+    },
+  })
+})
+
+test("reports schema-invalid frontmatter to the user like a YAML failure instead of dropping it silently", async () => {
+  await using tmp = await tmpdir({
+    git: true,
+    init: async (dir) => {
+      await Bun.write(
+        path.join(dir, ".openscience", "skill", "no-description", "SKILL.md"),
+        `---\nname: no-description\ncategory: biology\n---\n\n# Missing the required description\n`,
+      )
+      await Bun.write(
+        path.join(dir, ".openscience", "skill", "broken-yaml", "SKILL.md"),
+        `---\nname: broken-yaml\ndescription: "unterminated\n  - [nested: {\n---\n\n# Broken YAML\n`,
+      )
+      await Bun.write(
+        path.join(dir, ".openscience", "skill", "healthy", "SKILL.md"),
+        `---\nname: healthy\ndescription: Loads normally.\n---\n\n# Healthy\n`,
+      )
+    },
+  })
+
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await trust()
+      const reported: string[] = []
+      const unsubscribe = Bus.subscribe(Session.Event.Error, (event) => {
+        const error = event.properties.error
+        if (error?.name === "UnknownError") reported.push(error.data.message)
+      })
+      try {
+        expect((await Skill.all()).map((skill) => skill.name)).toEqual(["healthy"])
+      } finally {
+        unsubscribe()
+      }
+      const schema = reported.find((message) => message.includes("no-description/SKILL.md"))
+      expect(schema).toContain("invalid frontmatter")
+      expect(schema).toContain("description")
+      expect(reported.find((message) => message.includes("broken-yaml/SKILL.md"))).toBeDefined()
     },
   })
 })
@@ -140,6 +237,7 @@ description: A skill in the .claude/skills directory.
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trust()
       const skills = await Skill.all()
       expect(skills.length).toBe(1)
       const claudeSkill = skills.find((s) => s.name === "claude-skill")
@@ -168,7 +266,8 @@ test("discovers global skills from ~/.claude/skills/ directory", async () => {
       },
     })
   } finally {
-    process.env.OPENSCIENCE_TEST_HOME = originalHome
+    if (originalHome === undefined) delete process.env.OPENSCIENCE_TEST_HOME
+    else process.env.OPENSCIENCE_TEST_HOME = originalHome
   }
 })
 
@@ -182,4 +281,207 @@ test("returns empty array when no skills exist", async () => {
       expect(skills).toEqual([])
     },
   })
+})
+
+test("retired Atlas and graph skills cannot re-enter through project skill directories", async () => {
+  await using tmp = await tmpdir({
+    git: true,
+    init: async (dir) => {
+      for (const name of [
+        "atlas",
+        "atlas-lab",
+        "atlas-survey-cli",
+        "initialize-atlas-graph",
+        "initialize-research-graph",
+        "initialize-research-graphs",
+        "atlas-labs",
+      ]) {
+        await Bun.write(
+          path.join(dir, ".openscience", "skill", name, "SKILL.md"),
+          `---\nname: ${name}\ndescription: Local ${name} test skill.\n---\n\n# ${name}\n`,
+        )
+      }
+    },
+  })
+
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await trust()
+      expect((await Skill.all()).map((skill) => skill.name).toSorted()).toEqual([
+        "atlas-labs",
+        "initialize-research-graphs",
+      ])
+      expect(await Skill.get("atlas")).toBeUndefined()
+      expect(await Skill.get("ATLAS-LAB")).toBeUndefined()
+      expect(await Skill.get("initialize-atlas-graph")).toBeUndefined()
+      expect(await Skill.get("INITIALIZE-RESEARCH-GRAPH")).toBeUndefined()
+    },
+  })
+})
+
+test("removes only global Claude symlinks created by the retired Atlas package", async () => {
+  await using tmp = await tmpdir({ git: true })
+  const originalHome = process.env.OPENSCIENCE_TEST_HOME
+  process.env.OPENSCIENCE_TEST_HOME = tmp.path
+
+  try {
+    const packageSkills = path.join(tmp.path, "node_modules", "@synsci", "atlas", "skills")
+    for (const name of ["atlas", "atlas-lab"]) {
+      const target = path.join(packageSkills, name)
+      await Bun.write(path.join(target, "SKILL.md"), `---\nname: ${name}\ndescription: Retired package skill.\n---\n`)
+      await fs.mkdir(path.join(tmp.path, ".claude", "skills"), { recursive: true })
+      await fs.symlink(target, path.join(tmp.path, ".claude", "skills", name))
+    }
+    await Bun.write(
+      path.join(tmp.path, ".claude", "skills", "atlas-map", "SKILL.md"),
+      `---\nname: atlas-map\ndescription: User-owned same-name directory.\n---\n`,
+    )
+    await Bun.write(
+      path.join(tmp.path, ".claude", "skills", "atlas-labs", "SKILL.md"),
+      `---\nname: atlas-labs\ndescription: Similar third-party skill.\n---\n`,
+    )
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        expect((await Skill.all()).map((skill) => skill.name)).toEqual(["atlas-labs"])
+      },
+    })
+
+    expect(await fs.lstat(path.join(tmp.path, ".claude", "skills", "atlas")).catch(() => undefined)).toBeUndefined()
+    expect(await fs.lstat(path.join(tmp.path, ".claude", "skills", "atlas-lab")).catch(() => undefined)).toBeUndefined()
+    expect(await Bun.file(path.join(tmp.path, ".claude", "skills", "atlas-map", "SKILL.md")).exists()).toBe(true)
+  } finally {
+    if (originalHome === undefined) delete process.env.OPENSCIENCE_TEST_HOME
+    else process.env.OPENSCIENCE_TEST_HOME = originalHome
+  }
+})
+
+test("disabled frontmatter keeps a skill out of the catalog without shadowing enabled skills", async () => {
+  await using tmp = await tmpdir({
+    git: true,
+    init: async (dir) => {
+      await Bun.write(
+        path.join(dir, ".openscience", "skill", "disabled-copy", "SKILL.md"),
+        `---
+name: shared-skill
+description: This higher-priority copy is disabled.
+disabled: true
+---
+
+# Disabled copy
+`,
+      )
+      await Bun.write(
+        path.join(dir, ".claude", "skills", "enabled-copy", "SKILL.md"),
+        `---
+name: shared-skill
+description: This enabled copy remains available.
+---
+
+# Enabled copy
+`,
+      )
+      await Bun.write(
+        path.join(dir, ".openscience", "skill", "disabled-only", "SKILL.md"),
+        `---
+name: disabled-only
+description: This skill must not be visible.
+disabled: true
+---
+
+# Disabled only
+`,
+      )
+    },
+  })
+
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await trust()
+      expect(await Skill.get("disabled-only")).toBeUndefined()
+      expect(await Skill.all()).toEqual([
+        expect.objectContaining({
+          name: "shared-skill",
+          description: "This enabled copy remains available.",
+          origin: "project",
+        }),
+      ])
+    },
+  })
+})
+
+test("OPENSCIENCE_DISABLED_SKILLS matches trimmed frontmatter and directory names", async () => {
+  await using tmp = await tmpdir({
+    git: true,
+    init: async (dir) => {
+      const skills = [
+        ["different-directory", "blocked-by-name"],
+        ["blocked-by-directory", "different-name"],
+        ["still-enabled", "still-enabled"],
+      ]
+      await Promise.all(
+        skills.map(([directory, name]) =>
+          Bun.write(
+            path.join(dir, ".openscience", "skill", directory, "SKILL.md"),
+            `---
+name: ${name}
+description: Environment filtering fixture.
+---
+
+# ${name}
+`,
+          ),
+        ),
+      )
+    },
+  })
+
+  const original = process.env.OPENSCIENCE_DISABLED_SKILLS
+  process.env.OPENSCIENCE_DISABLED_SKILLS = " blocked-by-name, blocked-by-directory, ,"
+  try {
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        await trust()
+        expect((await Skill.all()).map((skill) => skill.name)).toEqual(["still-enabled"])
+        expect(await Skill.get("blocked-by-name")).toBeUndefined()
+        expect(await Skill.get("different-name")).toBeUndefined()
+      },
+    })
+  } finally {
+    if (original === undefined) delete process.env.OPENSCIENCE_DISABLED_SKILLS
+    if (original !== undefined) process.env.OPENSCIENCE_DISABLED_SKILLS = original
+  }
+})
+
+test("every bundled skill with frontmatter parses into a loadable skill", async () => {
+  const root = path.resolve(import.meta.dir, "../../skills")
+  const failures: string[] = []
+
+  for await (const relative of new Bun.Glob("**/SKILL.md").scan({ cwd: root })) {
+    const file = path.join(root, relative)
+    const source = await Bun.file(file).text()
+    // Category README files intentionally use the SKILL.md name without
+    // declaring a loadable skill.
+    if (!source.startsWith("---")) continue
+
+    try {
+      const markdown = await ConfigMarkdown.parse(file)
+      const parsed = Skill.Info.pick({
+        name: true,
+        description: true,
+        category: true,
+        tags: true,
+        entry: true,
+      }).safeParse(markdown.data)
+      if (!parsed.success) failures.push(`${relative}: ${parsed.error.message}`)
+    } catch (error) {
+      failures.push(`${relative}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  expect(failures).toEqual([])
 })

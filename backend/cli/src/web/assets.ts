@@ -21,3 +21,16 @@ try {
 
 export const WEB_ASSETS = _assets
 export const WEB_INDEX = _index
+
+export async function webVersion(assets: Record<string, string> = WEB_ASSETS) {
+  const file = assets["/version.json"]
+  if (!file) return
+  const value = await Bun.file(file)
+    .json()
+    .catch(() => undefined)
+  if (typeof value?.version !== "string" || typeof value?.channel !== "string") return
+  return {
+    version: value.version,
+    channel: value.channel,
+  }
+}

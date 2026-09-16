@@ -5,7 +5,37 @@ import { makePersisted, type SyncStorage } from "@solid-primitives/storage"
 import { createScrollPersistence } from "./layout-scroll"
 
 describe("createScrollPersistence", () => {
-  test.skip("debounces persisted scroll writes", async () => {
+  test("keeps rapid conversation positions isolated and restores them from persisted snapshots", () => {
+    const snapshots: Record<string, Record<string, { x: number; y: number }>> = {}
+    const first = createScrollPersistence({
+      debounceMs: 1_000,
+      getSnapshot: (session) => snapshots[session],
+      onFlush: (session, scroll) => {
+        snapshots[session] = scroll
+      },
+    })
+
+    for (const index of Array.from({ length: 20 }, (_, value) => value)) {
+      first.setScroll(index % 2 ? "project-a/session-a" : "project-b/session-a", "conversation", {
+        x: 0,
+        y: index,
+      })
+    }
+    first.flushAll()
+    first.dispose()
+
+    const restored = createScrollPersistence({
+      getSnapshot: (session) => snapshots[session],
+      onFlush: () => {},
+    })
+
+    expect(restored.scroll("project-a/session-a", "conversation")).toEqual({ x: 0, y: 19 })
+    expect(restored.scroll("project-b/session-a", "conversation")).toEqual({ x: 0, y: 18 })
+    expect(restored.scroll("project-a/session-b", "conversation")).toBeUndefined()
+    restored.dispose()
+  })
+
+  test("debounces persisted scroll writes", async () => {
     const key = "layout-scroll.test"
     const data = new Map<string, string>()
     const writes: string[] = []

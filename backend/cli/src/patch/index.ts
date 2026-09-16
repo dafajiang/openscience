@@ -33,6 +33,18 @@ export namespace Patch {
     is_end_of_file?: boolean
   }
 
+  export class UpdateChunkMismatch extends Error {
+    constructor(
+      message: string,
+      readonly chunkIndex: number,
+      readonly chunk: UpdateFileChunk,
+      readonly searchStart: number,
+    ) {
+      super(message)
+      this.name = "UpdateChunkMismatch"
+    }
+  }
+
   export interface ApplyPatchAction {
     changes: Map<string, ApplyPatchFileChange>
     patch: string
@@ -79,23 +91,23 @@ export namespace Patch {
     const line = lines[startIdx]
 
     if (line.startsWith("*** Add File:")) {
-      const filePath = line.split(":", 2)[1]?.trim()
+      const filePath = line.slice("*** Add File:".length).trim()
       return filePath ? { filePath, nextIdx: startIdx + 1 } : null
     }
 
     if (line.startsWith("*** Delete File:")) {
-      const filePath = line.split(":", 2)[1]?.trim()
+      const filePath = line.slice("*** Delete File:".length).trim()
       return filePath ? { filePath, nextIdx: startIdx + 1 } : null
     }
 
     if (line.startsWith("*** Update File:")) {
-      const filePath = line.split(":", 2)[1]?.trim()
+      const filePath = line.slice("*** Update File:".length).trim()
       let movePath: string | undefined
       let nextIdx = startIdx + 1
 
       // Check for move directive
       if (nextIdx < lines.length && lines[nextIdx].startsWith("*** Move to:")) {
-        movePath = lines[nextIdx].split(":", 2)[1]?.trim()
+        movePath = lines[nextIdx].slice("*** Move to:".length).trim()
         nextIdx++
       }
 
@@ -308,13 +320,23 @@ export namespace Patch {
     content: string
   }
 
-  export function deriveNewContentsFromChunks(filePath: string, chunks: UpdateFileChunk[]): ApplyPatchFileUpdate {
-    // Read original file content
+  export function deriveNewContentsFromChunks(
+    filePath: string,
+    chunks: UpdateFileChunk[],
+    approvedContent?: string,
+  ): ApplyPatchFileUpdate {
+    // Callers that gate an edit on user approval pass the exact snapshotted
+    // bytes here. This prevents a second pathname read from silently deriving
+    // a patch from a different inode during the approval window.
     let originalContent: string
-    try {
-      originalContent = readFileSync(filePath, "utf-8")
-    } catch (error) {
-      throw new Error(`Failed to read file ${filePath}: ${error}`)
+    if (approvedContent !== undefined) {
+      originalContent = approvedContent
+    } else {
+      try {
+        originalContent = readFileSync(filePath, "utf-8")
+      } catch (error) {
+        throw new Error(`Failed to read file ${filePath}: ${error}`)
+      }
     }
 
     let originalLines = originalContent.split("\n")
@@ -351,12 +373,17 @@ export namespace Patch {
     const replacements: Array<[number, number, string[]]> = []
     let lineIndex = 0
 
-    for (const chunk of chunks) {
+    for (const [chunkIndex, chunk] of chunks.entries()) {
       // Handle context-based seeking
       if (chunk.change_context) {
         const contextIdx = seekSequence(originalLines, [chunk.change_context], lineIndex)
         if (contextIdx === -1) {
-          throw new Error(`Failed to find context '${chunk.change_context}' in ${filePath}`)
+          throw new UpdateChunkMismatch(
+            `Failed to find context '${chunk.change_context}' in ${filePath}`,
+            chunkIndex,
+            chunk,
+            lineIndex,
+          )
         }
         lineIndex = contextIdx + 1
       }
@@ -389,7 +416,12 @@ export namespace Patch {
         replacements.push([found, pattern.length, newSlice])
         lineIndex = found + pattern.length
       } else {
-        throw new Error(`Failed to find expected lines in ${filePath}:\n${chunk.old_lines.join("\n")}`)
+        throw new UpdateChunkMismatch(
+          `Failed to find expected lines in ${filePath}:\n${chunk.old_lines.join("\n")}`,
+          chunkIndex,
+          chunk,
+          lineIndex,
+        )
       }
     }
 

@@ -7,10 +7,12 @@ import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
 import os from "os"
+import { cmd } from "./cmd"
 
 interface UninstallArgs {
-  keepConfig: boolean
-  keepData: boolean
+  keepConfig?: boolean
+  keepData?: boolean
+  purge: boolean
   dryRun: boolean
   force: boolean
 }
@@ -21,21 +23,24 @@ interface RemovalTargets {
   binary: string | null
 }
 
-export const UninstallCommand = {
+export const UninstallCommand = cmd({
   command: "uninstall",
-  describe: "uninstall openscience and remove all related files",
+  describe: "uninstall openscience while keeping your work and settings by default",
   builder: (yargs: Argv) =>
     yargs
       .option("keep-config", {
         alias: "c",
         type: "boolean",
-        describe: "keep configuration files",
-        default: false,
+        describe: "keep configuration files when using --purge (kept by default)",
       })
       .option("keep-data", {
         alias: "d",
         type: "boolean",
-        describe: "keep session data and snapshots",
+        describe: "keep sessions, artifacts, credentials, and snapshots when using --purge (kept by default)",
+      })
+      .option("purge", {
+        type: "boolean",
+        describe: "also permanently delete OpenScience configuration and user data",
         default: false,
       })
       .option("dry-run", {
@@ -84,15 +89,10 @@ export const UninstallCommand = {
 
     prompts.outro("Done")
   },
-}
+})
 
 async function collectRemovalTargets(args: UninstallArgs, method: Installation.Method): Promise<RemovalTargets> {
-  const directories: RemovalTargets["directories"] = [
-    { path: Global.Path.data, label: "Data", keep: args.keepData },
-    { path: Global.Path.cache, label: "Cache", keep: false },
-    { path: Global.Path.config, label: "Config", keep: args.keepConfig },
-    { path: Global.Path.state, label: "State", keep: false },
-  ]
+  const directories = uninstallDirectories(args)
 
   const shellConfig = method === "curl" ? await getShellConfigFile() : null
   const binary = method === "curl" ? process.execPath : null
@@ -100,8 +100,20 @@ async function collectRemovalTargets(args: UninstallArgs, method: Installation.M
   return { directories, shellConfig, binary }
 }
 
+export function uninstallDirectories(args: Pick<UninstallArgs, "keepConfig" | "keepData" | "purge">) {
+  return [
+    { path: Global.Path.data, label: "Data", keep: !args.purge || args.keepData === true },
+    { path: Global.Path.cache, label: "Cache", keep: false },
+    { path: Global.Path.config, label: "Config", keep: !args.purge || args.keepConfig === true },
+    { path: Global.Path.state, label: "State", keep: false },
+  ]
+}
+
 async function showRemovalSummary(targets: RemovalTargets, method: Installation.Method) {
   prompts.log.message("The following will be removed:")
+  if (targets.directories.some((dir) => dir.keep)) {
+    prompts.log.info("  Your configuration and user data will be kept. Use --purge to delete them.")
+  }
 
   for (const dir of targets.directories) {
     const exists = await fs
@@ -132,7 +144,6 @@ async function showRemovalSummary(targets: RemovalTargets, method: Installation.
       pnpm: "pnpm uninstall -g @synsci/openscience",
       bun: "bun remove -g @synsci/openscience",
       yarn: "yarn global remove @synsci/openscience",
-      brew: "brew uninstall openscience",
       choco: "choco uninstall openscience",
       scoop: "scoop uninstall openscience",
     }
@@ -183,7 +194,6 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
       pnpm: ["pnpm", "uninstall", "-g", "@synsci/openscience"],
       bun: ["bun", "remove", "-g", "@synsci/openscience"],
       yarn: ["yarn", "global", "remove", "@synsci/openscience"],
-      brew: ["brew", "uninstall", "openscience"],
       choco: ["choco", "uninstall", "openscience"],
       scoop: ["scoop", "uninstall", "openscience"],
     }

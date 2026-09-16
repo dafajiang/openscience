@@ -1,136 +1,416 @@
-// Permissions — governs what the agent may do to your registry (create/update
-// agents, publish/edit/attach/detach skills, attach/detach connectors) and at
-// what scope, plus the per-tool allow/ask/deny defaults.
+// Permissions — the standing approvals granted from permission cards (project
+// and machine scope, revocable here) plus the per-tool allow/ask/deny defaults
+// the agent loop enforces (config `permission` key via the globalSync-backed
+// component).
 //
-// Registry-write grants persist to routes/settings/permissions.ts (a real JSON
-// store under ~/.openscience/). Tool defaults reuse the config `permission` key via
-// the existing globalSync-backed component.
-import { Component, For, Show, createResource, createSignal } from "solid-js"
-import { Select } from "@synsci/ui/select"
+// The former "Registry actions" grant grid was removed deliberately: it
+// persisted scopes to a JSON store that no backend path ever consulted, so the
+// controls were display-only. Per the product truth pass, surfaces without a
+// real end-to-end runtime path are removed rather than shown.
+import { Component, For, Show, createMemo, createResource, createSignal } from "solid-js"
+import { useParams } from "@solidjs/router"
 import { Button } from "@synsci/ui/button"
+import { Icon } from "@synsci/ui/icon"
+import { useDialog } from "@synsci/ui/context/dialog"
 import { showToast } from "@synsci/ui/toast"
+import { confirmDialog } from "@/atlas/dialogs"
 import { useGlobalSDK } from "@/context/global-sdk"
-import { usePlatform } from "@/context/platform"
-import { settingsApi } from "./api"
+import { useGlobalSync } from "@/context/global-sync"
+import { resolveProjectRoute } from "@/utils/project-route"
 import { PermissionToolDefaults } from "../settings-permissions"
+import { PanelBody, PanelHeader, PanelScroll, Section, steady } from "./_shared"
+import "./preference-panels.css"
 
-type Scope = "global" | "session" | "revoked"
-interface PermissionInfo {
-  grants: Record<string, Scope>
+interface StandingApproval {
+  id: string
+  permission: string
+  pattern: string
+  scope: "project" | "global"
+  created: number
 }
 
-const ACTIONS: { id: string; title: string; description: string }[] = [
-  { id: "create_agent", title: "Create agent", description: "Register a new specialist agent." },
-  { id: "update_agent", title: "Update agent", description: "Modify an existing agent's config or prompt." },
-  { id: "publish_skill", title: "Publish skill", description: "Publish a skill to the registry." },
-  { id: "edit_skill", title: "Edit skill", description: "Change the contents of a skill." },
-  { id: "attach_skill", title: "Attach skill", description: "Enable a skill for an agent or session." },
-  { id: "detach_skill", title: "Detach skill", description: "Remove a skill from an agent or session." },
-  { id: "attach_connector", title: "Attach connector", description: "Enable an MCP connector for use." },
-  { id: "detach_connector", title: "Detach connector", description: "Disable an MCP connector." },
-]
-
-const SCOPES: { value: Scope; label: string }[] = [
-  { value: "session", label: "Session" },
-  { value: "global", label: "Global" },
-  { value: "revoked", label: "Revoked" },
-]
+interface FolderGrant {
+  id: string
+  path: string
+  access: "read" | "write"
+  scope: "once" | "session" | "project" | "installation"
+  source: "permission" | "api"
+  time: { created: number }
+}
 
 const Permissions: Component = () => {
+  const params = useParams()
   const sdk = useGlobalSDK()
-  const platform = usePlatform()
-  const fetchFn = platform.fetch ?? fetch
-  const call = <T,>(path: string, init?: RequestInit) =>
-    settingsApi<T>(sdk.url, fetchFn, `/settings/permissions${path}`, init)
-
-  const [info, { mutate, refetch }] = createResource(() => call<PermissionInfo>(""))
+  const globalSync = useGlobalSync()
+  const dialog = useDialog()
   const [busy, setBusy] = createSignal(false)
+  const [showAllDefaults, setShowAllDefaults] = createSignal(false)
 
-  const scopeFor = (id: string): Scope => info()?.grants[id] ?? "session"
+  const route = createMemo(() => resolveProjectRoute(params.dir, globalSync.data.project))
 
-  const setScope = async (id: string, scope: Scope) => {
+  const [standing, { refetch }] = steady(
+    createResource(
+      () => route()?.directory ?? false,
+      async (directory) => {
+        const response = await sdk.client.permission.standing.list({ directory })
+        return (response.data ?? []) as StandingApproval[]
+      },
+    ),
+  )
+
+  const [trust, trustControls] = steady(
+    createResource(
+      () => {
+        const value = route()
+        if (!value) return
+        return { projectID: value.projectID, directory: value.directory }
+      },
+      async (input) => {
+        const response = await sdk.client.project.trust.get(input)
+        if (!response.data) throw new Error("Project trust status was empty.")
+        return response.data
+      },
+    ),
+  )
+
+  const [folders, folderControls] = steady(
+    createResource(
+      () => {
+        const value = route()
+        const sessionID = params.id
+        if (!value || !sessionID || sessionID === "new") return
+        return { sessionID, directory: value.directory }
+      },
+      async (input) => {
+        const response = await sdk.client.session.filesystem.list(input)
+        return (response.data?.grants ?? []).filter(
+          (grant): grant is FolderGrant =>
+            (grant.source === "permission" || grant.source === "api") && !grant.time.consumed && !grant.time.revoked,
+        )
+      },
+    ),
+  )
+
+  const revoke = async (approval: StandingApproval) => {
+    const directory = route()?.directory
+    if (!directory) return
     setBusy(true)
     try {
-      mutate(await call<PermissionInfo>(`/${id}`, { method: "PUT", body: JSON.stringify({ scope }) }))
+      await sdk.client.permission.standing.revoke({ id: approval.id, directory })
+      await refetch()
     } catch (err) {
-      showToast({ title: "Failed to update permission", description: err instanceof Error ? err.message : String(err) })
-      refetch()
+      showToast({ title: "Failed to revoke approval", description: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setBusy(false)
     }
-    setBusy(false)
   }
 
-  const revokeAll = async () => {
+  const when = (created: number) => new Date(created).toLocaleDateString()
+
+  const revokeFolder = async (grant: FolderGrant) => {
+    const value = route()
+    const sessionID = params.id
+    if (!value || !sessionID || busy()) return
+    const confirmed = await confirmDialog(dialog, {
+      title: `Revoke access to ${grant.path}?`,
+      message: "OpenScience will stop affected kernels so the folder cannot remain mounted with stale access.",
+      confirmLabel: "Revoke folder access",
+      danger: true,
+    })
+    if (!confirmed) return
     setBusy(true)
-    try {
-      mutate(
-        await call<PermissionInfo>("/revoke-all", {
-          method: "POST",
-          body: JSON.stringify({ actions: ACTIONS.map((a) => a.id) }),
+    await sdk.client.session.filesystem
+      .revoke({ sessionID, grantID: grant.id, directory: value.directory })
+      .then(() => folderControls.refetch())
+      .catch((error) =>
+        showToast({
+          title: "Failed to revoke folder access",
+          description: error instanceof Error ? error.message : String(error),
         }),
       )
-    } catch (err) {
-      showToast({ title: "Failed to revoke", description: err instanceof Error ? err.message : String(err) })
-      refetch()
+      .finally(() => setBusy(false))
+  }
+
+  const updateTrust = async (trusted: boolean) => {
+    const value = route()
+    const status = trust()
+    if (!value || !status || busy()) return
+    const confirmed = await confirmDialog(dialog, {
+      title: trusted ? "Trust this project?" : "Revoke project trust?",
+      message: trusted
+        ? `Allow project-owned code under ${status.root}, including plugins, MCP servers, formatters, language servers, provider commands, and startup hooks. Trust also permits remote jobs, kernel environment changes such as package installs, and host execution when the sandbox is off or explicitly configured to fall back without containment. Sandboxed terminals, kernels, and local jobs do not require project trust unless you enable that stricter policy in Sandbox settings.`
+        : "Remote jobs, kernel environment changes such as package installs, project-owned extensions, and unsandboxed execution will be blocked. Existing project processes are stopped. Sandboxed terminals, kernels, and local jobs remain available unless Sandbox settings require project trust for all execution.",
+      confirmLabel: trusted ? "Trust project" : "Revoke trust",
+      danger: !trusted,
+    })
+    if (!confirmed) return
+    setBusy(true)
+    try {
+      await sdk.client.project.trust.update({
+        projectID: value.projectID,
+        directory: value.directory,
+        body: trusted ? { trusted: true, root: status.root } : { trusted: false },
+      })
+      await trustControls.refetch()
+      showToast({
+        variant: "success",
+        title: trusted ? "Project trusted" : "Project trust revoked",
+      })
+    } catch (error) {
+      showToast({
+        title: trusted ? "Could not trust project" : "Could not revoke project trust",
+        description: error instanceof Error ? error.message : String(error),
+      })
+    } finally {
+      setBusy(false)
     }
-    setBusy(false)
   }
 
   return (
-    <div class="flex flex-col h-full overflow-y-auto no-scrollbar">
-      <div class="sticky top-0 z-10 bg-[linear-gradient(to_bottom,var(--surface-raised-stronger-non-alpha)_calc(100%_-_24px),transparent)]">
-        <div class="flex flex-col gap-1 px-4 py-8 sm:p-8 max-w-[760px]">
-          <h2 class="text-16-medium text-text-strong">Permissions</h2>
-          <p class="text-13-regular text-text-weak">
-            Control what the agent may change in your registry and how it uses tools.
-          </p>
-        </div>
-      </div>
-
-      <div class="flex flex-col gap-8 px-4 pb-12 sm:px-8 max-w-[760px]">
-        {/* ── Registry actions ── */}
-        <div class="flex flex-col gap-3">
-          <div class="flex items-end justify-between gap-4">
-            <div class="flex flex-col gap-0.5">
-              <h3 class="text-13-medium text-text-weak tracking-wide">Registry actions</h3>
-              <p class="text-12-regular text-text-weak">
-                Grant each action at Global scope (all sessions) or Session scope (this session), or revoke it.
-              </p>
-            </div>
-            <Button size="small" variant="ghost" disabled={busy()} onClick={revokeAll}>
-              revoke all
-            </Button>
-          </div>
-
-          <div class="border border-border-weak-base rounded-[4px] overflow-hidden bg-surface-base/40">
-            <For each={ACTIONS}>
-              {(action) => (
-                <div class="flex flex-wrap items-center justify-between gap-4 px-4 py-3.5 border-b border-border-weak-base last:border-none">
-                  <div class="flex flex-col gap-0.5 min-w-0">
-                    <span class="text-14-medium text-text-strong">{action.title}</span>
-                    <span class="text-12-regular text-text-weak">{action.description}</span>
-                  </div>
-                  <Show when={info()} fallback={<span class="text-12-regular text-text-weak/60">…</span>}>
-                    <Select
-                      options={SCOPES}
-                      current={SCOPES.find((s) => s.value === scopeFor(action.id))}
-                      value={(o) => o.value}
-                      label={(o) => o.label}
-                      onSelect={(o) => o && setScope(action.id, o.value)}
-                      variant="secondary"
-                      size="small"
-                      triggerVariant="settings"
-                    />
+    <PanelScroll>
+      <div class="settings-preferences-panel settings-preferences-panel--permissions">
+        <PanelHeader title="Permissions" description="Control project trust, approvals, and tool behavior." />
+        <PanelBody>
+          <Show when={route()}>
+            <Section
+              title="Project code"
+              description="Trust remote jobs, kernel environment changes, project-owned extensions, and host execution separately from routine sandboxed work."
+            >
+              <div class="settings-card settings-preferences-card">
+                <Show
+                  when={!trust.loading}
+                  fallback={
+                    <div class="settings-panel-loading__rows" role="status" aria-label="Checking project trust">
+                      <span />
+                    </div>
+                  }
+                >
+                  <Show
+                    when={!trust.error}
+                    fallback={
+                      <div class="settings-alert" data-tone="critical" role="alert">
+                        <span>Project trust could not be loaded. {String(trust.error)}</span>
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          class="settings-panel-action"
+                          onClick={() => void trustControls.refetch()}
+                        >
+                          Retry
+                        </Button>
+                      </div>
+                    }
+                  >
+                    <div class="settings-row settings-preference-row justify-between">
+                      <span
+                        class="settings-preference-icon"
+                        data-tone={trust()?.canExecuteProjectCode ? "success" : "warning"}
+                        aria-hidden="true"
+                      >
+                        <Icon name={trust()?.canExecuteProjectCode ? "shield" : "shield-alert"} size="small" />
+                      </span>
+                      <div class="settings-row-copy">
+                        <strong>
+                          {trust()?.canExecuteProjectCode ? "Project code enabled" : "Project extensions blocked"}
+                        </strong>
+                        <span class="text-11-regular text-text-weak break-all">{trust()?.root}</span>
+                      </div>
+                      <span
+                        class="settings-preference-status"
+                        data-tone={trust()?.canExecuteProjectCode ? "success" : "warning"}
+                      >
+                        {trust()?.canExecuteProjectCode ? "Trusted" : "Restricted"}
+                      </span>
+                      <Button
+                        size="small"
+                        variant={trust()?.canExecuteProjectCode ? "ghost" : "secondary"}
+                        disabled={busy() || !trust()}
+                        onClick={() => void updateTrust(!trust()?.canExecuteProjectCode)}
+                      >
+                        {trust()?.canExecuteProjectCode ? "Revoke trust" : "Trust project"}
+                      </Button>
+                    </div>
                   </Show>
-                </div>
-              )}
-            </For>
-          </div>
-        </div>
+                </Show>
+              </div>
+            </Section>
+          </Show>
 
-        {/* ── Tool defaults (existing, config-backed) ── */}
-        <PermissionToolDefaults />
+          <Show when={route() && params.id && params.id !== "new"}>
+            <Section
+              title="Connected folders"
+              description="Review durable read-only and read-write access from the active research session."
+            >
+              <div class="settings-card settings-preferences-card">
+                <Show
+                  when={!folders.loading}
+                  fallback={
+                    <div class="settings-panel-loading__rows" role="status" aria-label="Loading connected folders">
+                      <span />
+                    </div>
+                  }
+                >
+                  <Show
+                    when={!folders.error}
+                    fallback={
+                      <div class="settings-alert" data-tone="critical" role="alert">
+                        <span>Connected folders could not be loaded.</span>
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          class="settings-panel-action"
+                          onClick={() => void folderControls.refetch()}
+                        >
+                          Retry
+                        </Button>
+                      </div>
+                    }
+                  >
+                    <Show
+                      when={(folders() ?? []).length > 0}
+                      fallback={
+                        <p class="settings-card-empty" role="status">
+                          No connected folders in this session.
+                        </p>
+                      }
+                    >
+                      <For each={folders()}>
+                        {(grant) => (
+                          <div class="settings-row settings-preference-row justify-between">
+                            <div class="settings-row-copy">
+                              <strong class="break-all">{grant.path}</strong>
+                              <span class="text-11-regular text-text-weak">
+                                {grant.access === "write" ? "Read & write" : "Read only"} ·{" "}
+                                {grant.scope === "installation"
+                                  ? "Every project"
+                                  : grant.scope === "project"
+                                    ? "This project"
+                                    : "This session"}
+                              </span>
+                            </div>
+                            <Button
+                              size="small"
+                              variant="ghost"
+                              disabled={busy()}
+                              onClick={() => void revokeFolder(grant)}
+                            >
+                              Revoke
+                            </Button>
+                          </div>
+                        )}
+                      </For>
+                    </Show>
+                  </Show>
+                </Show>
+              </div>
+            </Section>
+          </Show>
+
+          {/* ── Standing approvals ── */}
+          <Show when={route()}>
+            <Section
+              title="Standing approvals"
+              description="Approvals granted for this project or every project. Revoke one to ask again next time."
+            >
+              <div class="settings-card settings-preferences-card">
+                <Show
+                  when={!standing.loading}
+                  fallback={
+                    <div class="settings-panel-loading__rows" role="status" aria-label="Loading standing approvals">
+                      <span />
+                      <span />
+                    </div>
+                  }
+                >
+                  <Show
+                    when={!standing.error}
+                    fallback={
+                      <div class="settings-alert" data-tone="critical" role="alert">
+                        <span>Standing approvals could not be loaded. {String(standing.error)}</span>
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          class="settings-panel-action"
+                          disabled={standing.loading}
+                          onClick={() => void refetch()}
+                        >
+                          Retry
+                        </Button>
+                      </div>
+                    }
+                  >
+                    <Show
+                      when={(standing() ?? []).length > 0}
+                      fallback={
+                        <p class="settings-card-empty" role="status">
+                          No standing approvals yet. Conversation-scoped approvals end with their session.
+                        </p>
+                      }
+                    >
+                      <For each={standing()}>
+                        {(approval) => (
+                          <div class="settings-row settings-preference-row justify-between">
+                            <div class="settings-row-copy">
+                              <strong class="break-all">
+                                {approval.permission}
+                                <Show when={approval.pattern !== "*"}>
+                                  <span class="text-text-weak font-normal"> · {approval.pattern}</span>
+                                </Show>
+                              </strong>
+                              <span class="text-11-regular text-text-weak">
+                                {approval.scope === "global" ? "Everywhere" : "This project"} · granted{" "}
+                                {when(approval.created)}
+                              </span>
+                            </div>
+                            <span class="ml-auto shrink-0">
+                              <Button
+                                size="small"
+                                variant="ghost"
+                                disabled={busy()}
+                                onClick={() => void revoke(approval)}
+                              >
+                                Revoke
+                              </Button>
+                            </span>
+                          </div>
+                        )}
+                      </For>
+                    </Show>
+                  </Show>
+                </Show>
+              </div>
+            </Section>
+          </Show>
+
+          {/* Tool defaults are a long list, so keep the most common controls visible first. */}
+          <div
+            id="permission-tool-defaults"
+            class="settings-permission-defaults settings-disclosure-group"
+            data-expanded={showAllDefaults() ? "true" : "false"}
+          >
+            <PermissionToolDefaults />
+            <div class="settings-disclosure-footer">
+              <button
+                type="button"
+                class="settings-preference-action"
+                data-variant="quiet"
+                aria-expanded={showAllDefaults()}
+                aria-controls="permission-tool-defaults"
+                onClick={() => setShowAllDefaults((value) => !value)}
+              >
+                <Icon
+                  name="chevron-down"
+                  size="small"
+                  classList={{ "rotate-180": showAllDefaults() }}
+                  aria-hidden="true"
+                />
+                {showAllDefaults() ? "Show fewer tool defaults" : "Show all tool defaults"}
+              </button>
+            </div>
+          </div>
+        </PanelBody>
       </div>
-    </div>
+    </PanelScroll>
   )
 }
 

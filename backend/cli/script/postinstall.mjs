@@ -3,6 +3,7 @@
 import fs from "fs"
 import path from "path"
 import os from "os"
+import childProcess from "child_process"
 import { fileURLToPath } from "url"
 import { createRequire } from "module"
 
@@ -47,12 +48,92 @@ function detectPlatformAndArch() {
   return { platform, arch }
 }
 
+function detectMusl(platform) {
+  if (platform !== "linux") return false
+  try {
+    return fs.readdirSync("/lib").some((entry) => entry.startsWith("ld-musl-"))
+  } catch {
+    return false
+  }
+}
+
+function cpuSupportsAvx2(platform, arch, linuxInfo) {
+  if (arch !== "x64") return undefined
+  if (platform === "linux") {
+    const info = (() => {
+      if (linuxInfo !== undefined) return linuxInfo
+      try {
+        return fs.readFileSync("/proc/cpuinfo", "utf8")
+      } catch {
+        return undefined
+      }
+    })()
+    if (!info) return undefined
+    const flags = /^(?:flags|features)\s*:\s*(.+)$/im.exec(info)?.[1]
+    if (!flags) return undefined
+    return flags.toLowerCase().split(/\s+/).includes("avx2")
+  }
+  if (platform !== "darwin") return undefined
+  // hw.optional.avx2_0 answers 0/1 on every Mac, including x64 Node under
+  // Rosetta where machdep.cpu.leaf7_features is an unknown oid.
+  const optional = childProcess.spawnSync("sysctl", ["-n", "hw.optional.avx2_0"], { encoding: "utf8" })
+  const flag = optional.status === 0 ? String(optional.stdout).trim() : undefined
+  if (flag === "1") return true
+  if (flag === "0") return false
+  const result = childProcess.spawnSync("sysctl", ["-n", "machdep.cpu.leaf7_features"], { encoding: "utf8" })
+  if (result.status !== 0) return undefined
+  return result.stdout.toLowerCase().split(/\s+/).includes("avx2")
+}
+
+function linuxKernelProblem(platform, release = os.release()) {
+  if (platform !== "linux") return undefined
+  const match = /^(\d+)\.(\d+)/.exec(release)
+  if (!match) return undefined
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  if (major > 5 || (major === 5 && minor >= 1)) return undefined
+  return `Linux kernel ${release} is unsupported; OpenScience's bundled runtime requires kernel 5.1 or newer`
+}
+
+function pageSize(platform) {
+  if (platform !== "linux") return undefined
+  const result = childProcess.spawnSync("getconf", ["PAGESIZE"], { encoding: "utf8" })
+  return result.status === 0 ? result.stdout.trim() || undefined : undefined
+}
+
+function linuxArm64PageSizeProblem(platform, arch, detectedPageSize) {
+  if (platform !== "linux" || arch !== "arm64" || detectedPageSize === undefined) return undefined
+  const bytes = Number.parseInt(String(detectedPageSize), 10)
+  if (!Number.isFinite(bytes) || bytes === 4096) return undefined
+  return [
+    `Linux ARM64 page size ${bytes} is unsupported by OpenScience's Bun-compiled executable`,
+    "use a kernel or VM configured with 4 KB pages",
+    "upstream status: https://github.com/oven-sh/bun/issues/17627",
+  ].join("; ")
+}
+
+function platformPackageNames(
+  platform,
+  arch,
+  musl = detectMusl(platform),
+  preferBaseline = cpuSupportsAvx2(platform, arch) === false,
+) {
+  const base = `openscience-${platform}-${arch}`
+  const variants = musl ? [`${base}-musl`] : [base]
+  if (arch === "x64") variants.push(musl ? `${base}-baseline-musl` : `${base}-baseline`)
+  const ranked = preferBaseline
+    ? variants.sort((a, b) => Number(b.includes("-baseline")) - Number(a.includes("-baseline")))
+    : variants
+  return ranked.flatMap((name) => [`@synsci/${name}`, name])
+}
+
 function findBinary() {
   const { platform, arch } = detectPlatformAndArch()
   const binaryName = platform === "windows" ? "openscience.exe" : "openscience"
 
-  // Try scoped package first (@synsci/openscience-darwin-arm64), then unscoped (openscience-darwin-arm64)
-  const packageNames = [`@synsci/openscience-${platform}-${arch}`, `openscience-${platform}-${arch}`]
+  // Try the libc-compatible native package first, followed by an x64 baseline
+  // build for older CPUs. Never select a package for the wrong architecture.
+  const packageNames = platformPackageNames(platform, arch)
 
   for (const packageName of packageNames) {
     try {
@@ -70,7 +151,15 @@ function findBinary() {
     }
   }
 
-  throw new Error(`Could not find platform binary package for ${platform}-${arch}`)
+  throw new Error(
+    [
+      `Could not find a native platform binary for ${platform}-${arch}.`,
+      `Expected one of: ${packageNames.join(", ")}.`,
+      `Detected node ${process.version} on kernel ${os.release()}.`,
+      `Check npm selection with: npm config get cpu`,
+      `Then inspect the install with: npm ls -g @synsci/openscience ${packageNames[0]} --depth=0`,
+    ].join("\n"),
+  )
 }
 
 function prepareBinDirectory(binaryName) {
@@ -102,13 +191,23 @@ function symlinkBinary(sourcePath, binaryName) {
   }
 }
 
-async function main() {
+function main() {
   try {
     if (os.platform() === "win32") {
       // On Windows, the .exe is already included in the package and bin field points to it
       // No postinstall setup needed
       console.log("Windows detected: binary setup not needed (using packaged .exe)")
       return
+    }
+
+    const { platform, arch } = detectPlatformAndArch()
+    const kernelProblem = linuxKernelProblem(platform)
+    if (kernelProblem) {
+      throw new Error(`${kernelProblem}. CentOS 7's stock 3.10 kernel is not supported.`)
+    }
+    const pageSizeProblem = linuxArm64PageSizeProblem(platform, arch, pageSize(platform))
+    if (pageSizeProblem) {
+      throw new Error(pageSizeProblem)
     }
 
     // On non-Windows platforms, just verify the binary package exists
@@ -122,9 +221,6 @@ async function main() {
   }
 }
 
-try {
-  main()
-} catch (error) {
-  console.error("Postinstall script error:", error.message)
-  process.exit(0)
-}
+export { cpuSupportsAvx2, linuxArm64PageSizeProblem, linuxKernelProblem, platformPackageNames }
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()

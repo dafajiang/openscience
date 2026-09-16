@@ -1,13 +1,13 @@
-import { TextField } from "@synsci/ui/text-field"
 import { Button } from "@synsci/ui/button"
-import { Component, Show } from "solid-js"
+import { Component, Show, createSignal } from "solid-js"
 import { createStore } from "solid-js/store"
 import { usePlatform } from "@/context/platform"
 import { useLanguage } from "@/context/language"
-import { Icon } from "@synsci/ui/icon"
 import { FONT_SANS } from "@/styles/tokens"
+import { IconAlertCircle, IconCopy, IconRefresh } from "@/atlas/shared/Icon"
+import { updateController } from "@/components/settings/update-controller"
 
-export type InitError = {
+type InitError = {
   name: string
   data: Record<string, unknown>
 }
@@ -47,11 +47,6 @@ function formatInitError(error: InitError, t: Translator): string {
     case "MCPFailed": {
       const name = typeof data.name === "string" ? data.name : ""
       return t("error.chain.mcpFailed", { name })
-    }
-    case "ProviderAuthError": {
-      const providerID = typeof data.providerID === "string" ? data.providerID : "unknown"
-      const message = typeof data.message === "string" ? data.message : safeJson(data.message)
-      return t("error.chain.providerAuthFailed", { provider: providerID, message })
     }
     case "APIError": {
       const message = typeof data.message === "string" ? data.message : t("error.chain.apiError")
@@ -124,6 +119,25 @@ function formatInitError(error: InitError, t: Translator): string {
         : t("error.chain.configInvalid", { path })
 
       return [line, ...issues].join("\n")
+    }
+    case "ProjectMismatchError": {
+      const directory = typeof data.directory === "string" ? data.directory : safeJson(data.directory)
+      return `This link points at a project that does not match the folder the server resolved (${directory}). Open the project again from the Projects list.`
+    }
+    case "ProjectDirectoryError": {
+      const directory = typeof data.directory === "string" ? data.directory : safeJson(data.directory)
+      return `The project folder ${directory} could not be used as a project root. Choose the folder again from the Projects list.`
+    }
+    case "ProjectUnknownError":
+      return "This project is no longer registered on this server. Open or create it again from the Projects list."
+    case "ProjectStaleError": {
+      const directory = typeof data.directory === "string" ? ` (${data.directory})` : ""
+      return `This project's folder is missing or was moved${directory}. Reconnect it from the Projects list.`
+    }
+    case "SessionFilesystemInvalidPathError": {
+      const path = typeof data.path === "string" ? data.path : safeJson(data.path)
+      const message = typeof data.message === "string" ? data.message : ""
+      return message || `The folder ${path} cannot be used by this session. Choose a different project folder.`
     }
     case "UnknownError":
       return typeof data.message === "string" ? data.message : safeJson(data)
@@ -198,8 +212,14 @@ function formatErrorChain(error: unknown, t: Translator, depth = 0, parentMessag
   return indent + safeJson(error)
 }
 
-function formatError(error: unknown, t: Translator): string {
+export function formatError(error: unknown, t: Translator): string {
   return formatErrorChain(error, t, 0)
+}
+
+/** A project or folder the server refuses is bound to the current URL, so
+ * reloading reproduces it; the Projects list is the way out. */
+export function projectRecovery(detail: string): boolean {
+  return /Project(?:Mismatch|Directory|Unknown|Stale)Error|SessionFilesystemInvalidPathError/.test(detail)
 }
 
 interface ErrorPageProps {
@@ -208,86 +228,278 @@ interface ErrorPageProps {
 
 export const ErrorPage: Component<ErrorPageProps> = (props) => {
   const platform = usePlatform()
+  const updates = updateController(platform)
+  updates.start()
   const language = useLanguage()
+  const [copied, setCopied] = createSignal(false)
   const [store, setStore] = createStore({
     checking: false,
+    updating: false,
     version: undefined as string | undefined,
+    updateError: undefined as string | undefined,
   })
 
   async function checkForUpdates() {
     if (!platform.checkUpdate) return
     setStore("checking", true)
-    const result = await platform.checkUpdate()
-    setStore("checking", false)
-    if (result.updateAvailable && result.version) setStore("version", result.version)
+    setStore("updateError", undefined)
+    try {
+      const result = await updates.check()
+      if (result?.updateAvailable && result.version) setStore("version", result.version)
+    } catch (error) {
+      setStore("updateError", error instanceof Error ? error.message : String(error))
+    } finally {
+      setStore("checking", false)
+    }
   }
 
   async function installUpdate() {
-    if (!platform.update || !platform.restart) return
-    await platform.update()
-    await platform.restart()
+    if (store.updating) return
+    setStore("updating", true)
+    setStore("updateError", undefined)
+    try {
+      if (platform.stageUpdate && platform.applyUpdate) {
+        if (updates.state.phase === "ready") await updates.apply()
+        else await updates.stage()
+        return
+      }
+      if (!platform.update || !platform.restart) return
+      await platform.update()
+      await platform.restart()
+    } catch (error) {
+      setStore("updateError", error instanceof Error ? error.message : String(error))
+    } finally {
+      setStore("updating", false)
+    }
+  }
+
+  const detail = () => formatError(props.error, language.t)
+  // A project or folder the server refuses is bound to this URL; reloading it
+  // reproduces the same error, so the way out is the Projects list.
+  const projectProblem = () => projectRecovery(detail())
+  const home = () => window.location.assign("/")
+  const hint = () => {
+    const text = detail().toLowerCase()
+    if (projectProblem()) {
+      return "This conversation link points at a project folder the server cannot use. Your files and saved conversations are intact; go back to Projects and open the project from there."
+    }
+    if (text.includes("providerauth") || text.includes("unauthorized") || text.includes("401")) {
+      return "A model provider rejected its credentials. Reload first; if it returns, reconnect that provider in Settings."
+    }
+    if (text.includes("config") || text.includes("json")) {
+      return "OpenScience could not read part of its configuration. The technical details below identify the file to repair."
+    }
+    if (text.includes("fetch") || text.includes("network") || text.includes("connection")) {
+      return "The app lost contact with its server. Make sure the local server is running, then reload."
+    }
+    return "Reloading usually restores the workspace without losing project files or saved conversations."
+  }
+  const diagnostics = () =>
+    [
+      "OpenScience diagnostic",
+      `time: ${new Date().toISOString()}`,
+      `version: ${platform.version ?? "unknown"}`,
+      `platform: ${platform.platform}${platform.os ? `/${platform.os}` : ""}`,
+      `url: ${typeof location === "undefined" ? "unknown" : location.href}`,
+      "",
+      detail(),
+    ].join("\n")
+  const copy = async () => {
+    await navigator.clipboard?.writeText(diagnostics())
+    setCopied(true)
   }
 
   return (
     <div
-      class="relative flex-1 h-screen w-screen min-h-0 flex flex-col items-center justify-center bg-background-base font-sans"
-      style={{ "font-family": FONT_SANS }}
+      class="relative flex-1 h-screen w-screen min-h-0 flex flex-col items-center justify-center bg-background-base"
+      style={{
+        "font-family": FONT_SANS,
+        padding: "32px",
+        background:
+          "radial-gradient(circle at 50% 25%, color-mix(in srgb, var(--color-error) 6%, transparent), transparent 34%), var(--color-bg)",
+      }}
     >
-      <div class="w-2/3 max-w-3xl flex flex-col items-center justify-center gap-8">
-        <div class="text-24-medium text-text-strong tracking-tight opacity-50 shrink-0">OpenScience</div>
-        <div class="flex flex-col items-center gap-2 text-center">
-          <h1 class="text-lg font-medium text-text-strong">{language.t("error.page.title")}</h1>
-          <p class="text-sm text-text-weak">{language.t("error.page.description")}</p>
+      <main
+        style={{
+          width: "min(100%, 720px)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "24px",
+          padding: "30px",
+          border: "1px solid var(--color-border)",
+          "border-radius": "10px",
+          background: "var(--color-surface-solid)",
+          "box-shadow": "var(--shadow-lg)",
+        }}
+      >
+        <div style={{ display: "flex", "align-items": "flex-start", gap: "16px" }}>
+          <span
+            style={{
+              width: "40px",
+              height: "40px",
+              display: "inline-flex",
+              "align-items": "center",
+              "justify-content": "center",
+              "border-radius": "10px",
+              background: "color-mix(in srgb, var(--color-error) 10%, transparent)",
+              color: "var(--color-error)",
+              "flex-shrink": 0,
+            }}
+          >
+            <IconAlertCircle size={20} strokeWidth={1.5} />
+          </span>
+          <div style={{ display: "flex", "flex-direction": "column", gap: "8px", "min-width": 0 }}>
+            <span
+              style={{
+                "font-family": FONT_SANS,
+                "font-size": "12px",
+                "font-weight": "var(--font-weight-medium)",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              Workspace recovery
+            </span>
+            <h1
+              style={{
+                margin: 0,
+                color: "var(--color-text)",
+                "font-size": "24px",
+                "font-weight": "var(--font-weight-emphasis)",
+                "letter-spacing": "-0.025em",
+              }}
+            >
+              OpenScience hit a problem
+            </h1>
+            <p style={{ margin: 0, color: "var(--color-text-muted)", "font-size": "13px", "line-height": 1.6 }}>
+              {hint()}
+            </p>
+          </div>
         </div>
-        <TextField
-          value={formatError(props.error, language.t)}
-          readOnly
-          copyable
-          multiline
-          class="max-h-96 w-full font-mono text-xs no-scrollbar"
-          label={language.t("error.page.details.label")}
-          hideLabel
-        />
-        <div class="flex items-center gap-3">
-          <Button size="large" onClick={platform.restart}>
-            {language.t("error.page.action.restart")}
+
+        <div style={{ display: "flex", "align-items": "center", "flex-wrap": "wrap", gap: "8px" }}>
+          <Button
+            size="large"
+            variant={projectProblem() ? "secondary" : "primary"}
+            onClick={() => void platform.restart()}
+          >
+            <span style={{ display: "inline-flex", "align-items": "center", gap: "7px" }}>
+              <IconRefresh size={12} />
+              {platform.platform === "desktop" ? "Restart App" : "Reload App"}
+            </span>
+          </Button>
+          <Button size="large" variant={projectProblem() ? "primary" : "secondary"} onClick={home}>
+            Back to Projects
+          </Button>
+          <Button size="large" variant="secondary" onClick={() => void copy()}>
+            <span style={{ display: "inline-flex", "align-items": "center", gap: "7px" }}>
+              <IconCopy size={12} />
+              {copied() ? "Diagnostic Copied" : "Copy Diagnostic"}
+            </span>
           </Button>
           <Show when={platform.checkUpdate}>
             <Show
               when={store.version}
               fallback={
                 <Button size="large" variant="ghost" onClick={checkForUpdates} disabled={store.checking}>
-                  {store.checking
-                    ? language.t("error.page.action.checking")
-                    : language.t("error.page.action.checkUpdates")}
+                  {store.checking ? "Checking…" : "Check for Updates"}
                 </Button>
               }
             >
-              <Button size="large" onClick={installUpdate}>
-                {language.t("error.page.action.updateTo", { version: store.version ?? "" })}
+              <Button
+                size="large"
+                onClick={installUpdate}
+                disabled={
+                  store.updating ||
+                  ["downloading", "extracting", "verifying", "restarting"].includes(updates.state.phase)
+                }
+              >
+                {updates.state.phase === "ready"
+                  ? "Restart to update"
+                  : ["downloading", "extracting", "verifying"].includes(updates.state.phase)
+                    ? "Preparing update…"
+                    : `Download ${store.version}`}
               </Button>
             </Show>
           </Show>
         </div>
-        <div class="flex flex-col items-center gap-2">
-          <div class="flex items-center justify-center gap-1">
-            {language.t("error.page.report.prefix")}
+        <Show when={store.updateError ?? updates.state.error}>
+          {(message) => (
+            <p role="alert" style={{ margin: 0, color: "var(--color-error)", "font-size": "12px" }}>
+              Update check failed: {message()}
+            </p>
+          )}
+        </Show>
+
+        <details
+          style={{
+            border: "1px solid var(--color-border)",
+            "border-radius": "6px",
+            background: "var(--color-bg-subtle)",
+            overflow: "hidden",
+          }}
+        >
+          <summary
+            style={{
+              cursor: "pointer",
+              padding: "11px 13px",
+              color: "var(--color-text-muted)",
+              "font-family": FONT_SANS,
+              "font-size": "10px",
+              "user-select": "none",
+            }}
+          >
+            technical details
+          </summary>
+          <pre
+            style={{
+              margin: 0,
+              padding: "13px",
+              "max-height": "260px",
+              overflow: "auto",
+              "border-top": "1px solid var(--color-border)",
+              background: "var(--color-bg)",
+              color: "var(--color-text-muted)",
+              "font-family": FONT_SANS,
+              "font-size": "10px",
+              "line-height": 1.55,
+              "white-space": "pre-wrap",
+              "overflow-wrap": "anywhere",
+            }}
+          >
+            {detail()}
+          </pre>
+        </details>
+
+        <footer
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "space-between",
+            gap: "16px",
+            color: "var(--color-text-faint)",
+            "font-family": FONT_SANS,
+            "font-size": "10px",
+          }}
+        >
+          <span>OpenScience {platform.version ?? "development build"}</span>
+          <span style={{ display: "inline-flex", "align-items": "center", gap: "5px" }}>
+            Still stuck?
             <button
               type="button"
-              class="flex items-center text-text-interactive-base gap-1"
-              onClick={() => platform.openLink("https://github.com/synthetic-sciences/OpenScience/issues")}
+              onClick={() => platform.openLink("https://github.com/synthetic-sciences/openscience/issues/new")}
+              style={{
+                all: "unset",
+                cursor: "pointer",
+                color: "var(--color-accent)",
+                "text-decoration": "underline",
+                "text-underline-offset": "3px",
+              }}
             >
-              <div>{language.t("error.page.report.discord")}</div>
-              <Icon name="discord" class="text-text-interactive-base" />
+              Report This Issue
             </button>
-          </div>
-          <Show when={platform.version}>
-            {(version) => (
-              <p class="text-xs text-text-weak">{language.t("error.page.version", { version: version() })}</p>
-            )}
-          </Show>
-        </div>
-      </div>
+          </span>
+        </footer>
+      </main>
     </div>
   )
 }

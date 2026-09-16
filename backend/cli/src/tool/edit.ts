@@ -16,7 +16,10 @@ import { FileTime } from "../file/time"
 import { Filesystem } from "../util/filesystem"
 import { Instance } from "../project/instance"
 import { Snapshot } from "@/snapshot"
-import { assertExternalDirectory } from "./external-directory"
+import { assertExternalDirectory, sessionToolDirectory } from "./external-directory"
+import { SafeFileIO } from "@/file/safe-io"
+import { AuthoritySignal } from "@/project/authority-signal"
+import { PayloadIntegrity } from "./payload-integrity"
 
 const MAX_DIAGNOSTICS_PER_FILE = 20
 
@@ -41,16 +44,28 @@ export const EditTool = Tool.define("edit", {
       throw new Error("oldString and newString must be different")
     }
 
-    const filePath = path.isAbsolute(params.filePath) ? params.filePath : path.join(Instance.directory, params.filePath)
-    await assertExternalDirectory(ctx, filePath)
+    const directory = await sessionToolDirectory(ctx)
+    const requested = path.isAbsolute(params.filePath) ? params.filePath : path.join(directory, params.filePath)
+    using access = await assertExternalDirectory(ctx, requested, { access: "write" })
+    const filePath = access?.path ?? requested
+    const write = (content: string, approved?: Awaited<ReturnType<typeof SafeFileIO.optional>>) =>
+      AuthoritySignal.exclusive(async () => {
+        const current = (await access?.revalidate()) ?? filePath
+        if (current !== filePath) throw new Error("File authority changed before the edit")
+        return SafeFileIO.write(current, content, approved)
+      })
 
     let diff = ""
     let contentOld = ""
     let contentNew = ""
     await FileTime.withLock(filePath, async () => {
       if (params.oldString === "") {
-        const existed = await Bun.file(filePath).exists()
+        const approved = await SafeFileIO.optional(filePath)
+        const existed = !!approved
+        contentOld = approved?.bytes.toString("utf8") ?? ""
+        if (approved) await FileTime.assert(ctx.sessionID, filePath)
         contentNew = params.newString
+        PayloadIntegrity.assert({ content: contentNew, before: contentOld, messages: ctx.messages })
         diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
         await ctx.ask({
           permission: "edit",
@@ -61,7 +76,7 @@ export const EditTool = Tool.define("edit", {
             diff,
           },
         })
-        await Bun.write(filePath, params.newString)
+        await write(params.newString, approved)
         await Bus.publish(File.Event.Edited, {
           file: filePath,
         })
@@ -73,13 +88,14 @@ export const EditTool = Tool.define("edit", {
         return
       }
 
-      const file = Bun.file(filePath)
-      const stats = await file.stat().catch(() => {})
-      if (!stats) throw new Error(`File ${filePath} not found`)
-      if (stats.isDirectory()) throw new Error(`Path is a directory, not a file: ${filePath}`)
+      const approved = await SafeFileIO.read(filePath).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`File ${filePath} not found`)
+        throw error
+      })
       await FileTime.assert(ctx.sessionID, filePath)
-      contentOld = await file.text()
+      contentOld = approved.bytes.toString("utf8")
       contentNew = replace(contentOld, params.oldString, params.newString, params.replaceAll)
+      PayloadIntegrity.assert({ content: contentNew, before: contentOld, messages: ctx.messages })
 
       diff = trimDiff(
         createTwoFilesPatch(filePath, filePath, normalizeLineEndings(contentOld), normalizeLineEndings(contentNew)),
@@ -94,7 +110,7 @@ export const EditTool = Tool.define("edit", {
         },
       })
 
-      await file.write(contentNew)
+      await write(contentNew, approved)
       await Bus.publish(File.Event.Edited, {
         file: filePath,
       })
@@ -102,7 +118,6 @@ export const EditTool = Tool.define("edit", {
         file: filePath,
         event: "change",
       })
-      contentNew = await file.text()
       diff = trimDiff(
         createTwoFilesPatch(filePath, filePath, normalizeLineEndings(contentOld), normalizeLineEndings(contentNew)),
       )
@@ -181,11 +196,11 @@ function levenshtein(a: string, b: string): number {
   return matrix[a.length][b.length]
 }
 
-export const SimpleReplacer: Replacer = function* (_content, find) {
+const SimpleReplacer: Replacer = function* (_content, find) {
   yield find
 }
 
-export const LineTrimmedReplacer: Replacer = function* (content, find) {
+const LineTrimmedReplacer: Replacer = function* (content, find) {
   const originalLines = content.split("\n")
   const searchLines = find.split("\n")
 
@@ -225,7 +240,7 @@ export const LineTrimmedReplacer: Replacer = function* (content, find) {
   }
 }
 
-export const BlockAnchorReplacer: Replacer = function* (content, find) {
+const BlockAnchorReplacer: Replacer = function* (content, find) {
   const originalLines = content.split("\n")
   const searchLines = find.split("\n")
 
@@ -360,7 +375,7 @@ export const BlockAnchorReplacer: Replacer = function* (content, find) {
   }
 }
 
-export const WhitespaceNormalizedReplacer: Replacer = function* (content, find) {
+const WhitespaceNormalizedReplacer: Replacer = function* (content, find) {
   const normalizeWhitespace = (text: string) => text.replace(/\s+/g, " ").trim()
   const normalizedFind = normalizeWhitespace(find)
 
@@ -404,7 +419,7 @@ export const WhitespaceNormalizedReplacer: Replacer = function* (content, find) 
   }
 }
 
-export const IndentationFlexibleReplacer: Replacer = function* (content, find) {
+const IndentationFlexibleReplacer: Replacer = function* (content, find) {
   const removeIndentation = (text: string) => {
     const lines = text.split("\n")
     const nonEmptyLines = lines.filter((line) => line.trim().length > 0)
@@ -432,7 +447,7 @@ export const IndentationFlexibleReplacer: Replacer = function* (content, find) {
   }
 }
 
-export const EscapeNormalizedReplacer: Replacer = function* (content, find) {
+const EscapeNormalizedReplacer: Replacer = function* (content, find) {
   const unescapeString = (str: string): string => {
     return str.replace(/\\(n|t|r|'|"|`|\\|\n|\$)/g, (match, capturedChar) => {
       switch (capturedChar) {
@@ -481,7 +496,7 @@ export const EscapeNormalizedReplacer: Replacer = function* (content, find) {
   }
 }
 
-export const MultiOccurrenceReplacer: Replacer = function* (content, find) {
+const MultiOccurrenceReplacer: Replacer = function* (content, find) {
   // This replacer yields all exact matches, allowing the replace function
   // to handle multiple occurrences based on replaceAll parameter
   let startIndex = 0
@@ -495,7 +510,7 @@ export const MultiOccurrenceReplacer: Replacer = function* (content, find) {
   }
 }
 
-export const TrimmedBoundaryReplacer: Replacer = function* (content, find) {
+const TrimmedBoundaryReplacer: Replacer = function* (content, find) {
   const trimmedFind = find.trim()
 
   if (trimmedFind === find) {
@@ -521,7 +536,7 @@ export const TrimmedBoundaryReplacer: Replacer = function* (content, find) {
   }
 }
 
-export const ContextAwareReplacer: Replacer = function* (content, find) {
+const ContextAwareReplacer: Replacer = function* (content, find) {
   const findLines = find.split("\n")
   if (findLines.length < 3) {
     // Need at least 3 lines to have meaningful context
@@ -638,7 +653,9 @@ export function replace(content: string, oldString: string, newString: string, r
       if (index === -1) continue
       notFound = false
       if (replaceAll) {
-        return content.replaceAll(search, newString)
+        // A string replacement still expands `$$`, `$&`, `$\`` and `$'`; the
+        // model's text is literal, exactly as in the single-match branch.
+        return content.split(search).join(newString)
       }
       const lastIndex = content.lastIndexOf(search)
       if (index !== lastIndex) continue

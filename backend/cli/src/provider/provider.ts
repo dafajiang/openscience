@@ -1,8 +1,13 @@
 import z from "zod"
 import fuzzysort from "fuzzysort"
+import { createHash } from "node:crypto"
+import { stat } from "node:fs/promises"
+import path from "node:path"
 import { Config } from "../config/config"
+import { Global } from "../global"
+import { WorkspaceCredentials } from "../openscience/workspace-credentials"
 import { mapValues, mergeDeep, omit, pickBy, sortBy } from "remeda"
-import { NoSuchModelError, type Provider as SDK } from "ai"
+import { APICallError, NoSuchModelError, type Provider as SDK } from "ai"
 import { Log } from "../util/log"
 import { BunProc } from "../bun"
 import { Plugin } from "../plugin"
@@ -11,9 +16,18 @@ import { NamedError } from "@synsci/util/error"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { Instance } from "../project/instance"
+import { ProjectTrust } from "../project/trust"
 import { Flag } from "../flag/flag"
-import { iife } from "@/util/iife"
-import { OpenScience } from "../openscience"
+import { iife } from "@synsci/util/iife"
+import { OpenScience, type FundingSnapshot } from "../openscience"
+import { isAtlasProxyURL, managedOpenRouterBaseURL } from "../openscience/synced-env-policy"
+import { CredentialLifecycle } from "../credentials/lifecycle"
+import { ProviderTokenCommand } from "./token-command"
+import { AsyncLocalStorage } from "node:async_hooks"
+import { MANAGED_OPENROUTER_MODEL_SET, managedModelDetails } from "./managed-catalog"
+import { managedModelRoute } from "./managed-routing"
+import { ManagedPricing } from "./managed-pricing"
+import { gatewayTiming, type GatewayTiming } from "./gateway-timing"
 
 // Direct imports for bundled providers
 import { createAmazonBedrock, type AmazonBedrockProviderSettings } from "@ai-sdk/amazon-bedrock"
@@ -24,6 +38,7 @@ import { createVertex } from "@ai-sdk/google-vertex"
 import { createVertexAnthropic } from "@ai-sdk/google-vertex/anthropic"
 import { createOpenAI } from "@ai-sdk/openai"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
+import { createDeepSeek } from "@ai-sdk/deepseek"
 import { createOpenRouter, type LanguageModelV2 } from "@openrouter/ai-sdk-provider"
 import { createOpenaiCompatible as createGitHubCopilotOpenAICompatible } from "./sdk/openai-compatible/src"
 import { createXai } from "@ai-sdk/xai"
@@ -38,9 +53,616 @@ import { createPerplexity } from "@ai-sdk/perplexity"
 import { createVercel } from "@ai-sdk/vercel"
 import { createGitLab } from "@gitlab/gitlab-ai-provider"
 import { ProviderTransform } from "./transform"
+import { LocalProvider } from "./local"
+import { fetchWithFreshConnection } from "../util/fetch"
 
 export namespace Provider {
   const log = Log.create({ service: "provider" })
+  const MAX_TIMER_MS = 2_147_483_647
+  // Upstream admission on busy gateways and prefill on self-hosted servers
+  // both happen before the first response byte; short deadlines cut off healthy
+  // long prompts. Local endpoints disable the deadline entirely (see
+  // defaultConnectTimeout).
+  export const DEFAULT_CONNECT_TIMEOUT_MS = 300_000
+  // Raw body activity includes keepalives and private reasoning, so this only
+  // expires a remote response that has stopped producing bytes altogether.
+  // Local runtimes keep the deadline disabled because slow inference can be
+  // legitimately silent (see defaultIdleTimeout). Ten minutes of byte silence
+  // from a remote endpoint is a dead connection, not a thinking model; the
+  // earlier half-hour turned one hung stream into a 45-minute worker failure.
+  export const DEFAULT_REMOTE_IDLE_TIMEOUT_MS = 600_000
+  // The managed gateway does not send keepalives while an upstream model
+  // thinks: healthy requests have gone 133 s from response headers to the
+  // first body byte. A dead connection and a long think are indistinguishable
+  // at the byte level, so this deadline trades the two: ten minutes bounds a
+  // hang without cutting off deep reasoning. (Gateway keepalives would let it
+  // drop to a couple of minutes.)
+  export const DEFAULT_MANAGED_IDLE_TIMEOUT_MS = 600_000
+  // The managed gateway also holds its response headers until the upstream
+  // body begins: one healthy request reported upstream headers at 3.1 s in
+  // its Server-Timing while the client saw them at 133 s, with the first body
+  // byte 420 ms later. A silent think therefore lands in the header wait, so
+  // that wait needs the same allowance as the body deadline.
+  export const DEFAULT_MANAGED_CONNECT_TIMEOUT_MS = 600_000
+  export const DEFAULT_OUTPUT_IDLE_TIMEOUT_MS = false
+
+  export type RequestContext = {
+    sessionID: string
+    messageID: string
+    attempt: number
+    /** Agent that issued the request, for log attribution only. */
+    agent?: string
+    /** Model the session selected. The request body's own model wins when present. */
+    modelID?: string
+    /** Immutable account/funding choice for this provider operation. */
+    funding?: FundingSnapshot
+    /** How many times this step has been resubmitted as a new request after
+     * the gateway reported no progress on the earlier copy. Part of the
+     * idempotency key, so a resubmit is a different request to the gateway
+     * while ordinary retries of the same body keep the same key. */
+    resubmit?: number
+    /** Provider-only cancellation; tool execution keeps its own authority signal. */
+    abort?: AbortSignal
+    /** Actual fetch dispatch, after local request and credential preparation. */
+    onRequest?: () => void
+  }
+
+  export type RequestTiming = Pick<RequestContext, "sessionID" | "messageID" | "attempt" | "agent"> &
+    GatewayTiming & {
+      requestID: string
+      providerID: string
+      modelID: string
+      idleTimeoutMs: number | false
+      connectTimeoutMs?: number | false
+      startedAt: number
+      responseStartedAt?: number
+      firstBodyChunkAt?: number
+      lastBodyChunkAt?: number
+      completedAt: number
+      outcome: "completed" | "idle_timeout" | "timeout" | "aborted" | "cancelled" | "error" | "conflict_wait"
+      timeoutPhase?: "connect" | "first_event" | "stream" | "output" | "total"
+      errorName?: string
+      /** Present with outcome "conflict_wait": the managed gateway still owns an
+       * identical earlier copy of this request, so the client waits for that
+       * copy instead of dispatching the same body again. */
+      conflict?: { code: string; retries: number; delayMs: number; elapsedMs: number }
+    }
+
+  export class RequestTimeoutError extends Error {
+    constructor(
+      readonly phase: "connect" | "first_event" | "stream" | "output" | "total",
+      readonly timeoutMs: number,
+    ) {
+      const label = {
+        connect: "response headers",
+        first_event: "the first response-body data",
+        stream: "more response-body data",
+        output: "new model output",
+        total: "the request to complete",
+      }[phase]
+      super(`The model request timed out after ${Math.ceil(timeoutMs / 1000)} seconds waiting for ${label}.`)
+      this.name = "ProviderRequestTimeoutError"
+    }
+  }
+
+  export class IdleTimeoutError extends RequestTimeoutError {
+    constructor(
+      phase: "connect" | "first_event" | "stream",
+      readonly idleTimeoutMs: number,
+    ) {
+      super(phase, idleTimeoutMs)
+      this.name = "ProviderIdleTimeoutError"
+    }
+  }
+
+  /** A request that failed before any response byte arrived. Only the fetch
+   * wrapper knows that no headers were received; a failure after that point
+   * may already have been processed and billed. */
+  export class TransportError extends Error {
+    constructor(
+      readonly phase: "connect",
+      readonly code: string,
+      cause: unknown,
+    ) {
+      super(cause instanceof Error ? cause.message : String(cause), { cause })
+      this.name = "ProviderTransportError"
+    }
+  }
+
+  const TRANSPORT_CODES = new Set([
+    "ECONNREFUSED",
+    "ConnectionRefused",
+    "ECONNRESET",
+    "ECONNABORTED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "ETIMEDOUT",
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "ENETDOWN",
+    "EPIPE",
+    "FailedToOpenSocket",
+    "ConnectionClosed",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_SOCKET",
+    "UND_ERR_HEADERS_TIMEOUT",
+  ])
+  const TRANSPORT_MESSAGES =
+    /socket connection was closed|\bterminated\b|fetch failed|unable to connect|connection (?:refused|reset)|getaddrinfo|network error/i
+
+  /** Bun reports a refused or unresolved endpoint with its own codes
+   * (`ConnectionRefused`), which no SDK classifies as retryable; the AI SDK
+   * recognizes only undici's `fetch failed`. */
+  export function transportCode(error: unknown): string | undefined {
+    const seen = new Set<unknown>()
+    const pending = [error]
+    while (pending.length) {
+      const current = pending.shift()
+      if (!current || typeof current !== "object" || seen.has(current)) continue
+      seen.add(current)
+      const shape = current as { code?: unknown; message?: unknown; cause?: unknown }
+      if (typeof shape.code === "string" && TRANSPORT_CODES.has(shape.code)) return shape.code
+      if (typeof shape.message === "string" && TRANSPORT_MESSAGES.test(shape.message)) {
+        return typeof shape.code === "string" && shape.code ? shape.code : "transport"
+      }
+      pending.push(shape.cause)
+      if (current instanceof AggregateError) pending.push(...current.errors)
+    }
+  }
+
+  /** Aborts and deadlines keep their identity: a deadline means the request
+   * was sent and its outcome is unknown, which must never be replayed. */
+  function connectFailure(error: unknown, signal: AbortSignal) {
+    if (signal.aborted || isRequestTimeoutError(error) || error instanceof DOMException) return error
+    const code = transportCode(error)
+    if (!code) return error
+    return new TransportError("connect", code, error)
+  }
+
+  const requestContext = new AsyncLocalStorage<RequestContext>()
+
+  export function withRequestContext<T>(context: RequestContext, run: () => T): T {
+    return requestContext.run(context, run)
+  }
+
+  /** Keep the request context active for every lazy `next()` call. AI SDK
+   * multi-step streams can start a later provider fetch only after a local
+   * tool result, long after `LLM.stream()` itself returned. */
+  export async function* withRequestContextIterable<T>(context: RequestContext, iterable: AsyncIterable<T>) {
+    const iterator = iterable[Symbol.asyncIterator]()
+    let completed = false
+    try {
+      while (true) {
+        const next = await requestContext.run(context, () => iterator.next())
+        if (next.done) {
+          completed = true
+          return
+        }
+        yield next.value
+      }
+    } finally {
+      if (!completed && iterator.return) {
+        await requestContext.run(context, () => iterator.return!())
+      }
+    }
+  }
+
+  function resolveTimeout(value: unknown, fallback: number | false): number | false {
+    if (value === false) return false
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return Math.min(Math.floor(value), MAX_TIMER_MS)
+    }
+    return fallback
+  }
+
+  export function resolveConnectTimeout(value: unknown): number | false {
+    return resolveTimeout(value, DEFAULT_CONNECT_TIMEOUT_MS)
+  }
+
+  export function resolveIdleTimeout(value: unknown): number | false {
+    return resolveTimeout(value, false)
+  }
+
+  export function resolveOutputIdleTimeout(value: unknown): number | false {
+    return resolveTimeout(value, DEFAULT_OUTPUT_IDLE_TIMEOUT_MS)
+  }
+
+  /** SDKs can wrap transport errors or preserve only their stable shape. A
+   * timeout never proves that an upstream paid request was not processed. */
+  export function requestTimeout(error: unknown): RequestTimeoutError | undefined {
+    const seen = new Set<unknown>()
+    const pending = [error]
+    while (pending.length) {
+      const current = pending.shift()
+      if (!current || seen.has(current)) continue
+      if (current instanceof RequestTimeoutError) return current
+      if (current instanceof DOMException && current.name === "TimeoutError") {
+        // Native errors carry no duration. Preserve their truthful message.
+        return Object.assign(new RequestTimeoutError("total", 0), { message: current.message })
+      }
+      seen.add(current)
+      if (typeof current !== "object") continue
+      const shape = current as {
+        name?: unknown
+        phase?: unknown
+        timeoutMs?: unknown
+        idleTimeoutMs?: unknown
+        cause?: unknown
+      }
+      const duration = shape.name === "ProviderIdleTimeoutError" ? shape.idleTimeoutMs : shape.timeoutMs
+      const phases =
+        shape.name === "ProviderIdleTimeoutError"
+          ? ["connect", "first_event", "stream"]
+          : ["connect", "first_event", "stream", "output", "total"]
+      if (
+        (shape.name === "ProviderRequestTimeoutError" || shape.name === "ProviderIdleTimeoutError") &&
+        phases.includes(String(shape.phase)) &&
+        typeof duration === "number" &&
+        Number.isFinite(duration) &&
+        duration > 0
+      ) {
+        return new RequestTimeoutError(shape.phase as RequestTimeoutError["phase"], duration)
+      }
+      pending.push(shape.cause)
+      if (current instanceof AggregateError) pending.push(...current.errors)
+    }
+  }
+
+  export function isRequestTimeoutError(error: unknown): boolean {
+    return requestTimeout(error) !== undefined
+  }
+
+  export function isIdleTimeoutError(error: unknown): error is IdleTimeoutError {
+    const seen = new Set<unknown>()
+    const pending = [error]
+    while (pending.length) {
+      const current = pending.shift()
+      if (!current || seen.has(current)) continue
+      if (
+        current instanceof IdleTimeoutError ||
+        (typeof current === "object" &&
+          (current as { name?: unknown }).name === "ProviderIdleTimeoutError" &&
+          ["connect", "first_event", "stream"].includes(String((current as { phase?: unknown }).phase)) &&
+          typeof (current as { idleTimeoutMs?: unknown }).idleTimeoutMs === "number")
+      ) {
+        return true
+      }
+      seen.add(current)
+      if (typeof current !== "object") continue
+      pending.push((current as { cause?: unknown }).cause)
+      if (current instanceof AggregateError) pending.push(...current.errors)
+    }
+    return false
+  }
+
+  type FetchWithWatchdogOptions = {
+    providerID: string
+    modelID: string
+    idleTimeout?: unknown
+    connectTimeout?: unknown
+    totalTimeout?: unknown
+    managed?: boolean
+    onTiming?: (timing: RequestTiming) => void
+  }
+
+  function abortReason(signal: AbortSignal) {
+    return signal.reason ?? new DOMException("The request was aborted", "AbortError")
+  }
+
+  async function waitForActivity<T>(input: {
+    run: () => Promise<T>
+    phase: "connect" | "first_event" | "stream"
+    idleTimeoutMs: number | false
+    idleController: AbortController
+    signal: AbortSignal
+  }): Promise<T> {
+    if (input.signal.aborted) throw abortReason(input.signal)
+    const execution = Promise.resolve()
+      .then(input.run)
+      .then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      )
+    const interrupted = Promise.withResolvers<{ ok: false; error: unknown }>()
+    const onAbort = () => interrupted.resolve({ ok: false, error: abortReason(input.signal) })
+    input.signal.addEventListener("abort", onAbort, { once: true })
+    const timer =
+      input.idleTimeoutMs === false
+        ? undefined
+        : setTimeout(() => {
+            const error = new IdleTimeoutError(input.phase, input.idleTimeoutMs as number)
+            input.idleController.abort(error)
+            interrupted.resolve({ ok: false, error })
+          }, input.idleTimeoutMs)
+    try {
+      const result = await Promise.race([execution, interrupted.promise])
+      if (!result.ok) throw result.error
+      return result.value
+    } finally {
+      if (timer) clearTimeout(timer)
+      input.signal.removeEventListener("abort", onAbort)
+    }
+  }
+
+  function timingOutcome(error: unknown, signal: AbortSignal): RequestTiming["outcome"] {
+    if (isIdleTimeoutError(error)) return "idle_timeout"
+    if (isRequestTimeoutError(error)) return "timeout"
+    if (signal.aborted) {
+      const reason = abortReason(signal)
+      if (isRequestTimeoutError(reason)) return "timeout"
+      return "aborted"
+    }
+    return "error"
+  }
+
+  function copyResponse(response: Response, body: ReadableStream<Uint8Array>) {
+    const monitored = new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+    for (const property of ["url", "redirected", "type"] as const) {
+      Object.defineProperty(monitored, property, { configurable: true, value: response[property] })
+    }
+    return monitored
+  }
+
+  /** The model named by one JSON request body. Several models share a cached
+   * SDK instance, so the closure model is only a fallback for attribution. */
+  function requestModel(body: unknown): string | undefined {
+    if (typeof body !== "string") return
+    const head = /^\s*\{\s*"model"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(body)
+    if (head) return head[1]
+    const parsed = iife(() => {
+      try {
+        return JSON.parse(body) as { model?: unknown } | null
+      } catch {
+        return undefined
+      }
+    })
+    return typeof parsed?.model === "string" ? parsed.model : undefined
+  }
+
+  function timingContext(): RequestContext {
+    return requestContext.getStore() ?? { sessionID: "unknown", messageID: "unknown", attempt: 0 }
+  }
+
+  const timingSubscribers = new Set<(timing: RequestTiming) => void>()
+
+  /** Observe every request timing item, including the conflict waits issued
+   * inside the SDK fetch. Session telemetry subscribes here rather than being
+   * imported by the provider, which would close an import cycle. Returns the
+   * unsubscribe function. */
+  export function onTiming(subscriber: (timing: RequestTiming) => void) {
+    timingSubscribers.add(subscriber)
+    return () => {
+      timingSubscribers.delete(subscriber)
+    }
+  }
+
+  /** One log line, one hook call and one subscriber pass per timing item.
+   * Absolute timestamps stay on the item for consumers; the log line carries
+   * an ISO start plus deltas. */
+  function publishTiming(item: RequestTiming, onTiming?: (timing: RequestTiming) => void) {
+    log.info("request timing", {
+      ...omit(item, ["startedAt", "responseStartedAt", "firstBodyChunkAt", "lastBodyChunkAt", "completedAt"]),
+      startedAt: new Date(item.startedAt).toISOString(),
+      responseStartMs: item.responseStartedAt === undefined ? undefined : item.responseStartedAt - item.startedAt,
+      firstBodyChunkMs: item.firstBodyChunkAt === undefined ? undefined : item.firstBodyChunkAt - item.startedAt,
+      activeBodyMs:
+        item.firstBodyChunkAt === undefined || item.lastBodyChunkAt === undefined
+          ? undefined
+          : item.lastBodyChunkAt - item.firstBodyChunkAt,
+      totalMs: item.completedAt - item.startedAt,
+    })
+    for (const callback of [onTiming, ...timingSubscribers]) {
+      try {
+        callback?.(item)
+      } catch (error) {
+        log.debug("request timing callback failed", { error: `${error}` })
+      }
+    }
+  }
+
+  /** Bound the wait for response headers, then observe the response until it
+   * finishes or is cancelled. Optional body-idle and total deadlines remain
+   * available, but a quiet established response is not an error by default. */
+  export async function fetchWithIdleWatchdog(
+    fetchFn: (input: any, init?: BunFetchRequestInit) => Promise<Response>,
+    fetchInput: any,
+    init: BunFetchRequestInit | undefined,
+    options: FetchWithWatchdogOptions,
+  ): Promise<Response> {
+    const context = timingContext()
+    const idleTimeoutMs = resolveIdleTimeout(options.idleTimeout)
+    const connectTimeoutMs = resolveConnectTimeout(options.connectTimeout)
+    const idleController = new AbortController()
+    const signals = [init?.signal, context.abort, idleController.signal].filter(Boolean) as AbortSignal[]
+    const total =
+      typeof options.totalTimeout === "number" && Number.isFinite(options.totalTimeout) && options.totalTimeout > 0
+        ? Math.min(Math.floor(options.totalTimeout), MAX_TIMER_MS)
+        : undefined
+    const timer =
+      total === undefined
+        ? undefined
+        : setTimeout(() => idleController.abort(new RequestTimeoutError("total", total)), total).unref()
+    const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals)
+    const timing: Omit<RequestTiming, "completedAt" | "outcome"> = {
+      sessionID: context.sessionID,
+      messageID: context.messageID,
+      attempt: context.attempt,
+      ...(context.agent && { agent: context.agent }),
+      requestID: crypto.randomUUID(),
+      providerID: options.providerID,
+      modelID: requestModel(init?.body) ?? context.modelID ?? options.modelID,
+      idleTimeoutMs,
+      connectTimeoutMs,
+      startedAt: Date.now(),
+    }
+    let emitted = false
+    const emit = (outcome: RequestTiming["outcome"], error?: unknown, phase?: RequestTiming["timeoutPhase"]) => {
+      if (emitted) return
+      emitted = true
+      if (timer) clearTimeout(timer)
+      publishTiming(
+        {
+          ...timing,
+          completedAt: Date.now(),
+          outcome,
+          ...(phase && { timeoutPhase: phase }),
+          ...(error instanceof Error && { errorName: error.name }),
+        },
+        options.onTiming,
+      )
+    }
+
+    let response: Response
+    try {
+      response = await waitForActivity({
+        run: () => {
+          const fetchInit = { ...(init ?? {}), signal }
+          // Bun's native fetch accepts this runtime option even though its
+          // current BunFetchRequestInit declaration omits it.
+          ;(fetchInit as BunFetchRequestInit & { timeout: false }).timeout = false
+          try {
+            context.onRequest?.()
+          } catch {
+            log.debug("request dispatch callback failed")
+          }
+          return fetchFn(fetchInput, fetchInit)
+        },
+        phase: "connect",
+        idleTimeoutMs: connectTimeoutMs,
+        idleController,
+        signal,
+      })
+      timing.responseStartedAt = Date.now()
+      if (options.managed) Object.assign(timing, gatewayTiming(response.headers))
+      log.info("request response", {
+        sessionID: timing.sessionID,
+        messageID: timing.messageID,
+        attempt: timing.attempt,
+        agent: timing.agent,
+        requestID: timing.requestID,
+        providerID: timing.providerID,
+        modelID: timing.modelID,
+        responseStartMs: timing.responseStartedAt - timing.startedAt,
+        gatewayRequestID: timing.gatewayRequestID,
+        gatewayTiming: timing.gatewayTiming,
+      })
+    } catch (error) {
+      emit(timingOutcome(error, signal), error, requestTimeout(error)?.phase)
+      throw connectFailure(error, signal)
+    }
+
+    // Response.error()/opaque responses use status 0, which the Response
+    // constructor forbids. They do not expose a consumable network body, so
+    // preserve the original object rather than attempting to wrap it.
+    if (!response.body || response.status === 0) {
+      emit("completed")
+      return response
+    }
+
+    const reader = response.body.getReader()
+    let closed = false
+    const release = () => {
+      if (closed) return
+      try {
+        reader.releaseLock()
+        closed = true
+      } catch {
+        // A read may still be pending when an abort-ignoring source is
+        // cancelled. Cleanup must never replace the real timeout/abort or
+        // create an unhandled rejection.
+      }
+    }
+    let cancelled = false
+    let readerCancelRequested = false
+    const cancelReader = (reason: unknown) => {
+      if (readerCancelRequested) return
+      readerCancelRequested = true
+      void reader
+        .cancel(reason)
+        .catch(() => {})
+        .finally(release)
+        .catch(() => {})
+      release()
+    }
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const phase = timing.firstBodyChunkAt === undefined ? "first_event" : "stream"
+        try {
+          const next = await waitForActivity({
+            run: () => reader.read(),
+            phase,
+            idleTimeoutMs,
+            idleController,
+            signal,
+          })
+          if (next.done) {
+            release()
+            emit("completed")
+            controller.close()
+            return
+          }
+          const now = Date.now()
+          timing.firstBodyChunkAt ??= now
+          timing.lastBodyChunkAt = now
+          controller.enqueue(next.value)
+        } catch (error) {
+          if (!cancelled) {
+            emit(timingOutcome(error, signal), error, requestTimeout(error)?.phase)
+            controller.error(error)
+          }
+          cancelReader(error)
+        }
+      },
+      cancel(reason) {
+        cancelled = true
+        emit("cancelled", reason)
+        idleController.abort(reason ?? new DOMException("The response body was cancelled", "AbortError"))
+        cancelReader(reason)
+      },
+    })
+    return copyResponse(response, body)
+  }
+
+  // Models exposed by the ChatGPT / Codex OAuth transport. Keep the dot and
+  // dash spellings because older models.dev snapshots normalized version dots
+  // while current snapshots preserve the upstream ids.
+  const CODEX_MODEL_IDS = new Set([
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5-6-sol",
+    "gpt-5.6-terra",
+    "gpt-5-6-terra",
+    "gpt-5.6-luna",
+    "gpt-5-6-luna",
+    "gpt-5.5",
+    "gpt-5-5",
+    "gpt-5.4",
+    "gpt-5-4",
+    "gpt-5.4-mini",
+    "gpt-5-4-mini",
+  ])
+
+  export function isCodexOAuthModel(modelID: string): boolean {
+    return CODEX_MODEL_IDS.has(modelID)
+  }
+
+  function codexOAuthModes(modelID: string) {
+    if (!/^gpt-5[.-](?:4|5|6(?:-(?:sol|terra|luna))?)$/.test(modelID)) return undefined
+    return {
+      fast: {
+        provider: {
+          body: {
+            service_tier: "priority",
+          },
+          headers: {},
+        },
+      },
+    }
+  }
 
   function isGpt5OrLater(modelID: string): boolean {
     const match = /^gpt-(\d+)/.exec(modelID)
@@ -63,6 +685,7 @@ export namespace Provider {
     "@ai-sdk/google-vertex/anthropic": createVertexAnthropic,
     "@ai-sdk/openai": createOpenAI,
     "@ai-sdk/openai-compatible": createOpenAICompatible,
+    "@ai-sdk/deepseek": createDeepSeek,
     "@openrouter/ai-sdk-provider": createOpenRouter,
     "@ai-sdk/xai": createXai,
     "@ai-sdk/mistral": createMistral,
@@ -79,58 +702,471 @@ export namespace Provider {
     "@ai-sdk/github-copilot": createGitHubCopilotOpenAICompatible,
   }
 
-  function isAtlasApiKey(key: unknown): key is string {
-    return typeof key === "string" && key.startsWith("thk_")
+  const REMOVED_MODEL_IDS = new Set(["mistralai/mistral-small-3.2-24b-instruct"])
+
+  // A bundled or cached models.dev catalog can lag a newly released native
+  // model. Keep the official Z.AI and Zhipu routes selectable while that cache
+  // catches up; fromModelsDevProvider prefers any live catalog entry below.
+  const GLM53 = {
+    id: "glm-5.3-flash",
+    name: "GLM-5.3-Flash",
+    family: "glm",
+    release_date: "2026-08-26",
+    attachment: true,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
+    temperature: true,
+    tool_call: true,
+    interleaved: { field: "reasoning_content" },
+    cost: { input: 0.075, output: 0.25, cache_read: 0.015, cache_write: 0 },
+    limit: { context: 1_000_000, output: 131_072 },
+    modalities: { input: ["text", "image", "video", "pdf"], output: ["text"] },
+    options: {},
+  } satisfies ModelsDev.Model
+
+  // Official provider contracts, not an entitlement probe. Keep new native
+  // models available when the bundled or cached models.dev catalog predates them.
+  const ASTRA = {
+    id: "gpt-6-astra",
+    name: "GPT-6 Astra",
+    family: "gpt",
+    // OpenRouter's endpoint id is openai/gpt-6-astra-20260903; the date is
+    // what marks the newest model of a family as latest in the picker.
+    release_date: "2026-09-03",
+    provider: { npm: "@ai-sdk/openai" },
+    attachment: true,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    temperature: false,
+    tool_call: true,
+    cost: {
+      input: 10,
+      output: 50,
+      cache_read: 1,
+      cache_write: 12.5,
+      tiers: [{ input: 20, output: 75, cache_read: 2, cache_write: 25, tier: { type: "context", size: 272_000 } }],
+    },
+    limit: { context: 1_050_000, input: 922_000, output: 128_000 },
+    modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+    options: {},
+  } satisfies ModelsDev.Model
+
+  const FABLE51 = {
+    id: "claude-fable-5-1",
+    name: "Claude Fable 5.1",
+    family: "claude-fable",
+    release_date: "2026-09-01",
+    provider: { npm: "@ai-sdk/anthropic" },
+    attachment: true,
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    temperature: false,
+    tool_call: true,
+    cost: { input: 10, output: 50, cache_read: 0.25, cache_write: 12.5 },
+    limit: { context: 1_000_000, output: 128_000 },
+    modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+    options: {},
+  } satisfies ModelsDev.Model
+
+  function isRemovedModel(modelID: string) {
+    const normalized = modelID.toLowerCase()
+    return REMOVED_MODEL_IDS.has(normalized)
   }
 
-  function isAtlasProxyBaseURL(baseURL: unknown): baseURL is string {
-    return typeof baseURL === "string" && baseURL.includes("/api/llm/proxy/")
+  export function isAtlasProxyBaseURL(baseURL: unknown): baseURL is string {
+    return isAtlasProxyURL(baseURL)
   }
 
-  // Explicit apiKey for a provider routed through the Atlas managed proxy: force
-  // the session thk_ token. These SDKs read `<PROVIDER>_API_KEY` straight from
-  // env, so a shell `export OPENAI_API_KEY=sk-...` would otherwise shadow the
-  // managed token and 401 the proxy ("thk_* token not found"). Returns {} unless
-  // both managed spend is on AND the baseURL is the Atlas proxy — genuine BYOK
-  // (no proxy URL) is untouched and hits the provider directly.
-  async function managedProxyKey(providerID: string, baseURL: unknown): Promise<{ apiKey?: string }> {
-    const managed =
-      isAtlasProxyBaseURL(baseURL) && (await Config.get().catch(() => undefined))?.billing?.llm === "managed"
-    if (!managed) return {}
-    // Managed wallet routes through OpenRouter ONLY: never attach the wallet's
-    // thk_ token to a first-party proxy (anthropic / openai / google). Those
-    // providers are also dropped from availability (see isProviderAllowed), so
-    // this is belt-and-suspenders — a managed token can only ever reach the
-    // sanctioned OpenRouter (or hosted synsci) route.
-    if (!managedProviderAllowed(providerID)) return {}
-    const session = await OpenScience.getSession().catch(() => null)
-    return session?.api_key ? { apiKey: session.api_key } : {}
+  export function requestFundingHeaders(input: {
+    baseURL: unknown
+    apiKey: unknown
+    headers?: HeadersInit
+    funding?: FundingSnapshot
+  }): Headers {
+    const headers = new Headers(input.headers)
+    headers.delete("X-Organization-ID")
+    headers.delete("OpenScience-Funding-Protocol")
+    if (!isAtlasProxyBaseURL(input.baseURL) || !Auth.isAtlasApiKey(input.apiKey)) return headers
+    if (!input.funding) throw new Error("Managed inference has no funding-account snapshot. Retry the operation.")
+    if (input.funding.api_key !== input.apiKey) {
+      throw new Error("The connected account changed during managed inference. Retry the operation.")
+    }
+    // Native SDKs use x-api-key or x-goog-api-key; the first-party account
+    // middleware always authenticates the same immutable Bearer credential.
+    headers.set("Authorization", `Bearer ${input.funding.api_key}`)
+    headers.delete("x-api-key")
+    headers.delete("x-goog-api-key")
+    for (const [key, value] of Object.entries(OpenScience.fundingHeaders(input.funding))) headers.set(key, value)
+    return headers
+  }
+
+  /** The key is stable across attempts: it names the body, not the try. The
+   * gateway's claim under it stays authoritative for whether that body was
+   * dispatched — in progress means wait for the original, sealed means the
+   * provider already ran it (and may have billed it), so a session-level
+   * retry of the same body can never start a second inference. */
+  export function managedIdempotencyKey(input: {
+    endpoint: string
+    body: string
+    sessionID: string
+    messageID: string
+    operation: string
+  }): string {
+    const hash = new Bun.CryptoHasher("sha256")
+    for (const value of [
+      "openscience-managed-v1",
+      input.sessionID,
+      input.messageID,
+      input.operation,
+      input.endpoint,
+      input.body,
+    ]) {
+      hash.update(value)
+      hash.update("\0")
+    }
+    return `os_${hash.digest("hex")}`
+  }
+
+  const MANAGED_RELOAD_RETRY_MAX_SECONDS = 10
+  const MANAGED_RELOAD_RESPONSE_MAX_BYTES = 16_384
+  const ManagedReloadRetry = z.object({
+    error: z.literal("insufficient_balance"),
+    recovery: z.object({
+      kind: z.literal("ace_reload"),
+      retryable: z.literal(true),
+      retry_after_seconds: z.number().int().min(0).max(MANAGED_RELOAD_RETRY_MAX_SECONDS),
+      ace_reload: z.object({ state: z.literal("available"), pending: z.literal(true) }),
+    }),
+  })
+
+  /** Retry once only when Atlas proves a durable Ace reload is already pending. */
+  export async function retryManagedPaymentRequired(input: {
+    response: Response
+    managed: boolean
+    headers: Headers
+    signal?: AbortSignal | null
+    retry: () => Promise<Response>
+  }): Promise<Response> {
+    if (!input.managed || input.response.status !== 402 || !input.headers.get("Idempotency-Key")) return input.response
+    const declared = Number(input.response.headers.get("content-length"))
+    if (Number.isFinite(declared) && declared > MANAGED_RELOAD_RESPONSE_MAX_BYTES) return input.response
+    const text = await input.response
+      .clone()
+      .text()
+      .catch(() => "")
+    if (!text || text.length > MANAGED_RELOAD_RESPONSE_MAX_BYTES) return input.response
+    const parsed = iife(() => {
+      try {
+        return ManagedReloadRetry.safeParse(JSON.parse(text))
+      } catch {
+        return undefined
+      }
+    })
+    if (!parsed?.success) return input.response
+    const seconds = parsed.data.recovery.retry_after_seconds
+    const retryAfterHeader = input.response.headers.get("retry-after")
+    if (retryAfterHeader === null) return input.response
+    const retryAfter = Number(retryAfterHeader)
+    if (!Number.isFinite(retryAfter) || retryAfter !== seconds) return input.response
+    await input.response.body?.cancel().catch(() => undefined)
+    if (seconds > 0) await managedDelay(seconds * 1000, input.signal)
+    return input.retry()
+  }
+
+  function managedDelay(ms: number, signal?: AbortSignal | null) {
+    return new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) return reject(abortReason(signal))
+      const aborted = () => {
+        clearTimeout(timer)
+        reject(abortReason(signal!))
+      }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", aborted)
+        resolve()
+      }, ms)
+      signal?.addEventListener("abort", aborted, { once: true })
+    })
+  }
+
+  const MANAGED_CONFLICT_MIN_DELAY_MS = 1_000
+  const MANAGED_CONFLICT_MAX_DELAY_MS = 5_000
+  export const MANAGED_CONFLICT_MAX_WAIT_MS = 20 * 60_000
+  const MANAGED_CONFLICT_RESPONSE_MAX_BYTES = 16_384
+  const MANAGED_CONFLICT_SEALED_MESSAGE =
+    "The managed gateway already dispatched this request once and cannot replay it; the body was not sent again."
+  const MANAGED_CONFLICT_KEY_MESSAGE =
+    "The managed gateway already holds a different request under this idempotency key; the body was not sent again."
+  const MANAGED_OUTCOME_UNKNOWN_MESSAGE =
+    "The managed gateway cannot prove whether the provider accepted this request; the body was not sent again."
+  /** Verdicts that end the attempt: the gateway dispatched this body once and
+   * cannot replay its output, or cannot prove the provider's outcome. Gateways
+   * from the 2.0.67 era answer them as a 409 carrying the replay header; later
+   * ones answer 410. Either way the same key can never succeed again. */
+  const MANAGED_FINAL_CODES = new Set([
+    "idempotent_stream_already_started",
+    "idempotent_response_not_replayable",
+    "managed_outcome_unknown",
+  ])
+  const MANAGED_CONFLICT_STATUSES = new Set([409, 410])
+
+  /** Read the gateway's idempotency verdict from a managed 409 or 410. Sealed
+   * rows replay with x-openscience-idempotent-replay; live claims answer
+   * operation_in_progress with retry-after. */
+  async function managedConflict(response: Response) {
+    if (!MANAGED_CONFLICT_STATUSES.has(response.status)) return
+    const declared = Number(response.headers.get("content-length"))
+    if (Number.isFinite(declared) && declared > MANAGED_CONFLICT_RESPONSE_MAX_BYTES) return
+    const body = await response
+      .clone()
+      .text()
+      .catch(() => "")
+    if (body.length > MANAGED_CONFLICT_RESPONSE_MAX_BYTES) return
+    const object = (value: unknown) =>
+      value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
+    const field = (value: unknown) => (typeof value === "string" ? value : undefined)
+    const json = iife(() => {
+      try {
+        return object(JSON.parse(body))
+      } catch {
+        return undefined
+      }
+    })
+    const detail = object(json?.detail) ?? object(json?.error) ?? json
+    const code = field(json?.error) ?? field(detail?.code)
+    const message = field(detail?.message) ?? field(json?.message) ?? ""
+    const sealed = response.headers.get("x-openscience-idempotent-replay") === "true"
+    const header = response.headers.get("retry-after")
+    const retryAfterMs = header !== null && Number.isFinite(Number(header)) ? Number(header) * 1000 : undefined
+    if (!code && !sealed && retryAfterMs === undefined) return
+    return { code, message, sealed, retryAfterMs, body }
+  }
+
+  /** A gateway verdict the AI SDK must not retry: its status-code heuristic
+   * treats every 409 as transient and would dispatch the same body again. */
+  function managedConflictError(response: Response, body: string, message: string) {
+    return new APICallError({
+      message,
+      url: response.url,
+      requestBodyValues: {},
+      statusCode: response.status,
+      responseHeaders: Object.fromEntries(response.headers),
+      responseBody: body,
+      isRetryable: false,
+    })
+  }
+
+  /** Wait for the gateway's original copy of this request instead of sending
+   * the same body again. Sealed, final or conflicting keys are terminal for
+   * this attempt: the gateway answers them identically forever, so they
+   * surface without any retry. Only operation_in_progress is waited out. */
+  export async function retryManagedConflict(input: {
+    response: Response
+    managed: boolean
+    headers: Headers
+    signal?: AbortSignal | null
+    retry: () => Promise<Response>
+    timing: Pick<RequestTiming, "providerID" | "modelID" | "idleTimeoutMs">
+    onTiming?: (timing: RequestTiming) => void
+    limitMs?: number
+  }): Promise<Response> {
+    if (!input.managed || !input.headers.get("Idempotency-Key")) return input.response
+    const context = timingContext()
+    const started = Date.now()
+    const limit = input.limitMs ?? MANAGED_CONFLICT_MAX_WAIT_MS
+    const requestID = crypto.randomUUID()
+    const poll = async (response: Response, retries: number): Promise<Response> => {
+      const conflict = await managedConflict(response)
+      if (!conflict) return response
+      if (conflict.code === "managed_outcome_unknown") {
+        throw managedConflictError(response, conflict.body, conflict.message || MANAGED_OUTCOME_UNKNOWN_MESSAGE)
+      }
+      if (conflict.sealed || (conflict.code !== undefined && MANAGED_FINAL_CODES.has(conflict.code))) {
+        throw managedConflictError(response, conflict.body, conflict.message || MANAGED_CONFLICT_SEALED_MESSAGE)
+      }
+      if (conflict.code === "idempotency_conflict") {
+        throw managedConflictError(response, conflict.body, conflict.message || MANAGED_CONFLICT_KEY_MESSAGE)
+      }
+      if (conflict.code !== "operation_in_progress") return response
+      const elapsedMs = Date.now() - started
+      if (elapsedMs >= limit) {
+        const span = limit >= 60_000 ? `${Math.round(limit / 60_000)} minutes` : `${Math.ceil(limit / 1000)} seconds`
+        const message = `The managed gateway was still processing an identical earlier copy of this request after ${span}; the body was not sent again.`
+        const body = JSON.stringify({
+          error: "operation_in_progress",
+          detail: { code: "managed_conflict_timeout", message },
+        })
+        throw managedConflictError(response, body, message)
+      }
+      const base = Math.max(MANAGED_CONFLICT_MIN_DELAY_MS, conflict.retryAfterMs ?? 0)
+      const delayMs = Math.min(limit - elapsedMs, MANAGED_CONFLICT_MAX_DELAY_MS, base * 2 ** retries)
+      publishTiming(
+        {
+          sessionID: context.sessionID,
+          messageID: context.messageID,
+          attempt: context.attempt,
+          ...(context.agent && { agent: context.agent }),
+          requestID,
+          ...input.timing,
+          startedAt: started,
+          completedAt: Date.now(),
+          outcome: "conflict_wait",
+          conflict: { code: conflict.code ?? "operation_in_progress", retries, delayMs, elapsedMs },
+        },
+        input.onTiming,
+      )
+      await response.body?.cancel().catch(() => undefined)
+      await managedDelay(delayMs, input.signal)
+      return poll(await input.retry(), retries + 1)
+    }
+    return poll(input.response, 0)
+  }
+
+  const PUBLIC_PROVIDER_BASE_URLS: Record<string, string> = {
+    anthropic: "https://api.anthropic.com/v1",
+    openai: "https://api.openai.com/v1",
+    google: "https://generativelanguage.googleapis.com/v1beta",
+    xai: "https://api.x.ai/v1",
+    deepseek: "https://api.deepseek.com",
+  }
+
+  const PROVIDER_BASE_URL_ENV: Record<string, string[]> = {
+    anthropic: ["ANTHROPIC_BASE_URL"],
+    openai: ["OPENAI_BASE_URL"],
+    google: ["GOOGLE_GENERATIVE_AI_BASE_URL", "GOOGLE_BASE_URL", "GEMINI_BASE_URL"],
+    xai: ["XAI_BASE_URL"],
+    deepseek: ["DEEPSEEK_BASE_URL"],
+  }
+
+  /** DeepSeek V4 thinking rejects tool_choice even though the AI SDK's generic
+   * tool preparation emits "auto". Omit only that unsupported wire field;
+   * non-thinking V4 and every other request keep the caller's exact choice. */
+  export function normalizeDeepSeekRequestBody(value: unknown): unknown {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return value
+    const body = value as Record<string, unknown>
+    if (typeof body.model !== "string" || !body.model.includes("deepseek-v4")) return value
+    if (!Array.isArray(body.tools) || body.tools.length === 0) return value
+    const thinking =
+      typeof body.thinking === "object" && body.thinking !== null && !Array.isArray(body.thinking)
+        ? (body.thinking as Record<string, unknown>)
+        : undefined
+    if (thinking?.type === "disabled" || !Object.hasOwn(body, "tool_choice")) return value
+    const normalized = { ...body }
+    delete normalized.tool_choice
+    return normalized
+  }
+
+  export function normalizeOpenRouterRequestBody(value: Record<string, unknown>) {
+    if (typeof value.model !== "string" || !value.model.startsWith("openai/") || !Array.isArray(value.tools))
+      return value
+    return {
+      ...value,
+      tools: value.tools.map((tool: unknown) => {
+        if (typeof tool !== "object" || tool === null || !("type" in tool) || tool.type !== "function") return tool
+        if (!("function" in tool) || typeof tool.function !== "object" || tool.function === null) return tool
+        if ("strict" in tool.function) return tool
+        // OpenRouter forwards these tools to Responses, whose default strict
+        // mode makes optional fields required. Preserve our actual schema;
+        // runtime validation still enforces every required field and constraint.
+        return { ...tool, function: { ...tool.function, strict: false } }
+      }),
+    }
+  }
+
+  export function normalizeAstraRequestBody(value: Record<string, unknown>) {
+    if (value.model !== "gpt-6-astra") return value
+    const body = { ...value }
+    for (const key of ["temperature", "top_p", "logprobs", "top_logprobs"]) delete body[key]
+    if (Array.isArray(body.include)) {
+      body.include = body.include.filter((item) => item !== "message.output_text.logprobs")
+    }
+    return body
+  }
+
+  export function normalizeFableRequestBody(value: Record<string, unknown>) {
+    if (value.model !== "claude-fable-5-1") return value
+    const choice = value.tool_choice as { type?: string } | undefined
+    if (choice?.type === "any" || choice?.type === "tool") {
+      throw new Error("Claude Fable 5.1 does not support forced tool selection. Use automatic tool selection.")
+    }
+    // Fable 5.1 binds thinking signatures to the preceding conversation,
+    // system prompt and tools. OpenScience may compact history or change the
+    // available tools: ask Anthropic to drop only invalidated blocks instead
+    // of rejecting the whole request. Unchanged reasoning remains preserved.
+    // https://platform.claude.com/docs/en/models/fable-5-1/migration-guide
+    return {
+      ...value,
+      thinking: {
+        type: "adaptive",
+        // The provider otherwise omits readable reasoning and between-tool
+        // progress. Request its supplied text; never summarize it locally.
+        display: "summarized",
+        block_binding: { prefix_mismatch_behavior: "drop_block" },
+      },
+    }
+  }
+
+  /** Detect a retired proxy path so a user-owned key can never be sent to it. */
+  function hasManagedProxyPath(baseURL: unknown): baseURL is string {
+    if (typeof baseURL !== "string") return false
+    try {
+      // Match the exact retired path even below a prefix. Decode escaped
+      // separators conservatively so stale configuration cannot receive a key.
+      let path = new URL(baseURL).pathname
+      for (let pass = 0; pass < 3 && path.includes("%"); pass++) {
+        let decoded: string
+        try {
+          decoded = decodeURIComponent(path)
+        } catch {
+          // Keep checking the undecoded path. A malformed escape before a
+          // plain /api/llm/proxy suffix must not disable the leak guard.
+          break
+        }
+        if (decoded === path) break
+        path = decoded
+      }
+      path = path.replace(/\/+/g, "/").replace(/\/+$/, "")
+      return /\/api\/llm\/proxy(?:\/|$)/.test(path)
+    } catch {
+      return false
+    }
+  }
+
+  export function isManagedProxyBaseURL(baseURL: unknown): baseURL is string {
+    if (!hasManagedProxyPath(baseURL)) return false
+    try {
+      const url = new URL(baseURL)
+      return !url.search && !url.hash
+    } catch {
+      return false
+    }
   }
 
   function requireAtlasProxyForManagedKey(provider: Info, options: Record<string, any>) {
-    // Key off the EFFECTIVE credential, not raw env. A managed thk_ value can
-    // sit unused in env while an auth.json key wins resolution; demanding
-    // proxy routing for it hard-failed every call with advice (`connect
-    // sync`) that re-delivers the same env and can never fix it.
     const effective = effectiveKey(provider, options)
-    if (!isAtlasApiKey(effective)) return
-    if (isAtlasProxyBaseURL(options["baseURL"])) return
+    if (!Auth.isAtlasApiKey(effective)) return
+    if (provider.id === "openrouter" && isAtlasProxyBaseURL(options["baseURL"])) return
     throw new Error(
-      `${provider.id} is using a managed Atlas key without an Atlas proxy URL. ` +
-        "Run `openscience sync` and try again.",
+      `${provider.id} is using an Ace credential outside the managed gateway. Sign in again or connect your own provider account.`,
     )
   }
 
-  /** A user-owned (BYOK) key: a real, non-managed credential. Excludes the
-   *  "public" sentinel used for the zero-cost openscience demo models. */
+  /** A user-owned API key rather than an Ace account token. */
   function isByokKey(key: unknown): key is string {
-    return typeof key === "string" && key.length > 0 && key !== "public" && !isAtlasApiKey(key)
+    return typeof key === "string" && key.length > 0 && !Auth.isAtlasApiKey(key)
+  }
+
+  export function managedRoutesCuratedProvidersOnly(config: Config.Info): boolean {
+    return config.billing?.llm === "managed"
+  }
+
+  export function managedProviderAllowed(providerID: string): boolean {
+    return providerID === "openrouter"
   }
 
   /** The credential that actually authenticates a provider: an explicit apiKey
    *  (from a loader / config / getSDK options), the resolved provider key, or
    *  the first of its env vars that is set — undefined when it has none. Shared
-   *  by the routing-label display and the managed/BYOK proxy guards so all read
+   *  by routing labels and the retired-route guards so all read
    *  the credential the same way. `options` defaults to the provider's own; the
    *  proxy guards pass the mutable getSDK options instead. */
   export function effectiveKey(
@@ -145,30 +1181,29 @@ export namespace Provider {
     )
   }
 
-  /** Managed wallet ⇒ OpenRouter-only routing.
-   *
-   *  When the LLM spend toggle is explicitly "managed", every wallet inference
-   *  call flows through OpenRouter — the one gateway whose stream exposes a
-   *  single, unified reasoning format (`reasoning` / `reasoning_details`). The
-   *  first-party managed proxies (anthropic / openai / google), each with a
-   *  different reasoning shape, are taken out of the managed path entirely; the
-   *  hosted zero-cost `synsci` demo provider is kept. BYOK and the legacy
-   *  auto-detect path (`billing.llm` unset / null / "byok") are UNTOUCHED —
-   *  this only fires on an explicit managed-wallet opt-in. Pure + sync. */
-  export function managedRoutesOpenRouterOnly(config: Config.Info): boolean {
-    return config.billing?.llm === "managed"
+  const OPENROUTER_VENDOR_PREFIX: Record<string, string> = {
+    gemini: "google",
+    google: "google",
+    xai: "x-ai",
+    meta: "meta",
+    zai: "z-ai",
+    zhipuai: "z-ai",
   }
 
-  /** Providers a managed (OpenRouter-only) wallet session may load: OpenRouter
-   *  for all real inference, plus the hosted `synsci` demo. Pure + sync. */
-  export function managedProviderAllowed(providerID: string): boolean {
-    return providerID === "openrouter" || providerID.startsWith("synsci")
+  const ANTHROPIC_DASHED_VERSION = /^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)(?:-\d{8})?$/
+
+  function openrouterAliasCandidates(providerID: string, modelID: string) {
+    if (providerID === "openrouter") return []
+    const vendor = OPENROUTER_VENDOR_PREFIX[providerID] ?? providerID
+    const base = modelID.replace(/^~/, "")
+    if (!vendor || !base) return []
+    const direct = `${vendor}/${base}`
+    const normalized = vendor === "anthropic" ? `${vendor}/${base.replace(ANTHROPIC_DASHED_VERSION, "$1.$2")}` : direct
+    const aliased = providerID === "openai" && base === "gpt-5.6" ? ["openai/gpt-5.6-sol"] : []
+    return Array.from(new Set([direct, normalized, ...aliased]))
   }
 
-  /** True when a base URL points at the local machine (localhost / loopback).
-   *  A provider with a local baseURL runs on the user's own hardware, is free,
-   *  and is BYOK-class — so it's kept available even in managed-wallet mode
-   *  (where the wallet itself still routes only through OpenRouter). Pure. */
+  /** True when a base URL points at the local machine. */
   export function isLocalBaseURL(url: unknown): boolean {
     if (typeof url !== "string" || !url) return false
     try {
@@ -179,25 +1214,54 @@ export namespace Provider {
     }
   }
 
-  /**
-   * Blocker (c) — the inverse of requireAtlasProxyForManagedKey.
-   *
-   * A prior managed sync may have injected an Atlas proxy `*_BASE_URL` (e.g.
-   * ANTHROPIC_BASE_URL → app.syntheticsciences.ai). If the resolved key is the
-   * user's OWN key (BYOK), that key must NEVER be sent to the Atlas proxy — it
-   * would leak the credential and mis-bill. Pin the base URL back to the
-   * provider's public endpoint and drop the managed routing.
-   */
-  function pinByokToPublicEndpoint(provider: Info, options: Record<string, any>, publicURL: string) {
+  /** Self-hosted runtimes answer only after prompt processing: llama-server
+   * and Ollama send headers after prefill, so a long prompt on a slow machine
+   * legitimately outlasts any fixed connect deadline. Loopback and mDNS
+   * (`.local`) hosts and the bundled local runtime ids qualify. */
+  export function localEndpoint(input: { providerID: string; baseURL?: unknown }) {
+    if (LocalProvider.PRESETS.some((preset) => preset.id === input.providerID)) return true
+    if (isLocalBaseURL(input.baseURL)) return true
+    if (typeof input.baseURL !== "string" || !input.baseURL) return false
+    try {
+      return new URL(input.baseURL).hostname.toLowerCase().endsWith(".local")
+    } catch {
+      return false
+    }
+  }
+
+  export function defaultConnectTimeout(input: { providerID: string; baseURL?: unknown }): number | false {
+    if (localEndpoint(input)) return false
+    return isAtlasProxyBaseURL(input.baseURL) ? DEFAULT_MANAGED_CONNECT_TIMEOUT_MS : DEFAULT_CONNECT_TIMEOUT_MS
+  }
+
+  export function defaultIdleTimeout(input: { providerID: string; baseURL?: unknown }): number | false {
+    if (localEndpoint(input)) return false
+    return isAtlasProxyBaseURL(input.baseURL) ? DEFAULT_MANAGED_IDLE_TIMEOUT_MS : DEFAULT_REMOTE_IDLE_TIMEOUT_MS
+  }
+
+  /** Pin a user-owned key to a public endpoint when stale proxy config remains. */
+  function pinByokToPublicEndpoint(provider: Info, options: Record<string, any>, publicURL?: string) {
     const effective = effectiveKey(provider, options)
-    // Managed (thk_*) keys must keep their Atlas proxy routing.
-    if (isAtlasApiKey(effective)) return
+    if (Auth.isAtlasApiKey(effective)) return
     if (!isByokKey(effective)) return
-    if (isAtlasProxyBaseURL(options["baseURL"])) {
-      log.warn("refusing to route BYOK key through Atlas proxy — pinning to public endpoint", {
+    const configured =
+      options["baseURL"] ?? PROVIDER_BASE_URL_ENV[provider.id]?.map((key) => Env.get(key)).find((value) => !!value)
+    if (hasManagedProxyPath(configured)) {
+      log.warn("refusing to route a user key through a retired proxy; using the public endpoint", {
         provider: provider.id,
       })
-      options["baseURL"] = publicURL
+      const modelURL = typeof publicURL === "string" && !hasManagedProxyPath(publicURL) ? publicURL : undefined
+      const safeURL = modelURL ?? PUBLIC_PROVIDER_BASE_URLS[provider.id]
+      if (!safeURL) {
+        throw new Error(
+          `${provider.id} is using a user-owned key with a retired proxy URL, but no safe public endpoint is known. ` +
+            "Remove the proxy base URL and try again.",
+        )
+      }
+      // Set an explicit value even when the catalog omitted model.api.url.
+      // Leaving this undefined lets several provider SDKs re-read the stale
+      // *_BASE_URL directly from process.env and defeats the guard.
+      options["baseURL"] = safeURL
     }
   }
 
@@ -206,6 +1270,8 @@ export namespace Provider {
     autoload: boolean
     getModel?: CustomModelLoader
     options?: Record<string, any>
+    // Optional source override for custom provider loaders.
+    source?: Info["source"]
   }>
 
   const CUSTOM_LOADERS: Record<string, CustomLoader> = {
@@ -214,40 +1280,12 @@ export namespace Provider {
       return {
         autoload: false,
         options: {
-          ...(baseURL ? { baseURL, ...(await managedProxyKey("anthropic", baseURL)) } : {}),
+          ...(baseURL && !hasManagedProxyPath(baseURL) ? { baseURL } : {}),
           headers: {
             "anthropic-beta":
               "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
           },
         },
-      }
-    },
-    // Keyed on the catalog provider id `synsci` (the Atlas wire-contract id) — a
-    // stale `openscience` key here never matched database["openscience"], so the
-    // loop logged "Provider does not exist in model list openscience" and this
-    // loader never ran: the zero-cost demo's `apiKey: "public"` sentinel was
-    // never set (new keyless users couldn't use the demo at all) and the
-    // "drop paid models when no key" gating was skipped.
-    async synsci(input) {
-      const hasKey = await (async () => {
-        const env = Env.all()
-        if (input.env.some((item) => env[item])) return true
-        if (await Auth.get(input.id)) return true
-        const config = await Config.get()
-        if (config.provider?.[input.id]?.options?.apiKey) return true
-        return false
-      })()
-
-      if (!hasKey) {
-        for (const [key, value] of Object.entries(input.models)) {
-          if (value.cost.input === 0) continue
-          delete input.models[key]
-        }
-      }
-
-      return {
-        autoload: Object.keys(input.models).length > 0,
-        options: hasKey ? {} : { apiKey: "public" },
       }
     },
     openai: async () => {
@@ -257,7 +1295,26 @@ export namespace Provider {
         async getModel(sdk: any, modelID: string, _options?: Record<string, any>) {
           return sdk.responses(modelID)
         },
-        options: baseURL ? { baseURL, ...(await managedProxyKey("openai", baseURL)) } : {},
+        options: baseURL && !hasManagedProxyPath(baseURL) ? { baseURL } : {},
+      }
+    },
+    xai: async () => {
+      return {
+        autoload: false,
+        // Grok 4.5's low/medium/high effort ladder is implemented by xAI's
+        // Responses API. The pinned chat adapter accepts only low/high and
+        // rejects medium before sending a request, so route just this family
+        // through responses while preserving chat behavior for older models.
+        //
+        // This responses path only works because of
+        // tooling/patches/@ai-sdk%2Fxai@2.0.51.patch. xAI opens every stream
+        // with `response.created` carrying `"usage": null`, which the pinned
+        // 2.0.51 schema rejects (it marks usage optional, not nullable), so
+        // Grok 4.5 died on its first SSE event. @ai-sdk/xai@4.0.25 ships the
+        // same fix upstream; drop the patch when the @ai-sdk major bump lands.
+        async getModel(sdk: any, modelID: string) {
+          return /grok-4[.-]5\b/i.test(modelID) ? sdk.responses(modelID) : sdk.languageModel(modelID)
+        },
       }
     },
     "github-copilot": async () => {
@@ -452,50 +1509,77 @@ export namespace Provider {
     },
     openrouter: async () => {
       const headers = {
-        "HTTP-Referer": "https://syntheticsciences.ai/",
-        "X-Title": "synsci",
+        "HTTP-Referer": "https://github.com/synthetic-sciences/OpenScience",
+        "X-Title": "OpenScience",
       }
-      // OpenRouter is the ONE provider with both a managed and a BYOK route, and
-      // resolution is deterministic by key presence (mirrors the Atlas server's
-      // BYOK-first rule): the user's OWN OpenRouter key wins and hits public
-      // OpenRouter directly; with no own key, a logged-in session falls back to
-      // the Atlas managed proxy (thk_* token → wallet-billed). Deleting the own
-      // key restores the managed route automatically — nothing is latched.
       const auth = await Auth.get("openrouter").catch(() => undefined)
       const authKey = auth?.type === "api" ? auth.key : undefined
       const envKey = Env.get("OPENROUTER_API_KEY")
-      const ownKey = isByokKey(authKey) ? authKey : isByokKey(envKey) ? envKey : undefined
+      const mode = (await Config.get().catch(() => undefined))?.billing?.llm
+      const ownKey =
+        mode === "managed" ? undefined : isByokKey(authKey) ? authKey : isByokKey(envKey) ? envKey : undefined
       if (ownKey) {
-        // Honour a user's own OpenRouter-compatible gateway (custom
-        // OPENROUTER_BASE_URL); only the Atlas proxy is swapped for the public
-        // endpoint, since a BYOK key must never be sent to the managed proxy.
         const envBase = Env.get("OPENROUTER_BASE_URL")
-        const baseURL = envBase && !isAtlasProxyBaseURL(envBase) ? envBase : "https://openrouter.ai/api/v1"
+        const baseURL = envBase && !hasManagedProxyPath(envBase) ? envBase : "https://openrouter.ai/api/v1"
         return { autoload: false, options: { apiKey: ownKey, baseURL, headers } }
       }
-
-      // No own key: fall back to the Atlas managed proxy when it's configured.
-      // The @openrouter SDK auto-loads OPENROUTER_API_KEY but NOT
-      // OPENROUTER_BASE_URL, so forward the proxy URL explicitly and attach the
-      // managed token — the live session, or the synced thk_* already in env if
-      // the session file is momentarily unreadable.
-      const proxyBase = Env.get("OPENROUTER_BASE_URL")
-      if (isAtlasProxyBaseURL(proxyBase)) {
+      if (mode !== "byok") {
         const session = await OpenScience.getSession().catch(() => null)
-        const managedKey = session?.api_key ?? (isAtlasApiKey(envKey) ? envKey : undefined)
-        if (managedKey) return { autoload: false, options: { apiKey: managedKey, baseURL: proxyBase, headers } }
+        if (session?.api_key && Auth.isAtlasApiKey(session.api_key)) {
+          return {
+            // Account sync used to pre-register this provider. Ace now has no
+            // sync dependency, so the saved session itself is the autoload seam.
+            autoload: true,
+            options: { apiKey: session.api_key, baseURL: managedOpenRouterBaseURL(), headers },
+            source: "managed",
+          }
+        }
+      }
+      return { autoload: false, options: { headers } }
+    },
+    deepseek: async () => {
+      // The official DeepSeek route is BYOK-only. Keep its credential and
+      // endpoint independent from OpenRouter so an explicit OpenRouter model
+      // remains an exact relay choice.
+      const auth = await Auth.get("deepseek").catch(() => undefined)
+      const authKey = auth?.type === "api" ? auth.key : undefined
+      const envKey = Env.get("DEEPSEEK_API_KEY")
+      const apiKey = isByokKey(authKey) ? authKey : isByokKey(envKey) ? envKey : undefined
+      const configured = Env.get("DEEPSEEK_BASE_URL")
+      const baseURL = configured && !hasManagedProxyPath(configured) ? configured : "https://api.deepseek.com"
+      return {
+        autoload: false,
+        options: {
+          ...(apiKey ? { apiKey } : {}),
+          baseURL,
+        },
+      }
+    },
+    meta: async () => {
+      // Meta is user-key-only in the client; stale proxy config is ignored.
+      const auth = await Auth.get("meta").catch(() => undefined)
+      const authKey = auth?.type === "api" ? auth.key : undefined
+      const envKey = Env.get("META_MODEL_API_KEY")
+      const ownKey = isByokKey(authKey) ? authKey : isByokKey(envKey) ? envKey : undefined
+      if (ownKey) {
+        const envBase = Env.get("META_MODEL_BASE_URL")
+        const baseURL = envBase && !hasManagedProxyPath(envBase) ? envBase : "https://api.meta.ai/v1"
+        return {
+          autoload: false,
+          options: { apiKey: ownKey, baseURL },
+          getModel: async (sdk, modelID) => sdk.responses(modelID),
+        }
       }
 
-      // Neither an own key nor a managed route — nothing to route with.
-      return { autoload: false, options: { headers } }
+      return { autoload: false, getModel: async (sdk, modelID) => sdk.responses(modelID) }
     },
     vercel: async () => {
       return {
         autoload: false,
         options: {
           headers: {
-            "http-referer": "https://syntheticsciences.ai/",
-            "x-title": "synsci",
+            "http-referer": "https://github.com/synthetic-sciences/OpenScience",
+            "x-title": "OpenScience",
           },
         },
       }
@@ -561,8 +1645,8 @@ export namespace Provider {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://syntheticsciences.ai/",
-            "X-Title": "synsci",
+            "HTTP-Referer": "https://github.com/synthetic-sciences/OpenScience",
+            "X-Title": "OpenScience",
           },
         },
       }
@@ -628,8 +1712,8 @@ export namespace Provider {
             // Cloudflare AI Gateway uses cf-aig-authorization for authenticated gateways
             // This enables Unified Billing where Cloudflare handles upstream provider auth
             ...(apiToken ? { "cf-aig-authorization": `Bearer ${apiToken}` } : {}),
-            "HTTP-Referer": "https://syntheticsciences.ai/",
-            "X-Title": "synsci",
+            "HTTP-Referer": "https://github.com/synthetic-sciences/OpenScience",
+            "X-Title": "OpenScience",
           },
           // Custom fetch to handle parameter transformation and auth
           fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -661,33 +1745,63 @@ export namespace Provider {
         autoload: false,
         options: {
           headers: {
-            "X-Cerebras-3rd-Party-Integration": "synsci",
+            "X-Cerebras-3rd-Party-Integration": "OpenScience",
           },
         },
       }
     },
-    // Spec §3.2 / Task 14: @ai-sdk/google does not honour *_BASE_URL env vars
-    // natively (unlike @ai-sdk/anthropic and @ai-sdk/openai). Inject baseURL
-    // from env so Atlas proxy can redirect non-BYOK Gemini calls without
-    // requiring any user config. The proxy URL is written by /api/cli/sync.
+    // @ai-sdk/google does not honour *_BASE_URL env vars natively.
     google: async () => {
       const baseURL = Env.get("GOOGLE_GENERATIVE_AI_BASE_URL") ?? Env.get("GEMINI_BASE_URL")
       // @ai-sdk/google auto-loads ONLY GOOGLE_GENERATIVE_AI_API_KEY, but the
       // provider is detected from any of its aliases (GOOGLE_API_KEY /
       // GEMINI_API_KEY). Resolve the key from whichever alias is set and pass it
       // explicitly, otherwise a user who exported GOOGLE_API_KEY lists fine but
-      // hits "API key is missing" at call time. A managed proxy key (below), when
-      // present, overrides it.
-      const apiKey = Env.get("GOOGLE_GENERATIVE_AI_API_KEY") ?? Env.get("GOOGLE_API_KEY") ?? Env.get("GEMINI_API_KEY")
+      // hits "API key is missing" at call time.
+      const apiKey = [
+        Env.get("GOOGLE_GENERATIVE_AI_API_KEY"),
+        Env.get("GOOGLE_API_KEY"),
+        Env.get("GEMINI_API_KEY"),
+      ].find(isByokKey)
       return {
         autoload: false,
         options: {
           ...(apiKey ? { apiKey } : {}),
-          ...(baseURL ? { baseURL, ...(await managedProxyKey("google", baseURL)) } : {}),
+          ...(baseURL && !hasManagedProxyPath(baseURL) ? { baseURL } : {}),
         },
       }
     },
   }
+
+  const Mode = z.object({
+    model: z.string().optional(),
+    cost: z
+      .object({
+        input: z.number(),
+        output: z.number(),
+        cache: z.object({
+          read: z.number(),
+          write: z.number(),
+        }),
+        tiers: z
+          .array(
+            z.object({
+              input: z.number(),
+              output: z.number(),
+              cache: z.object({ read: z.number(), write: z.number() }),
+              threshold: z.number().positive(),
+            }),
+          )
+          .optional(),
+      })
+      .optional(),
+    provider: z
+      .object({
+        body: z.record(z.string(), z.any()).optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+      })
+      .optional(),
+  })
 
   export const Model = z
     .object({
@@ -695,7 +1809,7 @@ export namespace Provider {
       providerID: z.string(),
       api: z.object({
         id: z.string(),
-        url: z.string(),
+        url: z.string().optional(),
         npm: z.string(),
       }),
       name: z.string(),
@@ -733,6 +1847,16 @@ export namespace Provider {
           read: z.number(),
           write: z.number(),
         }),
+        tiers: z
+          .array(
+            z.object({
+              input: z.number(),
+              output: z.number(),
+              cache: z.object({ read: z.number(), write: z.number() }),
+              threshold: z.number().positive(),
+            }),
+          )
+          .optional(),
         experimentalOver200K: z
           .object({
             input: z.number(),
@@ -744,6 +1868,14 @@ export namespace Provider {
           })
           .optional(),
       }),
+      pricing: z
+        .object({
+          upstream_provider: z.enum(["anthropic", "gemini", "xai", "meta", "openrouter"]),
+          funding_fee_bps: z.number().optional(),
+          audited_at: z.string().optional(),
+          source_url: z.string().optional(),
+        })
+        .optional(),
       limit: z.object({
         context: z.number(),
         input: z.number().optional(),
@@ -753,7 +1885,12 @@ export namespace Provider {
       options: z.record(z.string(), z.any()),
       headers: z.record(z.string(), z.string()),
       release_date: z.string(),
+      /** Training-data cutoff from the catalog, when it lists one. */
+      knowledge: z.string().optional(),
+      reasoningOptions: z.array(z.record(z.string(), z.any())).optional(),
+      contextOptions: z.array(z.number().positive()).optional(),
       variants: z.record(z.string(), z.record(z.string(), z.any())).optional(),
+      modes: z.record(z.string(), Mode).optional(),
     })
     .meta({
       ref: "Model",
@@ -764,7 +1901,7 @@ export namespace Provider {
     .object({
       id: z.string(),
       name: z.string(),
-      source: z.enum(["env", "config", "custom", "api"]),
+      source: z.enum(["env", "config", "custom", "api", "workspace", "managed"]),
       env: z.string().array(),
       key: z.string().optional(),
       options: z.record(z.string(), z.any()),
@@ -775,22 +1912,45 @@ export namespace Provider {
     })
   export type Info = z.infer<typeof Info>
 
+  export function redact(info: Info): Info {
+    return {
+      ...info,
+      key: undefined,
+      options: {},
+      models: mapValues(info.models, (model) => ({
+        ...model,
+        api: {
+          ...model.api,
+          url: undefined,
+        },
+        options: {},
+        headers: {},
+        variants: model.variants ? mapValues(model.variants, () => ({})) : undefined,
+        modes: model.modes
+          ? mapValues(model.modes, (mode) => ({
+              model: mode.model,
+              cost: mode.cost,
+            }))
+          : undefined,
+      })),
+    }
+  }
+
   /** Synthesize a minimal Model entry for an OpenRouter model that
    *  isn't in the models.dev catalog. OR is OpenAI-compat for every
    *  upstream it aggregates, so any id is dispatchable through the
-   *  same /chat/completions shape. Cost stays at 0 client-side —
-   *  managed billing uses `usage.cost` from the upstream response
-   *  (the adapter's compute_cost_cents prefers it), so accuracy is
-   *  preserved without a per-model price entry.
+   *  same /chat/completions shape. Cost stays unknown client-side rather
+   *  than inventing a stale price for a model absent from the catalog.
    *
    *  Used after the whitelist filter: when sync ships an OR model id
    *  the local registry doesn't know about, this synthesizer fills
    *  the gap instead of having the picker reject the model. */
   function _syntheticOpenRouterModel(modelID: string): Model {
+    const reviewed = managedModelDetails(modelID)
     const m: Model = {
       id: modelID,
       providerID: "openrouter",
-      name: modelID,
+      name: reviewed?.name ?? modelID,
       api: {
         id: modelID,
         url: "https://openrouter.ai/api/v1",
@@ -807,24 +1967,131 @@ export namespace Provider {
       // Conservative defaults — OR aggregates many models with very
       // different real limits. Anything that needs more context will
       // hit the upstream's actual cap and the API surfaces the error.
-      limit: { context: 128_000, output: 8_192 },
+      limit: { context: reviewed?.context ?? 128_000, output: reviewed?.output ?? 8_192 },
       capabilities: {
-        temperature: true,
+        temperature: reviewed?.temperature ?? true,
         reasoning: true,
-        attachment: false,
+        // #192: this is a placeholder for a whitelisted model NOT in the
+        // local catalog — guessing `false` here silently drops images/PDFs
+        // for what may well be a vision-capable model. Guess permissive
+        // instead: a genuinely-unsupported attachment surfaces a real
+        // provider error rather than a fabricated "unsupported" one.
+        attachment: reviewed ? reviewed.input.length > 1 : true,
         toolcall: true,
-        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        input: {
+          text: true,
+          audio: reviewed?.input.includes("audio") ?? false,
+          image: reviewed?.input.includes("image") ?? true,
+          video: reviewed?.input.includes("video") ?? false,
+          pdf: reviewed?.input.includes("pdf") ?? true,
+        },
         output: { text: true, audio: false, image: false, video: false, pdf: false },
         interleaved: false,
       },
       release_date: "",
       variants: {},
+      modes: {},
     }
     m.variants = mapValues(ProviderTransform.variants(m), (v) => v)
     return m
   }
 
+  function directModes(
+    providerID: string,
+    modelID: string,
+    experimental: ModelsDev.Model["experimental"],
+  ): Model["modes"] | undefined {
+    const modes = experimental && typeof experimental === "object" ? experimental.modes : undefined
+    const result = Object.fromEntries(
+      Object.entries(modes ?? {})
+        .filter(([key, mode]) => {
+          if (!mode) return false
+          if (key === "pro" && /(^|\/)gpt-/.test(modelID)) return false
+          if (providerID === "xai" && key === "fast") return /^grok-4[.-]6\b/.test(modelID)
+          if (providerID !== "anthropic" || key !== "fast") return true
+          const id = modelID.toLowerCase().replaceAll(".", "-")
+          return id.startsWith("claude-opus-5") || id.startsWith("claude-opus-4-8")
+        })
+        .map(([key, mode]) => [
+          key,
+          {
+            model: mode?.model,
+            cost: mode?.cost
+              ? {
+                  input: mode.cost.input,
+                  output: mode.cost.output,
+                  cache: {
+                    read: mode.cost.cache_read ?? 0,
+                    write: mode.cost.cache_write ?? 0,
+                  },
+                }
+              : undefined,
+            provider: mode?.provider
+              ? {
+                  body: mode.provider.body ?? {},
+                  headers: mode.provider.headers ?? {},
+                }
+              : undefined,
+          },
+        ]),
+    )
+    if (Object.keys(result).length === 0) return undefined
+    return result
+  }
+
+  function modelModes(provider: ModelsDev.Provider, model: ModelsDev.Model): Model["modes"] | undefined {
+    const direct = directModes(provider.id, model.id, model.experimental) ?? {}
+    // These audited priority routes charge 2x each standard token class,
+    // including long-context and cache rates. Keep local estimates in sync.
+    const priority = () => ({
+      provider: { body: { service_tier: "priority" } },
+      ...(model.cost
+        ? {
+            cost: {
+              input: model.cost.input * 2,
+              output: model.cost.output * 2,
+              cache: { read: (model.cost.cache_read ?? 0) * 2, write: (model.cost.cache_write ?? 0) * 2 },
+              tiers: (
+                model.cost.tiers ??
+                (model.cost.context_over_200k ? [{ ...model.cost.context_over_200k, tier: { size: 200_000 } }] : [])
+              ).map((tier) => ({
+                input: tier.input * 2,
+                output: tier.output * 2,
+                cache: { read: (tier.cache_read ?? 0) * 2, write: (tier.cache_write ?? 0) * 2 },
+                threshold: tier.tier.size,
+              })),
+            },
+          }
+        : {}),
+    })
+    // Priority is a paid service tier, not throughput sorting. Only advertise
+    // audited routes: an arbitrary OR model has no guaranteed Fast endpoint.
+    const openrouter: NonNullable<Model["modes"]> =
+      provider.id === "openrouter" && /^openai\/(?:gpt-5\.6-(?:sol|terra|luna)|gpt-6-astra)$/.test(model.id)
+        ? { fast: priority() }
+        : {}
+    const xai: NonNullable<Model["modes"]> =
+      provider.id === "xai" && /^grok-4[.-]6\b/.test(model.id) ? { fast: priority() } : {}
+    const result = provider.id === "openrouter" ? openrouter : { ...direct, ...xai }
+    if (Object.keys(result).length === 0) return undefined
+    return result
+  }
+
   function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
+    // models.dev can lag a just-launched model's authoritative provider
+    // contract. Normalize Muse at the ingestion seam so cached, bundled, and
+    // freshly fetched catalogs all drive the same token budgeting.
+    const isMetaMuse11 = provider.id === "meta" && /muse-spark-1[.-]1\b/.test(model.id.toLowerCase())
+    // xAI and OpenRouter publish different cached-input rates for Grok 4.5.
+    // Keep the route-specific contract even when models.dev flattens both
+    // entries to the same value.
+    const isGrok45 = /grok-4[.-]5\b/.test(model.id.toLowerCase())
+    const cacheRead =
+      isGrok45 && provider.id === "xai"
+        ? 0.3
+        : isGrok45 && provider.id === "openrouter"
+          ? 0.5
+          : (model.cost?.cache_read ?? 0)
     const m: Model = {
       id: model.id,
       providerID: provider.id,
@@ -833,18 +2100,35 @@ export namespace Provider {
       api: {
         id: model.id,
         url: provider.api!,
-        npm: model.provider?.npm ?? provider.npm ?? "@ai-sdk/openai-compatible",
+        npm:
+          provider.id === "deepseek"
+            ? "@ai-sdk/deepseek"
+            : (model.provider?.npm ?? provider.npm ?? "@ai-sdk/openai-compatible"),
       },
       status: model.status ?? "active",
       headers: model.headers ?? {},
       options: model.options ?? {},
+      modes: modelModes(provider, model),
+      reasoningOptions:
+        provider.id === "anthropic" && model.id === FABLE51.id
+          ? FABLE51.reasoning_options.map((option) => ({ ...option, default: "high" }))
+          : model.reasoning_options,
       cost: {
         input: model.cost?.input ?? 0,
         output: model.cost?.output ?? 0,
         cache: {
-          read: model.cost?.cache_read ?? 0,
+          read: cacheRead,
           write: model.cost?.cache_write ?? 0,
         },
+        tiers: model.cost?.tiers?.map((tier) => ({
+          input: tier.input,
+          output: tier.output,
+          cache: {
+            read: tier.cache_read ?? 0,
+            write: tier.cache_write ?? 0,
+          },
+          threshold: tier.tier.size,
+        })),
         experimentalOver200K: model.cost?.context_over_200k
           ? {
               cache: {
@@ -857,9 +2141,9 @@ export namespace Provider {
           : undefined,
       },
       limit: {
-        context: model.limit.context,
+        context: isMetaMuse11 ? 1_048_576 : model.limit.context,
         input: model.limit.input,
-        output: model.limit.output,
+        output: isMetaMuse11 ? 131_072 : model.limit.output,
       },
       capabilities: {
         temperature: model.temperature,
@@ -882,7 +2166,8 @@ export namespace Provider {
         },
         interleaved: model.interleaved ?? false,
       },
-      release_date: model.release_date,
+      release_date: isMetaMuse11 ? "2026-07-09" : model.release_date,
+      knowledge: model.knowledge,
       variants: {},
     }
 
@@ -892,13 +2177,36 @@ export namespace Provider {
   }
 
   export function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
+    const reviewed =
+      provider.id === "openai"
+        ? [ASTRA]
+        : provider.id === "anthropic"
+          ? [FABLE51]
+          : provider.id === "openrouter"
+            ? [{ ...ASTRA, id: "openai/gpt-6-astra", provider: { npm: "@openrouter/ai-sdk-provider" } }]
+            : []
+    const models =
+      (provider.id === "zai" || provider.id === "zhipuai") && !provider.models[GLM53.id]
+        ? { ...provider.models, [GLM53.id]: GLM53 }
+        : { ...provider.models }
+    for (const model of reviewed) {
+      models[model.id] = { ...provider.models[model.id], ...model, experimental: undefined }
+    }
+    // OpenRouter's changed-prefix thinking replay is not verified yet. Do not
+    // advertise it from a generic catalog. Explicit BYOK config may add it;
+    // the managed route is synthesized only after gateway approval below.
+    if (provider.id === "openrouter") delete models["anthropic/claude-fable-5.1"]
     return {
       id: provider.id,
       source: "custom",
       name: provider.name,
       env: provider.env ?? [],
       options: {},
-      models: mapValues(provider.models, (model) => fromModelsDevModel(provider, model)),
+      models: Object.fromEntries(
+        Object.entries(models)
+          .filter(([modelID]) => !isRemovedModel(modelID))
+          .map(([modelID, model]) => [modelID, fromModelsDevModel(provider, model)]),
+      ),
     }
   }
 
@@ -907,14 +2215,62 @@ export namespace Provider {
   // `invalidate()` clears the cache so the next `state()` call rebuilds
   // from the current process.env (picks up env vars written by a
   // background BYOK sync). We bypass Instance.state here so we can
-  // control the lifecycle independently.
+  // control the lifecycle independently, and key the cache on a revision
+  // of the inputs that differ between projects rather than on the project
+  // itself: opening another project with the same provider config keeps the
+  // built state instead of running the whole "[provider] init" pass again.
   let _stateCache: Promise<{
     models: Map<string, LanguageModelV2>
     providers: { [providerID: string]: Info }
     sdk: Map<number, SDK>
     modelLoaders: { [providerID: string]: CustomModelLoader }
   }> | null = null
-  let _stateCacheDirectory: string | undefined
+  let _stateCacheRevision: string | undefined
+
+  /** Env the loaders themselves set while building: Bedrock and AI Core mirror
+   * their stored key into the process env. The key they mirror is already
+   * covered by auth.json, and hashing the mirror would make every build change
+   * the inputs it was keyed on, so the next read would build once more. */
+  const LOADER_ENV = new Set(["AWS_BEARER_TOKEN_BEDROCK", "AICORE_SERVICE_KEY"])
+
+  /** A fingerprint of what `_loadState` consumes: the provider-relevant config
+   * (project config merges in), trust, the credential files and the process
+   * env. The files are covered by a stat (every writer replaces them) and the
+   * env is small, so this is far cheaper than a rebuild; models.dev and
+   * managed pricing are process-wide and call `invalidate()` themselves.
+   * Plugin instances are per project (they receive the project directory), so
+   * a project that declares plugins keys its own state. Per-request project
+   * boundaries (token minting, module loading) are still re-checked at use. */
+  async function stateRevision() {
+    const config = await Config.get()
+    const trusted = await ProjectTrust.allowed(Instance.project)
+    const files = await Promise.all(
+      [path.join(Global.Path.data, "auth.json"), WorkspaceCredentials.filepath].map((file) =>
+        stat(file).then(
+          (info) => `${info.mtimeMs}:${info.size}`,
+          () => "absent",
+        ),
+      ),
+    )
+    const env = Object.entries(Env.all())
+      .filter(([key]) => !LOADER_ENV.has(key))
+      .sort(([a], [b]) => a.localeCompare(b))
+    return createHash("sha256")
+      .update(
+        JSON.stringify({
+          provider: config.provider ?? null,
+          disabled: config.disabled_providers ?? null,
+          enabled: config.enabled_providers ?? null,
+          billing: config.billing?.llm ?? null,
+          plugin: config.plugin ?? null,
+          directory: config.plugin?.length ? Instance.directory : null,
+          trusted,
+          files,
+          env,
+        }),
+      )
+      .digest("hex")
+  }
 
   async function _loadState() {
     using _ = log.time("state")
@@ -924,37 +2280,36 @@ export namespace Provider {
 
     const disabled = new Set(config.disabled_providers ?? [])
     const enabled = config.enabled_providers ? new Set(config.enabled_providers) : null
-    // Managed wallet ⇒ OpenRouter-only. Drop every other provider (the
-    // first-party managed proxies included) from a managed session so wallet
-    // inference can only flow through OpenRouter's unified reasoning stream,
-    // plus the hosted zero-cost demo. Gated on the explicit toggle, so BYOK and
-    // legacy auto-detect sessions see every provider exactly as before. This is
-    // the single seam that makes defaultModel()/getSmallModel() managed-safe:
-    // both read the filtered state, so they can only resolve openrouter/synsci.
-    const managedOpenRouterOnly = managedRoutesOpenRouterOnly(config)
-    // Config-registered providers pointing at the local machine (Ollama, LM
-    // Studio, any OpenAI-compatible localhost endpoint). They're free and run on
-    // the user's own hardware, so they stay available even in managed-wallet
-    // mode — the wallet still only routes real inference through OpenRouter.
-    const localProviderIds = new Set(
+    const resolvedAuth = await Auth.resolve()
+    const authEntries = resolvedAuth.auth
+    // Keys that arrived through the signed-in workspace are managed on the
+    // dashboard; labelling them as this device's own file made Remove fail.
+    const workspaceKeys = resolvedAuth.overlay?.providers ?? new Set<string>()
+    const managedCuratedProvidersOnly = managedRoutesCuratedProvidersOnly(config)
+    const localProviderIDs = new Set(
       Object.entries(config.provider ?? {})
-        .filter(([, p]) => isLocalBaseURL(p?.options?.baseURL ?? p?.api))
+        .filter(([, provider]) => isLocalBaseURL(provider?.options?.baseURL ?? provider?.api))
         .map(([id]) => id),
     )
 
     function isProviderAllowed(providerID: string): boolean {
-      // Codex OAuth (openai-codex) is the user's own ChatGPT subscription: it
-      // routes straight to chatgpt.com and never debits the managed wallet, so a
-      // completed sign-in must surface regardless of managed-mode routing or the
-      // synced managed catalog whitelist. Treat it as BYOK-class (like a local
-      // provider) — only an explicit `disabled` entry hides it. Without this,
-      // managed users finish the ChatGPT login (the credential persists) but the
-      // provider is filtered out and the UI never flips to Connected.
-      if (providerID === "openai-codex") return !disabled.has(providerID)
-      if (managedOpenRouterOnly && !managedProviderAllowed(providerID) && !localProviderIds.has(providerID))
-        return false
-      if (enabled && !enabled.has(providerID)) return false
+      // The former hosted/demo catalog is retired. Keep the package namespace
+      // and launcher compatibility, but never surface these provider ids from
+      // models.dev, env, auth, or user config.
+      if (providerID === "synsci" || providerID.startsWith("synsci-")) return false
       if (disabled.has(providerID)) return false
+      const credential = authEntries[providerID]
+      const baseURL = providers[providerID]?.options?.["baseURL"]
+      const direct =
+        providerID === "openai-codex" ||
+        localProviderIDs.has(providerID) ||
+        isLocalBaseURL(baseURL) ||
+        credential?.type === "oauth" ||
+        (credential?.type === "api" && isByokKey(credential.key)) ||
+        isByokKey(providers[providerID] ? effectiveKey(providers[providerID]) : undefined)
+      if (managedCuratedProvidersOnly && !managedProviderAllowed(providerID) && !direct) return false
+      // A user- or administrator-authored enabled_providers list is an explicit local restriction.
+      if (enabled && !enabled.has(providerID)) return false
       return true
     }
 
@@ -1009,7 +2364,9 @@ export namespace Provider {
       }
 
       for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+        if (isRemovedModel(modelID)) continue
         const existingModel = parsed.models[model.id ?? modelID]
+        const baseURL = typeof provider.options?.baseURL === "string" ? provider.options.baseURL : undefined
         const name = iife(() => {
           if (model.name) return model.name
           if (model.id && model.id !== modelID) return modelID
@@ -1020,12 +2377,14 @@ export namespace Provider {
           api: {
             id: model.id ?? existingModel?.api.id ?? modelID,
             npm:
-              model.provider?.npm ??
-              provider.npm ??
-              existingModel?.api.npm ??
-              modelsDev[providerID]?.npm ??
-              "@ai-sdk/openai-compatible",
-            url: provider?.api ?? existingModel?.api.url ?? modelsDev[providerID]?.api,
+              providerID === "deepseek"
+                ? "@ai-sdk/deepseek"
+                : (model.provider?.npm ??
+                  provider.npm ??
+                  existingModel?.api.npm ??
+                  modelsDev[providerID]?.npm ??
+                  "@ai-sdk/openai-compatible"),
+            url: baseURL ?? provider.api ?? existingModel?.api.url ?? modelsDev[providerID]?.api,
           },
           status: model.status ?? existingModel?.status ?? "active",
           name,
@@ -1071,7 +2430,11 @@ export namespace Provider {
           headers: mergeDeep(existingModel?.headers ?? {}, model.headers ?? {}),
           family: model.family ?? existingModel?.family ?? "",
           release_date: model.release_date ?? existingModel?.release_date ?? "",
+          knowledge: model.knowledge ?? existingModel?.knowledge,
+          reasoningOptions: existingModel?.reasoningOptions,
+          contextOptions: existingModel?.contextOptions,
           variants: {},
+          modes: directModes(providerID, modelID, model.experimental) ?? existingModel?.modes,
         }
         const merged = mergeDeep(ProviderTransform.variants(parsedModel), model.variants ?? {})
         parsedModel.variants = mapValues(
@@ -1095,33 +2458,44 @@ export namespace Provider {
       // snapshot normalizes dots to dashes (e.g. `gpt-5-5`) while the
       // OpenAI API expects dots (`gpt-5.5`). We pick up whichever the
       // snapshot ships and route it through the codex provider.
-      const codexModelIds = new Set<string>([
-        "gpt-5.5",
-        "gpt-5-5",
-        "gpt-5.4",
-        "gpt-5-4",
-        "gpt-5.4-mini",
-        "gpt-5-4-mini",
-        "gpt-5.3-codex",
-        "gpt-5-3-codex",
-        "gpt-5.2",
-        "gpt-5-2",
-      ])
       const baseOpenai = database["openai"]
       const codexModels: Record<string, (typeof baseOpenai.models)[string]> = {}
       for (const [id, model] of Object.entries(baseOpenai.models)) {
-        if (codexModelIds.has(id)) {
-          codexModels[id] = {
+        if (isCodexOAuthModel(id)) {
+          const codexModel = {
             ...model,
             providerID: "openai-codex",
             cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+            // Keep each model's catalog window. Flattening the whole Codex
+            // family to a legacy input allowance made flagship and mini
+            // models advertise the same, incorrect context in every picker.
+            limit: id === "gpt-6-astra" ? { context: 872_000, output: 128_000 } : { ...model.limit },
+            // The subscription catalog advertises a smaller default/maximum
+            // context than the public API. Ultra is a Codex orchestration mode,
+            // not an additional Responses reasoning.effort value.
+            ...(id === "gpt-6-astra"
+              ? {
+                  contextOptions: [272_000, 872_000],
+                  reasoningOptions: [
+                    { type: "effort", values: ["low", "medium", "high", "xhigh", "max"], default: "medium" },
+                  ],
+                }
+              : {}),
+            // Codex advertises its own fast tier independently of the public
+            // API catalog, so synthesize only the modes in the OAuth contract.
+            modes: codexOAuthModes(model.id),
           }
+          // The public API and ChatGPT/Codex expose different GPT-5.6 effort
+          // ladders. Recompute after changing providerID instead of copying the
+          // API model's pre-built variants (`none` is not a Codex picker option).
+          codexModel.variants = ProviderTransform.variants(codexModel)
+          codexModels[id] = codexModel
         }
       }
       database["openai-codex"] = {
         ...baseOpenai,
         id: "openai-codex",
-        name: "OpenAI Codex (ChatGPT subscription)",
+        name: "OpenAI (Codex subscription)",
         env: [],
         options: {},
         models: codexModels,
@@ -1132,20 +2506,26 @@ export namespace Provider {
     const env = Env.all()
     for (const [providerID, provider] of Object.entries(database)) {
       if (disabled.has(providerID)) continue
-      const apiKey = provider.env.map((item) => env[item]).find(Boolean)
-      if (!apiKey) continue
+      // models.dev lists GITHUB_TOKEN for Copilot, but OpenScience also uses
+      // that variable for ordinary repository access. A GitHub PAT or App
+      // server token is not a Copilot inference credential and advertising it
+      // here produces a connected provider that fails before inference. Real
+      // Copilot access is loaded below through the OAuth plugin.
+      if (providerID.startsWith("github-copilot")) continue
+      const credential = provider.env.map((name) => ({ name, value: env[name] })).find((item) => item.value)
+      if (!credential?.value) continue
       mergeProvider(providerID, {
         source: "env",
-        key: provider.env.length === 1 ? apiKey : undefined,
+        key: provider.env.length === 1 ? credential.value : undefined,
       })
     }
 
     // load apikeys
-    for (const [providerID, provider] of Object.entries(await Auth.all())) {
+    for (const [providerID, provider] of Object.entries(authEntries)) {
       if (disabled.has(providerID)) continue
       if (provider.type === "api") {
         mergeProvider(providerID, {
-          source: "api",
+          source: workspaceKeys.has(providerID) ? "workspace" : "api",
           key: provider.key,
         })
       }
@@ -1209,14 +2589,29 @@ export namespace Provider {
       if (result && (result.autoload || providers[providerID])) {
         if (result.getModel) modelLoaders[providerID] = result.getModel
         const opts = result.options ?? {}
-        const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
+        // A loader-reported source wins; otherwise use "custom" only for a
+        // provider's first registration.
+        const patch: Partial<Info> = providers[providerID]
+          ? { options: opts, ...(result.source ? { source: result.source } : {}) }
+          : { source: result.source ?? "custom", options: opts }
         mergeProvider(providerID, patch)
       }
     }
 
     // load config
     for (const [providerID, provider] of configProviders) {
-      const partial: Partial<Info> = { source: "config" }
+      // A provider already registered by an earlier stage under a genuinely
+      // credential-derived source (env/api) must not be relabeled —
+      // a `config.provider` entry that only supplies a `whitelist`, `name`,
+      // etc. is not where the credential came from. "custom" is excluded from
+      // this protection: it's loader-assigned (not credential-derived) and an
+      // autoloaded provider (AWS-profile Bedrock, google-vertex,
+      // cloudflare-ai-gateway, gitlab, sap-ai-core, ...) that also appears in
+      // config.provider for its whitelist has always been, and must stay,
+      // "config" here.
+      const credentialSource = providers[providerID]?.source
+      const claimed = credentialSource === "env" || credentialSource === "api" || credentialSource === "managed"
+      const partial: Partial<Info> = claimed ? {} : { source: "config" }
       if (provider.env) partial.env = provider.env
       if (provider.name) partial.name = provider.name
       if (provider.options) partial.options = provider.options
@@ -1229,36 +2624,108 @@ export namespace Provider {
         continue
       }
 
-      // Under an EXPLICIT byok toggle, drop any provider whose effective
-      // credential is a managed Atlas (thk_) key. The managed sync writes
-      // OPENROUTER_BASE_URL + a thk_ OPENROUTER_API_KEY into the environment and
-      // those survive a managed→byok switch — so without this, byok silently
-      // keeps routing through the wallet proxy (and billing managed spend) on a
-      // credential the user never brought. BYOK must use the user's OWN keys
-      // only; auto-detect (billing unset) is left alone so a thk_ key can still
-      // resolve to managed there.
-      if (config.billing?.llm === "byok" && isAtlasApiKey(effectiveKey(provider))) {
+      const auth = authEntries[providerID]
+      // An explicit OAuth record is the credential authority. Strip any stale
+      // retired token or proxy values before constructing its SDK request.
+      if (auth?.type === "oauth") {
+        if (Auth.isAtlasApiKey(provider.key)) provider.key = undefined
+        if (Auth.isAtlasApiKey(provider.options?.["apiKey"])) delete provider.options["apiKey"]
+        if (hasManagedProxyPath(provider.options?.["baseURL"])) delete provider.options["baseURL"]
+        provider.env = []
+      }
+
+      const baseURL = provider.options?.["baseURL"] ?? config.provider?.[providerID]?.api
+      const credential = effectiveKey(provider)
+      const managedRoute =
+        providerID === "openrouter" &&
+        provider.source === "managed" &&
+        Auth.isAtlasApiKey(credential) &&
+        isAtlasProxyBaseURL(baseURL)
+      if (config.billing?.llm === "managed" && providerID === "openrouter" && !managedRoute) {
+        delete providers[providerID]
+        continue
+      }
+      if ((Auth.isAtlasApiKey(credential) || hasManagedProxyPath(baseURL)) && !managedRoute) {
+        delete providers[providerID]
+        continue
+      }
+      if (config.billing?.llm === "byok" && managedRoute) {
         delete providers[providerID]
         continue
       }
 
       const configProvider = config.provider?.[providerID]
 
-      // The synced OpenRouter whitelist curates the MANAGED catalog only. When
-      // OpenRouter resolves to the user's OWN key (BYOK — the resolver above
-      // attaches a non-thk_ apiKey), it's their account: show the full local
-      // models.dev OpenRouter catalog instead of the managed subset.
-      const openrouterByok = providerID === "openrouter" && isByokKey(provider.options?.["apiKey"])
+      if (managedRoute) {
+        const catalog = await ManagedPricing.catalog()
+        for (const modelID of MANAGED_OPENROUTER_MODEL_SET) {
+          const reviewed = managedModelDetails(modelID)!
+          if (
+            catalog.availability[modelID] === false ||
+            (reviewed.requiresApproval && catalog.availability[modelID] !== true)
+          ) {
+            delete provider.models[modelID]
+            continue
+          }
+          if (!(modelID in provider.models)) provider.models[modelID] = _syntheticOpenRouterModel(modelID)
+          const model = provider.models[modelID]
+          const configured = configProvider?.models?.[modelID]
+          model.name = configured?.name ?? reviewed.name
+          model.limit.context = configured?.limit?.context ?? reviewed.context
+          model.limit.output = configured?.limit?.output ?? reviewed.output
+          if (reviewed.maxInput) model.limit.input = reviewed.maxInput
+          if (reviewed.temperature !== undefined) model.capabilities.temperature = reviewed.temperature
+          // Never present models.dev's unrelated upstream price as Ace pricing.
+          const price = catalog.prices[modelID]
+          model.api = { ...model.api, ...managedModelRoute(modelID) }
+          // The gateway's request envelope carries text and image parts only,
+          // whatever the upstream model accepts; a document or media part is
+          // refused with 422, so the route never advertises those inputs.
+          // Image support follows the reviewed route, not models.dev's entry,
+          // which has lagged and left vision models refusing attachments.
+          model.capabilities.input.image = reviewed.input.includes("image")
+          model.capabilities.attachment = model.capabilities.input.image
+          model.capabilities.input.pdf = false
+          model.capabilities.input.audio = false
+          model.capabilities.input.video = false
+          if (price) {
+            model.cost = price.cost
+            model.pricing = price.pricing
+            model.limit = { ...model.limit, ...price.limit }
+            model.reasoningOptions = price.reasoningOptions
+            model.contextOptions = price.contextOptions
+            model.modes = price.modes
+          } else {
+            model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } }
+            delete model.pricing
+            // Do not inherit unrelated BYOK capabilities or paid modes while
+            // this workspace's route catalogue is unavailable.
+            model.reasoningOptions = reviewed.efforts
+              ? [
+                  {
+                    type: "effort",
+                    values: [...reviewed.efforts],
+                    ...(reviewed.defaultEffort ? { default: reviewed.defaultEffort } : {}),
+                  },
+                ]
+              : []
+            model.contextOptions = [model.limit.context]
+            model.modes = {}
+          }
+        }
+      }
 
       for (const [modelID, model] of Object.entries(provider.models)) {
         model.api.id = model.api.id ?? model.id ?? modelID
+        if (isRemovedModel(modelID)) delete provider.models[modelID]
         if (modelID === "gpt-5-chat-latest" || (providerID === "openrouter" && modelID === "openai/gpt-5-chat"))
           delete provider.models[modelID]
         if (model.status === "alpha" && !Flag.OPENSCIENCE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
         if (model.status === "deprecated") delete provider.models[modelID]
+        if (managedRoute && !MANAGED_OPENROUTER_MODEL_SET.has(modelID)) delete provider.models[modelID]
         if (
           (configProvider?.blacklist && configProvider.blacklist.includes(modelID)) ||
-          (!openrouterByok && configProvider?.whitelist && !configProvider.whitelist.includes(modelID))
+          (configProvider?.whitelist && !configProvider.whitelist.includes(modelID))
         )
           delete provider.models[modelID]
 
@@ -1275,18 +2742,27 @@ export namespace Provider {
         }
       }
 
-      // OpenRouter aggregates models from many upstreams; a whitelisted managed
-      // model id occasionally missing from the models.dev registry gets
-      // synthesized so the picker still accepts it. Safe because OR is
-      // OpenAI-compat for every upstream + managed billing uses usage.cost from
-      // the response, not a local price table. Skipped on a BYOK key — that path
-      // shows the full local catalog and isn't bound to the managed whitelist.
-      if (!openrouterByok && providerID === "openrouter" && configProvider?.whitelist) {
+      // OpenRouter is OpenAI-compatible across upstreams, so a user-whitelisted
+      // model missing from the registry can still be represented locally.
+      if (providerID === "openrouter" && configProvider?.whitelist && !managedRoute) {
         for (const wlid of configProvider.whitelist) {
+          if (isRemovedModel(wlid)) continue
+          if (configProvider.blacklist?.includes(wlid)) continue
           if (!(wlid in provider.models)) {
             provider.models[wlid] = _syntheticOpenRouterModel(wlid)
           }
         }
+      }
+
+      // A mode that points at a dedicated catalog route is valid only while
+      // that exact route remains available after status/config
+      // filtering. Otherwise the UI would offer Fast and silently fall back to
+      // the base model.
+      for (const model of Object.values(provider.models)) {
+        const fast = model.modes?.fast
+        if (!fast?.model || provider.models[fast.model]) continue
+        delete model.modes?.fast
+        if (model.modes && Object.keys(model.modes).length === 0) model.modes = undefined
       }
 
       if (Object.keys(provider.models).length === 0) {
@@ -1305,15 +2781,23 @@ export namespace Provider {
     }
   }
 
-  // Returns the memoised state, creating it on first call or after invalidate().
-  function state() {
-    const directory = Instance.directory
-    if (_stateCacheDirectory !== directory) {
+  // Returns the memoised state, creating it on first call, after invalidate(),
+  // or when the provider-relevant inputs changed since it was built.
+  async function state() {
+    await CredentialLifecycle.ensureFresh()
+    const revision = await stateRevision()
+    if (_stateCacheRevision !== revision) {
       _stateCache = null
-      _stateCacheDirectory = directory
+      _stateCacheRevision = revision
     }
     if (_stateCache === null) {
-      _stateCache = _loadState()
+      // A rejected load must not be memoised forever; drop it so the next
+      // caller retries, unless a newer load already replaced it.
+      const loading: ReturnType<typeof _loadState> = _loadState().catch((error) => {
+        if (_stateCache === loading) _stateCache = null
+        throw error
+      })
+      _stateCache = loading
     }
     return _stateCache
   }
@@ -1326,11 +2810,33 @@ export namespace Provider {
    */
   export function invalidate(): void {
     _stateCache = null
-    _stateCacheDirectory = undefined
+    _stateCacheRevision = undefined
   }
 
-  export async function list() {
-    return state().then((state) => state.providers)
+  function resolveOpenRouterAlias(s: Awaited<ReturnType<typeof state>>, providerID: string, modelID: string) {
+    const openrouter = s.providers["openrouter"]
+    if (!openrouter) return undefined
+    for (const alias of openrouterAliasCandidates(providerID, modelID)) {
+      const model = openrouter.models[alias]
+      if (model) return model
+    }
+  }
+
+  function resolveAvailableModel(s: Awaited<ReturnType<typeof state>>, providerID: string, modelID: string) {
+    const exact = s.providers[providerID]?.models[modelID]
+    return exact ?? resolveOpenRouterAlias(s, providerID, modelID)
+  }
+
+  export async function list(options: { refresh?: boolean } = {}) {
+    // An explicit refresh waits (bounded) for the pricing answer before the
+    // state is read, so the list handed back already carries it.
+    if (options.refresh) await ManagedPricing.current({ force: true })
+    const s = await state()
+    // Provider state can outlive the pricing cache, including a failed initial
+    // fetch. Catalog reads must revalidate pricing so Refresh can recover;
+    // keep this off getModel/getLanguage and never await a network response.
+    if (Object.values(s.providers).some((provider) => provider.source === "managed")) await ManagedPricing.current()
+    return s.providers
   }
 
   // === tokenCommand: refreshing shell-command auth (#146) ===
@@ -1339,25 +2845,70 @@ export namespace Provider {
   // its stdout as `Authorization: Bearer <token>`, re-minting shortly before the
   // token's JWT exp. Module-level so the cache + single-flight are shared across the
   // (memoized) SDK instances rather than re-run per request.
-  const tokenCache = new Map<string, { token: string; expires: number }>()
-  const tokenInflight = new Map<string, Promise<string>>()
+  type TokenScope = {
+    projectID: string
+    providerID: string
+    command: string
+    endpoint: string
+  }
+  type TokenCacheEntry = TokenScope & { token: string; expires: number }
+  type TokenInflightEntry = TokenScope & { promise: Promise<string> }
 
-  async function mintToken(command: string): Promise<string> {
-    const cached = tokenCache.get(command)
+  const tokenCache = new Map<string, TokenCacheEntry>()
+  const tokenInflight = new Map<string, TokenInflightEntry>()
+  let tokenGeneration = 0
+
+  export function invalidateTokenCache(projectID?: string): void {
+    // Advancing the generation prevents an already-running mint from
+    // repopulating a cache that was invalidated while the helper was active.
+    tokenGeneration++
+    if (!projectID) {
+      tokenCache.clear()
+      tokenInflight.clear()
+      return
+    }
+    for (const [key, entry] of tokenCache) {
+      if (entry.projectID === projectID) tokenCache.delete(key)
+    }
+    for (const [key, entry] of tokenInflight) {
+      if (entry.projectID === projectID) tokenInflight.delete(key)
+    }
+  }
+
+  async function projectToken(model: Model, command: string) {
+    return Config.projectControlsProviderToken(model.providerID, command)
+  }
+
+  async function projectModule(model: Model) {
+    const configured = (config: Config.Info) => {
+      const provider = config.provider?.[model.providerID]
+      return provider?.models?.[model.id]?.provider?.npm ?? provider?.npm
+    }
+    const declared = configured(await Config.get())
+    if (declared !== model.api.npm) return false
+    return configured(await Config.getExecution()) !== model.api.npm
+  }
+
+  async function mintToken(model: Model, command: string, endpoint: string, projectDeclared: boolean): Promise<string> {
+    // A token command is evaluated relative to the active project and its
+    // result is sent to one provider endpoint. Command text alone is therefore
+    // not an authority boundary: two projects may intentionally use the same
+    // command while resolving different files from different working trees.
+    const scope: TokenScope = {
+      projectID: Instance.project.id,
+      providerID: model.providerID,
+      command,
+      endpoint,
+    }
+    const key = JSON.stringify(scope)
+    const cached = tokenCache.get(key)
     // Re-mint a minute early so an in-flight request never ships an expired token.
     if (cached && cached.expires > Date.now() + 60_000) return cached.token
-    const pending = tokenInflight.get(command)
-    if (pending) return pending
+    const pending = tokenInflight.get(key)
+    if (pending) return pending.promise
+    const generation = tokenGeneration
     const run = (async () => {
-      const proc = Bun.spawn(["sh", "-c", command], { stdout: "pipe", stderr: "pipe" })
-      const [out, err, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ])
-      const token = out.trim()
-      if (code !== 0) throw new Error(`tokenCommand exited ${code}: ${err.trim() || "no stderr"}`)
-      if (!token) throw new Error("tokenCommand produced no output")
+      const token = await ProviderTokenCommand.run({ command, projectDeclared })
       // Decode a JWT exp (seconds) so we can re-mint just before it lapses; a
       // non-JWT token has no exp, so expire it immediately (re-mint every request).
       const claims = token.split(".")
@@ -1369,10 +2920,14 @@ export namespace Provider {
           /* not a JWT — leave exp 0 */
         }
       }
-      tokenCache.set(command, { token, expires: exp ? exp * 1000 : 0 })
+      if (generation === tokenGeneration) {
+        tokenCache.set(key, { ...scope, token, expires: exp ? exp * 1000 : 0 })
+      }
       return token
-    })().finally(() => tokenInflight.delete(command))
-    tokenInflight.set(command, run)
+    })().finally(() => {
+      if (tokenInflight.get(key)?.promise === run) tokenInflight.delete(key)
+    })
+    tokenInflight.set(key, { ...scope, promise: run })
     return run
   }
 
@@ -1385,11 +2940,24 @@ export namespace Provider {
       const provider = s.providers[model.providerID]
       const options = { ...provider.options }
 
+      if (
+        provider.source === "managed" &&
+        Auth.isAtlasApiKey(effectiveKey(provider)) &&
+        model.providerID === "openrouter" &&
+        MANAGED_OPENROUTER_MODEL_SET.has(model.id)
+      ) {
+        const route = managedModelRoute(model.id)
+        if (model.api.npm !== route.npm || model.api.id !== route.id) {
+          throw new Error("The Ace model route changed. Refresh the model list and retry.")
+        }
+        options["baseURL"] = route.url
+      }
+
       if (model.api.npm.includes("@ai-sdk/openai-compatible") && options["includeUsage"] !== false) {
         options["includeUsage"] = true
       }
 
-      if (!options["baseURL"]) options["baseURL"] = model.api.url
+      if (!options["baseURL"] && model.api.url) options["baseURL"] = model.api.url
       if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
       // tokenCommand supplies the credential per-request via the fetch hook below;
       // give the SDK a non-empty placeholder so @ai-sdk/openai's loadApiKey doesn't
@@ -1409,20 +2977,45 @@ export namespace Provider {
 
       const customFetch = options["fetch"]
       const tokenCommand = options["tokenCommand"] as string | undefined
+      const idleTimeout =
+        options["idleTimeout"] ??
+        defaultIdleTimeout({ providerID: model.providerID, baseURL: options["baseURL"] ?? model.api.url })
+      const connectTimeout =
+        options["connectTimeout"] ??
+        defaultConnectTimeout({ providerID: model.providerID, baseURL: options["baseURL"] ?? model.api.url })
+      delete options["idleTimeout"]
+      delete options["connectTimeout"]
+      delete options["outputIdleTimeout"]
 
       options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
-        // Preserve custom fetch if it exists, wrap it with timeout logic
-        const fetchFn = customFetch ?? fetch
-        const opts = init ?? {}
+        // Preserve custom fetch if it exists, then add an activity watchdog.
+        // A configured `timeout` is still an opt-in total wall-clock cap.
+        const fetchFn = customFetch ?? fetchWithFreshConnection
+        const opts = { ...(init ?? {}) }
 
-        if (options["timeout"] !== undefined && options["timeout"] !== null) {
-          const signals: AbortSignal[] = []
-          if (opts.signal) signals.push(opts.signal)
-          if (options["timeout"] !== false) signals.push(AbortSignal.timeout(options["timeout"]))
+        if (
+          model.api.npm === "@openrouter/ai-sdk-provider" &&
+          typeof opts.body === "string" &&
+          opts.method === "POST"
+        ) {
+          opts.body = JSON.stringify(normalizeOpenRouterRequestBody(JSON.parse(opts.body)))
+        }
 
-          const combined = signals.length > 1 ? AbortSignal.any(signals) : signals[0]
+        if (model.api.npm === "@ai-sdk/deepseek" && opts.body && opts.method === "POST") {
+          const body = normalizeDeepSeekRequestBody(JSON.parse(opts.body as string))
+          opts.body = JSON.stringify(body)
+        }
 
-          opts.signal = combined
+        if (model.api.npm === "@ai-sdk/anthropic" && typeof opts.body === "string" && opts.method === "POST") {
+          const body = JSON.parse(opts.body)
+          if (body.model === "claude-fable-5-1") {
+            opts.body = JSON.stringify(normalizeFableRequestBody(body))
+            const headers = new Headers(opts.headers as HeadersInit | undefined)
+            const beta = new Set((headers.get("anthropic-beta") ?? "").split(",").filter(Boolean))
+            beta.add("thinking-binding-controls-2026-08-01")
+            headers.set("anthropic-beta", [...beta].join(","))
+            opts.headers = headers
+          }
         }
 
         // Strip openai itemId metadata following what codex does
@@ -1430,7 +3023,7 @@ export namespace Provider {
         // Message, Reasoning, FunctionCall, LocalShellCall, CustomToolCall, WebSearchCall
         // IDs are only re-attached for Azure with store=true
         if (model.api.npm === "@ai-sdk/openai" && opts.body && opts.method === "POST") {
-          const body = JSON.parse(opts.body as string)
+          const body = normalizeAstraRequestBody(JSON.parse(opts.body as string))
           const isAzure = model.providerID.includes("azure")
           const keepIds = isAzure && body.store === true
           if (!keepIds && Array.isArray(body.input)) {
@@ -1439,25 +3032,94 @@ export namespace Provider {
                 delete item.id
               }
             }
-            opts.body = JSON.stringify(body)
           }
+          opts.body = JSON.stringify(body)
         }
 
         // Mint (or reuse) the shell-command token and overwrite Authorization.
         // Headers.set is case-insensitive, so it replaces the placeholder key the
         // SDK attached at construction.
         if (tokenCommand) {
-          const token = await mintToken(tokenCommand)
+          const projectDeclared = await projectToken(model, tokenCommand)
+          if (projectDeclared) {
+            await ProjectTrust.require(Instance.project, "provider_token_command")
+          }
+          const endpoint = String(options["baseURL"] ?? model.api.url ?? "")
+          const token = await mintToken(model, tokenCommand, endpoint, projectDeclared)
           const headers = new Headers(opts.headers as HeadersInit | undefined)
           headers.set("authorization", `Bearer ${token}`)
           opts.headers = headers
         }
 
-        return fetchFn(input, {
-          ...opts,
-          // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
-          timeout: false,
+        const apiKey = typeof options["apiKey"] === "string" ? options["apiKey"] : undefined
+        const managed = isAtlasProxyBaseURL(options["baseURL"]) && Auth.isAtlasApiKey(apiKey)
+        if ((Auth.isAtlasApiKey(apiKey) || hasManagedProxyPath(options["baseURL"])) && !managed) {
+          throw new Error("Ace credentials are valid only on the managed gateway.")
+        }
+        if (managed) {
+          const endpoint = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input)
+          if (!isAtlasProxyBaseURL(endpoint)) throw new Error("Ace credentials cannot leave the managed gateway.")
+          opts.redirect = "error"
+        }
+        const context = requestContext.getStore()
+        const funding = managed ? await OpenScience.managedRequestSnapshot(apiKey, context?.funding) : undefined
+        opts.headers = requestFundingHeaders({
+          baseURL: options["baseURL"],
+          apiKey,
+          headers: opts.headers as HeadersInit | undefined,
+          funding,
         })
+        const sessionID = context?.sessionID ?? opts.headers.get("x-openscience-session")
+        const messageID = context?.messageID ?? opts.headers.get("x-openscience-request")
+        if (managed && sessionID && messageID && typeof opts.body === "string") {
+          const endpoint = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input)
+          opts.headers.set(
+            "Idempotency-Key",
+            managedIdempotencyKey({
+              endpoint,
+              body: opts.body,
+              sessionID,
+              messageID,
+              operation: context?.resubmit ? `model:resubmit:${context.resubmit}` : "model",
+            }),
+          )
+        }
+
+        const request = () =>
+          fetchWithIdleWatchdog(fetchFn, input, opts, {
+            providerID: model.providerID,
+            modelID: model.id,
+            idleTimeout,
+            connectTimeout,
+            totalTimeout: options["timeout"],
+            managed,
+          })
+        const response = await request()
+        const settled = await retryManagedPaymentRequired({
+          response,
+          managed,
+          headers: opts.headers,
+          signal: opts.signal,
+          retry: request,
+        })
+        const resolved = await retryManagedConflict({
+          response: settled,
+          managed,
+          headers: opts.headers,
+          signal: opts.signal,
+          retry: request,
+          timing: {
+            providerID: model.providerID,
+            modelID: requestModel(opts.body) ?? context?.modelID ?? model.id,
+            idleTimeoutMs: resolveIdleTimeout(idleTimeout),
+          },
+        })
+        // A refused request (a 402 once the reload retry is spent) may mean
+        // the balance is gone, so the cached one is dropped here. A served
+        // request is charged only after its stream ends; the processor
+        // announces that settlement, and a read at the headers would predate it.
+        if (managed && !resolved.ok) OpenScience.invalidateBalance()
+        return funding ? OpenScience.validateFundingResponse(resolved, funding) : resolved
       }
 
       // Special case: google-vertex-anthropic uses a subpath import
@@ -1474,6 +3136,9 @@ export namespace Provider {
         return loaded as SDK
       }
 
+      if (await projectModule(model)) {
+        await ProjectTrust.require(Instance.project, "provider_module")
+      }
       let installedPath: string
       if (!model.api.npm.startsWith("file://")) {
         installedPath = await BunProc.install(model.api.npm, "latest")
@@ -1502,6 +3167,9 @@ export namespace Provider {
 
   export async function getModel(providerID: string, modelID: string) {
     const s = await state()
+    const resolved = resolveAvailableModel(s, providerID, modelID)
+    if (resolved) return resolved
+
     const provider = s.providers[providerID]
     if (!provider) {
       const availableProviders = Object.keys(s.providers)
@@ -1510,14 +3178,10 @@ export namespace Provider {
       throw new ModelNotFoundError({ providerID, modelID, suggestions })
     }
 
-    const info = provider.models[modelID]
-    if (!info) {
-      const availableModels = Object.keys(provider.models)
-      const matches = fuzzysort.go(modelID, availableModels, { limit: 3, threshold: -10000 })
-      const suggestions = matches.map((m) => m.target)
-      throw new ModelNotFoundError({ providerID, modelID, suggestions })
-    }
-    return info
+    const availableModels = Object.keys(provider.models)
+    const matches = fuzzysort.go(modelID, availableModels, { limit: 3, threshold: -10000 })
+    const suggestions = matches.map((m) => m.target)
+    throw new ModelNotFoundError({ providerID, modelID, suggestions })
   }
 
   export async function getLanguage(model: Model): Promise<LanguageModelV2> {
@@ -1562,18 +3226,6 @@ export namespace Provider {
     }
   }
 
-  /** Whether a managed (Atlas) session is active. Only then should the hosted
-   *  `openscience` provider participate in DEFAULT model selection — a fresh
-   *  BYOK/OAuth clone must default to the user's own provider. */
-  async function hasManagedSession(): Promise<boolean> {
-    try {
-      const session = await OpenScience.getSession()
-      return !!session?.api_key
-    } catch {
-      return false
-    }
-  }
-
   export async function getSmallModel(providerID: string) {
     const cfg = await Config.get()
 
@@ -1593,9 +3245,6 @@ export namespace Provider {
         "gemini-2.5-flash",
         "gpt-5-nano",
       ]
-      if (providerID.startsWith("synsci")) {
-        priority = ["gpt-5-nano"]
-      }
       if (providerID.startsWith("github-copilot")) {
         // prioritize free models for github copilot
         priority = ["gpt-5-mini", "claude-haiku-4.5", ...priority]
@@ -1607,21 +3256,11 @@ export namespace Provider {
       }
     }
 
-    // Only fall back to the hosted openscience demo small-model when a managed
-    // session is active — a BYOK/OAuth clone shouldn't silently route summaries
-    // through the hosted endpoint.
-    if (await hasManagedSession()) {
-      const openscienceProvider = await state().then((state) => state.providers["synsci"])
-      if (openscienceProvider && openscienceProvider.models["gpt-5-nano"]) {
-        return getModel("synsci", "gpt-5-nano")
-      }
-    }
-
     return undefined
   }
 
   export const NO_PROVIDER_HINT =
-    "No model providers are available. Add your own API key (`openscience keys add`) or connect a managed account (`openscience login`), then choose a model."
+    "No model providers are available. Sign in to Ace, add your own API key, or connect a local/subscription model in Customize → Models."
 
   const priority = ["claude-sonnet-4", "claude-opus-4", "gpt-5", "gemini-3-pro"]
   export function sort(models: Model[]) {
@@ -1648,20 +3287,15 @@ export namespace Provider {
       // (e.g. a saved `anthropic/...` model with no API key must not be returned)
       // — otherwise fall through to the priority-based selection below.
       const parsed = parseModel(cfg.model)
-      if (available[parsed.providerID]?.models[parsed.modelID]) return parsed
+      const resolved = resolveAvailableModel(await state(), parsed.providerID, parsed.modelID)
+      if (resolved) return { providerID: resolved.providerID, modelID: resolved.id }
       log.warn("configured model is not available, falling back to default selection", parsed)
     }
 
-    const managed = await hasManagedSession()
     const providers = Object.values(available)
     const configured = (p: Info) => !cfg.provider || Object.keys(cfg.provider).includes(p.id)
-    // Drop the hosted `openscience` provider from DEFAULT priority unless a managed
-    // session is active, then pick the first provider that actually has models.
-    // Fall back to the raw configured list so a openscience-only, unmanaged clone
-    // still resolves a default rather than throwing.
-    const candidates = providers.filter((p) => configured(p) && (managed || !p.id.startsWith("synsci")))
-    const provider =
-      candidates.find((p) => Object.keys(p.models).length > 0) ?? candidates[0] ?? providers.find(configured)
+    const candidates = providers.filter((p) => configured(p))
+    const provider = candidates.find((p) => Object.keys(p.models).length > 0) ?? candidates[0]
     if (!provider) throw new Error(NO_PROVIDER_HINT)
     const [model] = sort(Object.values(provider.models))
     if (!model) throw new Error(NO_PROVIDER_HINT)
@@ -1695,3 +3329,8 @@ export namespace Provider {
     }),
   )
 }
+
+CredentialLifecycle.onRefresh(() => {
+  Provider.invalidateTokenCache()
+  Provider.invalidate()
+})

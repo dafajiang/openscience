@@ -51,7 +51,7 @@ export const dict = {
   "command.terminal.new": "Nouveau terminal",
   "command.terminal.new.description": "Créer un nouvel onglet de terminal",
   "command.steps.toggle": "Basculer les étapes",
-  "command.steps.toggle.description": "Afficher ou masquer les étapes du message actuel",
+  "command.steps.toggle.description": "Afficher ou masquer la trace d’exécution du message actuel",
   "command.message.previous": "Message précédent",
   "command.message.previous.description": "Aller au message utilisateur précédent",
   "command.message.next": "Message suivant",
@@ -78,10 +78,6 @@ export const dict = {
   "command.session.compact.description": "Résumer la session pour réduire la taille du contexte",
   "command.session.fork": "Bifurquer à partir du message",
   "command.session.fork.description": "Créer une nouvelle session à partir d'un message précédent",
-  "command.session.share": "Partager la session",
-  "command.session.share.description": "Partager cette session et copier l'URL dans le presse-papiers",
-  "command.session.unshare": "Ne plus partager la session",
-  "command.session.unshare.description": "Arrêter de partager cette session",
 
   "palette.search.placeholder": "Rechercher des fichiers et des commandes",
   "palette.empty": "Aucun résultat trouvé",
@@ -93,7 +89,6 @@ export const dict = {
   "dialog.provider.group.popular": "Populaire",
   "dialog.provider.group.other": "Autre",
   "dialog.provider.tag.recommended": "Recommandé",
-  "dialog.provider.synsci.note": "curated models including Claude, GPT, Gemini and more",
   "dialog.provider.anthropic.note": "Connectez-vous avec Claude Pro/Max ou une clé API",
   "dialog.provider.openai.note": "Connectez-vous avec ChatGPT Pro/Plus ou une clé API",
   "dialog.provider.google.note": "Gemini models for fast, structured responses",
@@ -106,10 +101,6 @@ export const dict = {
   "dialog.model.empty": "Aucun résultat de modèle",
   "dialog.model.manage": "Gérer les modèles",
   "dialog.model.manage.description": "Personnalisez les modèles qui apparaissent dans le sélecteur.",
-
-  "dialog.model.unpaid.freeModels.title": "Modèles gratuits de vos fournisseurs connectés",
-  "dialog.model.unpaid.empty": "no free models available yet — connect a provider to add models.",
-  "dialog.model.unpaid.addMore.title": "Ajouter plus de modèles de fournisseurs populaires",
 
   "dialog.provider.viewAll": "Voir plus de fournisseurs",
 
@@ -179,37 +170,11 @@ export const dict = {
   "common.attachment": "pièce jointe",
 
   "prompt.placeholder.shell": "Entrez une commande shell...",
-  "prompt.placeholder.normal": 'Demandez n\'importe quoi... "{{example}}"',
+  "prompt.placeholder.normal": "Décrivez la tâche de recherche sur laquelle vous souhaitez travailler…",
   "prompt.placeholder.summarizeComments": "Résumer les commentaires…",
   "prompt.placeholder.summarizeComment": "Résumer le commentaire…",
   "prompt.mode.shell": "Shell",
   "prompt.mode.shell.exit": "esc pour quitter",
-
-  "prompt.example.1": "Corriger un TODO dans la base de code",
-  "prompt.example.2": "Quelle est la pile technique de ce projet ?",
-  "prompt.example.3": "Réparer les tests échoués",
-  "prompt.example.4": "Expliquer comment fonctionne l'authentification",
-  "prompt.example.5": "Trouver et corriger les vulnérabilités de sécurité",
-  "prompt.example.6": "Ajouter des tests unitaires pour le service utilisateur",
-  "prompt.example.7": "Refactoriser cette fonction pour être plus lisible",
-  "prompt.example.8": "Que signifie cette erreur ?",
-  "prompt.example.9": "Aidez-moi à déboguer ce problème",
-  "prompt.example.10": "Générer la documentation de l'API",
-  "prompt.example.11": "Optimiser les requêtes de base de données",
-  "prompt.example.12": "Ajouter une validation d'entrée",
-  "prompt.example.13": "Créer un nouveau composant pour...",
-  "prompt.example.14": "Comment déployer ce projet ?",
-  "prompt.example.15": "Vérifier mon code pour les meilleures pratiques",
-  "prompt.example.16": "Ajouter la gestion des erreurs à cette fonction",
-  "prompt.example.17": "Expliquer ce modèle regex",
-  "prompt.example.18": "Convertir ceci en TypeScript",
-  "prompt.example.19": "Ajouter des logs dans toute la base de code",
-  "prompt.example.20": "Quelles dépendances sont obsolètes ?",
-  "prompt.example.21": "Aidez-moi à écrire un script de migration",
-  "prompt.example.22": "Implémenter la mise en cache pour ce point de terminaison",
-  "prompt.example.23": "Ajouter la pagination à cette liste",
-  "prompt.example.24": "Créer une commande CLI pour...",
-  "prompt.example.25": "Comment fonctionnent les variables d'environnement ici ?",
 
   "prompt.popover.emptyResults": "Aucun résultat correspondant",
   "prompt.popover.emptyCommands": "Aucune commande correspondante",
@@ -289,16 +254,10 @@ export const dict = {
   "dialog.project.edit.worktree.startup.description":
     "S'exécute après la création d'un nouvel espace de travail (arbre de travail).",
   "dialog.project.edit.worktree.startup.placeholder": "p. ex. bun install",
-  "context.breakdown.title": "Répartition du contexte",
-  "context.breakdown.note":
-    "Répartition approximative des jetons d'entrée. \"Autre\" inclut les définitions d'outils et les frais généraux.",
-  "context.breakdown.system": "Système",
   "context.breakdown.user": "Utilisateur",
   "context.breakdown.assistant": "Assistant",
   "context.breakdown.tool": "Appels d'outils",
-  "context.breakdown.other": "Autre",
 
-  "context.systemPrompt.title": "Prompt système",
   "context.rawMessages.title": "Messages bruts",
 
   "context.stats.session": "Session",
@@ -361,16 +320,6 @@ export const dict = {
   "toast.file.listFailed.title": "Échec de la liste des fichiers",
   "toast.context.noLineSelection.title": "Aucune sélection de lignes",
   "toast.context.noLineSelection.description": "Sélectionnez d'abord une plage de lignes dans un onglet de fichier.",
-  "toast.session.share.copyFailed.title": "Échec de la copie de l'URL dans le presse-papiers",
-  "toast.session.share.success.title": "Session partagée",
-  "toast.session.share.success.description": "URL de partage copiée dans le presse-papiers !",
-  "toast.session.share.failed.title": "Échec du partage de la session",
-  "toast.session.share.failed.description": "Une erreur s'est produite lors du partage de la session",
-
-  "toast.session.unshare.success.title": "Session non partagée",
-  "toast.session.unshare.success.description": "Session non partagée avec succès !",
-  "toast.session.unshare.failed.title": "Échec de l'annulation du partage",
-  "toast.session.unshare.failed.description": "Une erreur s'est produite lors de l'annulation du partage de la session",
 
   "toast.session.listFailed.title": "Échec du chargement des sessions pour {{project}}",
 
@@ -469,20 +418,6 @@ export const dict = {
   "status.popover.tab.lsp": "LSP",
   "status.popover.tab.plugins": "Plugins",
   "status.popover.action.manageServers": "Gérer les serveurs",
-
-  "session.share.popover.title": "Publier sur le web",
-  "session.share.popover.description.shared":
-    "Cette session est publique sur le web. Elle est accessible à toute personne disposant du lien.",
-  "session.share.popover.description.unshared":
-    "Partager la session publiquement sur le web. Elle sera accessible à toute personne disposant du lien.",
-  "session.share.action.share": "Partager",
-  "session.share.action.publish": "Publier",
-  "session.share.action.publishing": "Publication...",
-  "session.share.action.unpublish": "Dépublier",
-  "session.share.action.unpublishing": "Dépublication...",
-  "session.share.action.view": "Voir",
-  "session.share.copy.copied": "Copié",
-  "session.share.copy.copyLink": "Copier le lien",
 
   "lsp.tooltip.none": "Aucun serveur LSP",
   "lsp.label.connected": "{{count}} LSP",

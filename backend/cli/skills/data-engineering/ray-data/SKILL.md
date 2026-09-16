@@ -3,10 +3,18 @@ name: ray-data
 description: Scalable data processing for ML workloads. Streaming execution across CPU/GPU, supports Parquet/CSV/JSON/images. Integrates with Ray Train, PyTorch, TensorFlow. Scales from single machine to 100s of nodes. Use for batch inference, data preprocessing, multi-modal data loading, or distributed ETL pipelines.
 category: data-engineering
 version: 1.0.0
-author: Synthetic Sciences
+author: Orchestra Research
 license: MIT
 tags: [Data Processing, Ray Data, Distributed Computing, ML Pipelines, Batch Inference, ETL, Scalable, Ray, PyTorch, TensorFlow]
-dependencies: [ray[data], pyarrow, pandas]
+dependencies: ["ray[data]", pyarrow, pandas]
+metadata:
+  upstream: Orchestra-Research/AI-Research-SKILLs
+  upstream-url: https://github.com/Orchestra-Research/AI-Research-SKILLs
+  upstream-path: 05-data-processing/ray-data
+  upstream-license: MIT
+  upstream-relationship: derived
+  skill-author: Orchestra Research
+  adapted-by: Synthetic Sciences
 ---
 
 # Ray Data - Scalable ML Data Processing
@@ -322,6 +330,5 @@ for features, labels in tf_ds:
 - **GitHub**: https://github.com/ray-project/ray ⭐ 36,000+
 - **Version**: Ray 2.40.0+
 - **Examples**: https://docs.ray.io/en/latest/data/examples/overview.html
-
 
 

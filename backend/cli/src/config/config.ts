@@ -8,26 +8,31 @@ import { ModelsDev } from "../provider/models"
 import { mergeDeep, pipe, unique } from "remeda"
 import { Global } from "../global"
 import fs from "fs/promises"
-import { lazy } from "../util/lazy"
+import { lazy } from "@synsci/util/lazy"
 import { NamedError } from "@synsci/util/error"
 import { Flag } from "../flag/flag"
 import { Auth } from "../auth"
 import {
   type ParseError as JsoncParseError,
   applyEdits,
+  findNodeAtLocation,
   modify,
   parse as parseJsonc,
+  parseTree,
   printParseErrorCode,
 } from "jsonc-parser"
 import { Instance } from "../project/instance"
 import { LSPServer } from "../lsp/server"
-import { BunProc } from "@/bun"
-import { Installation } from "@/installation"
 import { ConfigMarkdown } from "./markdown"
 import { existsSync } from "fs"
 import { Bus } from "@/bus"
 import { GlobalBus } from "@/bus/global"
 import { Event } from "../server/event"
+import { ProjectTrust } from "../project/trust"
+import { State } from "../project/state"
+import { McpSecretStorage } from "../mcp/secret-storage"
+import { McpRemoteUrl } from "../mcp/remote-url"
+import { CredentialLifecycle } from "../credentials/lifecycle"
 
 export namespace Config {
   const log = Log.create({ service: "config" })
@@ -72,12 +77,16 @@ export namespace Config {
     return merged
   }
 
-  export const state = Instance.state(async () => {
+  let globalRevision = 0
+
+  const loadState = async () => {
+    const revision = globalRevision
     const auth = await Auth.all()
 
     // Load remote/well-known config first as the base layer (lowest precedence)
     // This allows organizations to provide default configs that users can override
     let result: Info = {}
+    let execution: Info = {}
     for (const [key, value] of Object.entries(auth)) {
       if (value.type === "wellknown") {
         process.env[value.key] = value.token
@@ -86,16 +95,14 @@ export namespace Config {
         // Config.get() and brick the whole CLI (it's only the lowest-precedence
         // base layer) — mirror the synced-config resilience: log and continue.
         try {
-          const response = await fetch(`${key}/.well-known/openscience`)
+          // Bounded so an unreachable host cannot stall Config.get() indefinitely.
+          const response = await fetch(`${key}/.well-known/openscience`, { signal: AbortSignal.timeout(10_000) })
           if (!response.ok) throw new Error(`HTTP ${response.status}`)
           const wellknown = (await response.json()) as any
           const remoteConfig = wellknown.config ?? {}
-          // Add $schema to prevent load() from trying to write back to a non-existent file
-          if (!remoteConfig.$schema) remoteConfig.$schema = "https://syntheticsciences.ai/config.json"
-          result = mergeConfigConcatArrays(
-            result,
-            await load(JSON.stringify(remoteConfig), `${key}/.well-known/openscience`),
-          )
+          const remote = await load(JSON.stringify(remoteConfig), `${key}/.well-known/openscience`)
+          result = mergeConfigConcatArrays(result, remote)
+          execution = mergeConfigConcatArrays(execution, remote)
           log.debug("loaded remote config from well-known", { url: key })
         } catch (e) {
           log.warn("failed to fetch remote config; continuing without it", {
@@ -107,11 +114,15 @@ export namespace Config {
     }
 
     // Global user config overrides remote config
-    result = mergeConfigConcatArrays(result, await global())
+    const user = await global()
+    result = mergeConfigConcatArrays(result, user)
+    execution = mergeConfigConcatArrays(execution, user)
 
     // Custom config path overrides global
     if (Flag.OPENSCIENCE_CONFIG) {
-      result = mergeConfigConcatArrays(result, await loadFile(Flag.OPENSCIENCE_CONFIG))
+      const custom = await loadFile(Flag.OPENSCIENCE_CONFIG)
+      result = mergeConfigConcatArrays(result, custom)
+      execution = mergeConfigConcatArrays(execution, custom)
       log.debug("loaded custom config", { path: Flag.OPENSCIENCE_CONFIG })
     }
 
@@ -127,7 +138,9 @@ export namespace Config {
 
     // Inline config content has highest precedence
     if (Flag.OPENSCIENCE_CONFIG_CONTENT) {
-      result = mergeConfigConcatArrays(result, JSON.parse(Flag.OPENSCIENCE_CONFIG_CONTENT))
+      const inline = JSON.parse(Flag.OPENSCIENCE_CONFIG_CONTENT)
+      result = mergeConfigConcatArrays(result, inline)
+      execution = mergeConfigConcatArrays(execution, inline)
       log.debug("loaded custom config from OPENSCIENCE_CONFIG_CONTENT")
     }
 
@@ -135,27 +148,33 @@ export namespace Config {
     result.mode = result.mode || {}
     result.plugin = result.plugin || []
 
+    const projectDirectories = !Flag.OPENSCIENCE_DISABLE_PROJECT_CONFIG
+      ? await Array.fromAsync(
+          Filesystem.up({
+            targets: [".openscience", ".synsc"],
+            start: Instance.directory,
+            stop: Instance.worktree,
+          }),
+        )
+      : []
+    const projectSet = new Set(projectDirectories.map((dir) => path.resolve(dir)))
+    const homeDirectories = Flag.OPENSCIENCE_CONFIG_DIR
+      ? []
+      : await Array.fromAsync(
+          Filesystem.up({
+            targets: [".openscience", ".synsc"],
+            start: Global.Path.home,
+            stop: Global.Path.home,
+          }),
+        )
     const directories = [
       Global.Path.config,
       // Only scan project .openscience/ directories when project discovery is enabled
       // (".synsc" is the pre-rename name, still honored)
-      ...(!Flag.OPENSCIENCE_DISABLE_PROJECT_CONFIG
-        ? await Array.fromAsync(
-            Filesystem.up({
-              targets: [".openscience", ".synsc"],
-              start: Instance.directory,
-              stop: Instance.worktree,
-            }),
-          )
-        : []),
-      // Always scan ~/.openscience/ (user home directory)
-      ...(await Array.fromAsync(
-        Filesystem.up({
-          targets: [".openscience", ".synsc"],
-          start: Global.Path.home,
-          stop: Global.Path.home,
-        }),
-      )),
+      ...projectDirectories,
+      // An explicit config root is an isolation boundary. Do not also discover
+      // legacy ~/.openscience configuration from the normal user home.
+      ...homeDirectories,
     ]
 
     if (Flag.OPENSCIENCE_CONFIG_DIR) {
@@ -164,10 +183,13 @@ export namespace Config {
     }
 
     for (const dir of unique(directories)) {
+      const local = projectSet.has(path.resolve(dir))
       if (dir.endsWith(".openscience") || dir.endsWith(".synsc") || dir === Flag.OPENSCIENCE_CONFIG_DIR) {
         for (const file of CONFIG_FILES) {
           log.debug(`loading config from ${path.join(dir, file)}`)
-          result = mergeConfigConcatArrays(result, await loadFile(path.join(dir, file)))
+          const config = await loadFile(path.join(dir, file))
+          result = mergeConfigConcatArrays(result, config)
+          if (!local) execution = mergeConfigConcatArrays(execution, config)
           // to satisfy the type checker
           result.agent ??= {}
           result.mode ??= {}
@@ -175,60 +197,32 @@ export namespace Config {
         }
       }
 
-      const exists = existsSync(path.join(dir, "node_modules"))
-      const installing = installDependencies(dir)
-      if (!exists) await installing
-
-      result.command = mergeDeep(result.command ?? {}, await loadCommand(dir))
-      result.agent = mergeDeep(result.agent, await loadAgent(dir))
-      result.agent = mergeDeep(result.agent, await loadMode(dir))
-      result.plugin.push(...(await loadPlugin(dir)))
-    }
-
-    // Load synced config from dashboard (below the enterprise-managed layer).
-    // Written by OpenScience.syncServices() to the user's XDG config dir. Tolerate
-    // a corrupt file: it must never brick config load (and thus the whole CLI).
-    // Atomic writes prevent torn files going forward; this covers external
-    // corruption or a file written by an older, non-atomic version.
-    const syncedConfig = path.join(Global.Path.config, "openscience-synced.json")
-    try {
-      // Atlas writes model-lockdown config (enabled_providers, per-provider
-      // whitelists, default model) for the hosted web agents, but on the CLI the
-      // only *managed* route is OpenRouter. Honour the OpenRouter managed catalog
-      // and the recommended default model; drop the rest UNCONDITIONALLY — the
-      // synced enabled_providers must never hide a locally-configured BYOK
-      // provider, regardless of the billing toggle. An open-source CLI shouldn't
-      // let a dashboard allowlist govern the user's own keys; enterprise lockdown
-      // stays available via admin-controlled managed config + disabled_providers.
-      // (A user's OWN enabled_providers in their config file still gates normally.)
-      const synced = await loadFile(syncedConfig)
-      const scoped: Partial<Config.Info> = {}
-      if (synced?.provider?.openrouter) scoped.provider = { openrouter: synced.provider.openrouter }
-      if (synced?.model) scoped.model = synced.model
-      // Merge synced UNDERNEATH the user's own config, not on top: it is the
-      // server's *recommendation* (default model, OpenRouter managed catalog),
-      // not a lockdown, so the user's config must win — otherwise their chosen
-      // default model and custom OpenRouter models are reverted on every sync
-      // (#159). mergeConfigConcatArrays(base, override) lets `override` win, so
-      // pass the user config (result) as the override. Model records still union,
-      // so server-whitelisted models the user didn't declare stay available.
-      // Enterprise lockdown is unaffected: the managed /etc layer merges LAST
-      // below and still wins over both.
-      result = mergeConfigConcatArrays(scoped as Config.Info, result)
-    } catch {
-      // treat an unreadable synced config as absent
+      const commands = await loadCommand(dir)
+      const agents = await loadAgent(dir)
+      const modes = await loadMode(dir)
+      const plugins = await loadPlugin(dir)
+      result.command = mergeDeep(result.command ?? {}, commands)
+      result.agent = mergeDeep(result.agent, agents)
+      result.agent = mergeDeep(result.agent, modes)
+      result.plugin.push(...plugins)
+      if (!local) {
+        execution.command = mergeDeep(execution.command ?? {}, commands)
+        execution.agent = mergeDeep(execution.agent ?? {}, agents)
+        execution.agent = mergeDeep(execution.agent, modes)
+        execution.plugin = [...(execution.plugin ?? []), ...plugins]
+      }
     }
 
     // Load managed config files LAST (highest priority) - enterprise admin-controlled.
     // Kept separate from directories array to avoid write operations when installing plugins
     // which would fail on system directories requiring elevated permissions
     // This way it only loads config file and not skills/plugins/commands.
-    // Must merge AFTER the dashboard-synced config: an admin policy in
-    // /etc (or /Library/...) must win over a per-user dashboard value, otherwise
-    // the synced config silently overrode the admin's "overrides all" contract.
+    // System policy remains the final authority on managed installations.
     if (existsSync(managedConfigDir)) {
       for (const file of CONFIG_FILES) {
-        result = mergeConfigConcatArrays(result, await loadFile(path.join(managedConfigDir, file)))
+        const managed = await loadFile(path.join(managedConfigDir, file))
+        result = mergeConfigConcatArrays(result, managed)
+        execution = mergeConfigConcatArrays(execution, managed)
       }
     }
 
@@ -241,15 +235,25 @@ export namespace Config {
         },
       })
     }
+    for (const [name, mode] of Object.entries(execution.mode ?? {})) {
+      execution.agent = mergeDeep(execution.agent ?? {}, {
+        [name]: {
+          ...mode,
+          mode: "primary" as const,
+        },
+      })
+    }
 
     if (Flag.OPENSCIENCE_PERMISSION) {
       result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENSCIENCE_PERMISSION))
+      execution.permission = mergeDeep(execution.permission ?? {}, JSON.parse(Flag.OPENSCIENCE_PERMISSION))
     }
 
     // Backwards compatibility: legacy top-level `tools` config
-    if (result.tools) {
+    for (const target of [result, execution]) {
+      if (!target.tools) continue
       const perms: Record<string, Config.PermissionAction> = {}
-      for (const [tool, enabled] of Object.entries(result.tools)) {
+      for (const [tool, enabled] of Object.entries(target.tools)) {
         const action: Config.PermissionAction = enabled ? "allow" : "deny"
         if (tool === "write" || tool === "edit" || tool === "patch" || tool === "multiedit") {
           perms.edit = action
@@ -257,7 +261,7 @@ export namespace Config {
         }
         perms[tool] = action
       }
-      result.permission = mergeDeep(perms, result.permission ?? {})
+      target.permission = mergeDeep(perms, target.permission ?? {})
     }
 
     if (!result.username) result.username = os.userInfo().username
@@ -273,34 +277,25 @@ export namespace Config {
     }
 
     result.plugin = deduplicatePlugins(result.plugin ?? [])
+    execution.plugin = deduplicatePlugins(execution.plugin ?? [])
 
     return {
       config: result,
+      execution,
       directories,
+      executableDirectories: directories.filter((dir) => !projectSet.has(path.resolve(dir))),
+      globalRevision: revision,
     }
-  })
+  }
 
-  export async function installDependencies(dir: string) {
-    const pkg = path.join(dir, "package.json")
+  const cachedState = Instance.state(loadState)
 
-    if (!(await Bun.file(pkg).exists())) {
-      await Bun.write(pkg, "{}")
+  export async function state() {
+    while (true) {
+      const current = await cachedState()
+      if (current.globalRevision === globalRevision) return current
+      State.clear(Instance.directory, loadState)
     }
-
-    const gitignore = path.join(dir, ".gitignore")
-    const hasGitIgnore = await Bun.file(gitignore).exists()
-    if (!hasGitIgnore) await Bun.write(gitignore, ["node_modules", "package.json", "bun.lock", ".gitignore"].join("\n"))
-
-    await BunProc.run(
-      ["add", "@synsci/plugin@" + (Installation.isLocal() ? "latest" : Installation.VERSION), "--exact"],
-      {
-        cwd: dir,
-      },
-    ).catch(() => {})
-
-    // Install any additional dependencies defined in the package.json
-    // This allows local plugins and custom tools to use external packages
-    await BunProc.run(["install"], { cwd: dir }).catch(() => {})
   }
 
   function rel(item: string, patterns: string[]) {
@@ -552,7 +547,13 @@ export namespace Config {
   export const McpRemote = z
     .object({
       type: z.literal("remote").describe("Type of MCP server connection"),
-      url: z.string().describe("URL of the remote MCP server"),
+      url: z
+        .string()
+        .refine(McpRemoteUrl.validEndpoint, {
+          message:
+            "Remote MCP URLs require HTTPS (loopback HTTP allowed) and must not contain credentials or query data",
+        })
+        .describe("HTTPS URL of the remote MCP server"),
       enabled: z.boolean().optional().describe("Enable or disable the MCP server on startup"),
       headers: z.record(z.string(), z.string()).optional().describe("Headers to send with the request"),
       oauth: z
@@ -575,6 +576,191 @@ export namespace Config {
 
   export const Mcp = z.discriminatedUnion("type", [McpLocal, McpRemote])
   export type Mcp = z.infer<typeof Mcp>
+  export const MCP_SECRET_MASK = "••••••••"
+
+  function redactRecord(value: Record<string, string> | undefined) {
+    if (!value) return undefined
+    return Object.fromEntries(Object.keys(value).map((key) => [key, MCP_SECRET_MASK]))
+  }
+
+  function restoreRecord(
+    value: Record<string, string> | undefined,
+    previous: Record<string, string> | undefined,
+    label: string,
+  ) {
+    if (!value) return undefined
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => {
+        if (entry !== MCP_SECRET_MASK) return [key, entry]
+        const stored = previous?.[key]
+        if (stored === undefined) throw new Error(`Replace the masked value for ${label}.${key} before saving`)
+        return [key, stored]
+      }),
+    )
+  }
+
+  export function redactMcp(value: Mcp): Mcp {
+    if (value.type === "local") {
+      return {
+        ...value,
+        environment: redactRecord(value.environment),
+      }
+    }
+    const oauth =
+      value.oauth && typeof value.oauth === "object"
+        ? {
+            ...value.oauth,
+            clientSecret: value.oauth.clientSecret ? MCP_SECRET_MASK : undefined,
+          }
+        : value.oauth
+    return {
+      ...value,
+      headers: redactRecord(value.headers),
+      oauth,
+    }
+  }
+
+  export function restoreMcp(value: Mcp, previous?: Mcp): Mcp {
+    if (value.type === "local") {
+      const sameCommand =
+        previous?.type === "local" && JSON.stringify(previous.command) === JSON.stringify(value.command)
+      const stored = sameCommand ? previous.environment : undefined
+      return {
+        ...value,
+        environment: restoreRecord(value.environment, stored, "environment"),
+      }
+    }
+    const stored = (() => {
+      if (previous?.type !== "remote") return undefined
+      try {
+        return McpRemoteUrl.endpoint(previous.url).toString() === McpRemoteUrl.endpoint(value.url).toString()
+          ? previous
+          : undefined
+      } catch {
+        return undefined
+      }
+    })()
+    const oauth = (() => {
+      if (!value.oauth || typeof value.oauth !== "object") return value.oauth
+      if (value.oauth.clientSecret !== MCP_SECRET_MASK) return value.oauth
+      const secret =
+        stored?.oauth && typeof stored.oauth === "object" && stored.oauth.clientId === value.oauth.clientId
+          ? stored.oauth.clientSecret
+          : undefined
+      if (!secret) throw new Error("Replace the masked value for oauth.clientSecret before saving")
+      return {
+        ...value.oauth,
+        clientSecret: secret,
+      }
+    })()
+    return {
+      ...value,
+      headers: restoreRecord(value.headers, stored?.headers, "headers"),
+      oauth,
+    }
+  }
+
+  // Provider blocks carry the user's own keys and auth headers. The served
+  // config has {env:…} references already resolved, so they must never leave
+  // the process in the clear.
+  // Works on the raw record rather than a parsed Provider so a block the strict
+  // schema rejects still cannot slip its key through unredacted.
+  function stringRecord(value: unknown): Record<string, string> | undefined {
+    if (!isRecord(value)) return undefined
+    return Object.fromEntries(Object.entries(value).filter(([, entry]) => typeof entry === "string")) as Record<
+      string,
+      string
+    >
+  }
+
+  function mapProviderSecrets(
+    entry: unknown,
+    secret: (value: string) => string | undefined,
+    record: (value: Record<string, string>) => Record<string, string>,
+  ): unknown {
+    if (!isRecord(entry)) return entry
+    const result: Record<string, unknown> = { ...entry }
+    if (isRecord(entry.options)) {
+      const options: Record<string, unknown> = { ...entry.options }
+      if (typeof options.apiKey === "string" && options.apiKey) {
+        const next = secret(options.apiKey)
+        if (next === undefined) delete options.apiKey
+        else options.apiKey = next
+      }
+      const headers = stringRecord(options.headers)
+      if (headers) options.headers = record(headers)
+      result.options = options
+    }
+    if (isRecord(entry.models)) {
+      result.models = Object.fromEntries(
+        Object.entries(entry.models).map(([id, model]) => {
+          if (!isRecord(model)) return [id, model]
+          const headers = stringRecord(model.headers)
+          return [id, headers ? { ...model, headers: record(headers) } : model]
+        }),
+      )
+    }
+    return result
+  }
+
+  function redactProvider(entry: unknown) {
+    return mapProviderSecrets(
+      entry,
+      () => MCP_SECRET_MASK,
+      (headers) => redactRecord(headers) ?? {},
+    )
+  }
+
+  // A masked provider secret means "leave what is on disk alone". Dropping it
+  // from the patch keeps the file's own form, whether a literal or an {env:…}
+  // reference, where copying the resolved value back would leak the literal.
+  function restoreProvider(entry: unknown) {
+    return mapProviderSecrets(
+      entry,
+      (value) => (value === MCP_SECRET_MASK ? undefined : value),
+      (headers) => Object.fromEntries(Object.entries(headers).filter(([, value]) => value !== MCP_SECRET_MASK)),
+    )
+  }
+
+  function mapProviders(value: Info, map: (entry: unknown) => unknown): Info {
+    if (!value.provider) return value
+    return {
+      ...value,
+      provider: Object.fromEntries(
+        Object.entries(value.provider).map(([id, entry]) => [id, map(entry)]),
+      ) as Info["provider"],
+    }
+  }
+
+  export function redact(value: Info): Info {
+    const withProviders = mapProviders(value, redactProvider)
+    if (!withProviders.mcp) return withProviders
+    return {
+      ...withProviders,
+      mcp: Object.fromEntries(
+        Object.entries(withProviders.mcp).map(([name, entry]) => {
+          const parsed = Mcp.safeParse(entry)
+          return [name, parsed.success ? redactMcp(parsed.data) : entry]
+        }),
+      ),
+    }
+  }
+
+  export function restore(value: Info, previous: Info): Info {
+    const withProviders = mapProviders(value, restoreProvider)
+    if (!withProviders.mcp) return withProviders
+    return {
+      ...withProviders,
+      mcp: Object.fromEntries(
+        Object.entries(withProviders.mcp).map(([name, entry]) => {
+          const parsed = Mcp.safeParse(entry)
+          if (!parsed.success) return [name, entry]
+          const stored = Mcp.safeParse(previous.mcp?.[name])
+          return [name, restoreMcp(parsed.data, stored.success ? stored.data : undefined)]
+        }),
+      ),
+    }
+  }
 
   export const PermissionAction = z.enum(["ask", "allow", "deny"]).meta({
     ref: "PermissionActionConfig",
@@ -650,12 +836,12 @@ export namespace Config {
         .boolean()
         .optional()
         .describe(
-          "Run the agent's shell commands inside an OS sandbox (macOS Seatbelt / Linux bubblewrap) that confines writes to the workspace. Off by default.",
+          "Run local terminals, kernels, and shell commands inside an OS sandbox (macOS Seatbelt / Linux bubblewrap) that confines writes to authorized project roots. Enabled by default; an explicit false selects full host access.",
         ),
       network: z
         .enum(["allow", "deny"])
         .optional()
-        .describe("Whether sandboxed commands may reach the network. Default: allow."),
+        .describe("Whether sandboxed commands may reach the network. Default: deny."),
       allowWrite: z
         .array(z.string())
         .optional()
@@ -664,7 +850,13 @@ export namespace Config {
         .enum(["warn", "error", "allow"])
         .optional()
         .describe(
-          "Behaviour when no sandbox backend exists on this platform: 'warn' (default) runs unsandboxed with a notice, 'error' refuses to run the command, 'allow' runs unsandboxed silently.",
+          "Behaviour when no sandbox backend exists on this platform: 'error' (default) refuses to run, 'warn' runs unsandboxed with a notice, and 'allow' runs unsandboxed silently.",
+        ),
+      requireProjectTrust: z
+        .boolean()
+        .optional()
+        .describe(
+          "Require explicit project trust before any execution, even when a verified OS sandbox is available. Default: false.",
         ),
     })
     .meta({
@@ -683,12 +875,26 @@ export namespace Config {
 
   export const Skills = z.object({
     paths: z.array(z.string()).optional().describe("Additional paths to skill folders"),
+    disabled: z
+      .array(z.string().min(1))
+      .optional()
+      .describe(
+        "Skills excluded from agent discovery and loading. Does not change skill permissions or uninstall files.",
+      ),
   })
   export type Skills = z.infer<typeof Skills>
 
   export const Agent = z
     .object({
       model: z.string().optional(),
+      variant: z
+        .string()
+        .optional()
+        .describe("Model variant (reasoning effort) used when this agent runs on its own configured model"),
+      skills: z
+        .array(z.string())
+        .optional()
+        .describe("Skill categories indexed in this agent's <domain-skills> block (specialist agents)"),
       temperature: z.number().optional(),
       top_p: z.number().optional(),
       prompt: z.string().optional(),
@@ -720,6 +926,8 @@ export namespace Config {
       const knownKeys = new Set([
         "name",
         "model",
+        "variant",
+        "skills",
         "prompt",
         "description",
         "temperature",
@@ -982,14 +1190,43 @@ export namespace Config {
                 .number()
                 .int()
                 .positive()
+                .max(2_147_483_647)
                 .describe(
-                  "Timeout in milliseconds for requests to this provider. Default is 300000 (5 minutes). Set to false to disable timeout.",
+                  "Optional total wall-clock timeout in milliseconds for a provider request. No total timeout is applied by default; active long-running generations are allowed to finish.",
                 ),
-              z.literal(false).describe("Disable timeout for this provider entirely."),
+              z.literal(false).describe("Explicitly disable the optional total wall-clock timeout."),
             ])
             .optional()
             .describe(
-              "Timeout in milliseconds for requests to this provider. Default is 300000 (5 minutes). Set to false to disable timeout.",
+              "Optional total wall-clock timeout in milliseconds for a provider request. No total timeout is applied by default. The response stays open until completion, explicit cancellation, or a configured deadline; connectTimeout separately bounds the wait for response headers.",
+            ),
+          idleTimeout: z
+            .union([
+              z
+                .number()
+                .int()
+                .positive()
+                .max(2_147_483_647)
+                .describe(
+                  "Maximum provider response-body inactivity in milliseconds; resets on every body chunk, including keepalives and streamed private reasoning. Remote endpoints, including the managed Ace gateway, default to 600000 (10 minutes); local endpoints default to disabled.",
+                ),
+              z.literal(false).describe("Disable the provider inactivity watchdog."),
+            ])
+            .optional()
+            .describe(
+              "Maximum provider response-body inactivity in milliseconds. Remote endpoints, including the managed Ace gateway, default to 600000 (10 minutes); local endpoints (loopback or .local base URLs and bundled local providers) default to disabled. Set false to disable.",
+            ),
+          connectTimeout: z
+            .union([z.number().int().positive().max(2_147_483_647), z.literal(false)])
+            .optional()
+            .describe(
+              "Maximum wait for provider response headers in milliseconds, including connection setup and upstream admission. Defaults to 300000 (5 minutes), to 600000 (10 minutes) for the managed Ace gateway, which sends headers only once the upstream body begins, and to disabled for local endpoints (loopback or .local base URLs and the ollama, lmstudio, llamacpp, vllm and jan providers), which send headers only after prompt processing. Set false to disable.",
+            ),
+          outputIdleTimeout: z
+            .union([z.number().int().positive().max(2_147_483_647), z.literal(false)])
+            .optional()
+            .describe(
+              "Optional maximum wait for new readable model output or tool-call activity in milliseconds. Disabled by default because providers can reason without publishing text. When configured, transport keepalives do not reset it; tool execution and local processing suspend it. Set false to disable.",
             ),
         })
         .catchall(z.any())
@@ -1008,10 +1245,7 @@ export namespace Config {
       keybinds: Keybinds.optional().describe("Custom keybind configurations"),
       logLevel: Log.Level.optional().describe("Log level"),
       server: Server.optional().describe("Server configuration for openscience serve and web commands"),
-      command: z
-        .record(z.string(), Command)
-        .optional()
-        .describe("Command configuration, see https://syntheticsciences.ai/docs/commands"),
+      command: z.record(z.string(), Command).optional().describe("Command configuration"),
       skills: Skills.optional().describe("Additional skill folder paths"),
       watcher: z
         .object({
@@ -1042,6 +1276,27 @@ export namespace Config {
         .describe(
           "Default agent to use when none is specified. Must be a primary agent. Falls back to 'research' if not set or if the specified agent is invalid.",
         ),
+      subagent_depth: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("How many levels of subagents a session may nest (default 1: only the lead dispatches workers)"),
+      harness: z
+        .object({
+          "headless-policy": z.boolean().optional(),
+          redirect: z.boolean().optional(),
+          deliverables: z.boolean().optional(),
+          budget: z.boolean().optional(),
+          cost: z
+            .union([z.boolean(), z.object({ max_usd: z.number().positive().optional() })])
+            .optional()
+            .describe("Spend visibility beside the time budget; an optional soft ceiling injects a wrap-up reminder"),
+          "durable-jobs": z.boolean().optional(),
+          workers: z.boolean().optional(),
+        })
+        .optional()
+        .describe("Harness units, each on by default; set one to false to remove its behaviour"),
       billing: z
         .object({
           llm: z
@@ -1049,19 +1304,18 @@ export namespace Config {
             .nullable()
             .optional()
             .describe(
-              "How LLM inference is paid for. 'managed' routes through the Atlas wallet (metered credits); 'byok' uses your own provider API keys or first-party OAuth (ChatGPT/Claude Pro/Copilot) and is never billed. Unset or null = auto-detect from the resolved credential.",
+              "How LLM inference is paid for. 'managed' pays from the purchased Wallet; 'byok' uses only user-owned keys, subscriptions, or local models.",
             ),
           compute: z
-            .enum(["managed", "byok"])
+            .literal("byok")
             .optional()
+            .catch("byok")
             .describe(
-              "How GPU/compute is paid for. 'managed' runs on Atlas-provisioned compute billed to your wallet (via the bundled atlas CLI); 'byok' uses your own connected GPU providers (Modal, Tinker, TensorPool, …). Unset = byok.",
+              "@deprecated Retained so existing 2.x config files keep parsing. Compute always uses user-owned routes.",
             ),
         })
         .optional()
-        .describe(
-          "Managed (Atlas wallet) vs bring-your-own-key spend, toggled independently for LLM inference and compute.",
-        ),
+        .describe("Provider access configuration for Ace or user-owned credentials."),
       username: z
         .string()
         .optional()
@@ -1088,7 +1342,7 @@ export namespace Config {
         })
         .catchall(Agent)
         .optional()
-        .describe("Agent configuration, see https://syntheticsciences.ai/docs/agents"),
+        .describe("Agent configuration"),
       provider: z
         .record(z.string(), Provider)
         .optional()
@@ -1176,7 +1430,7 @@ export namespace Config {
             .min(0)
             .max(1)
             .optional()
-            .describe("Compact when context exceeds this fraction of the model window (default: 0.75)"),
+            .describe("@deprecated Ignored. Automatic compaction uses the model's usable context capacity."),
           fallbackContext: z
             .number()
             .int()
@@ -1197,39 +1451,19 @@ export namespace Config {
             .describe(
               "Token budget for the verbatim recent tail during compaction (default: clamp(0.20*usable, 8000, 32000))",
             ),
+          recentImages: z
+            .number()
+            .int()
+            .nonnegative()
+            .optional()
+            .describe(
+              "How many recent images travel in full with each model request; once the cap is exceeded the older half are released together and become text placeholders that can be read again (default: 20)",
+            ),
         })
         .optional(),
       experimental: z
         .object({
-          hook: z
-            .object({
-              file_edited: z
-                .record(
-                  z.string(),
-                  z
-                    .object({
-                      command: z.string().array(),
-                      environment: z.record(z.string(), z.string()).optional(),
-                    })
-                    .array(),
-                )
-                .optional(),
-              session_completed: z
-                .object({
-                  command: z.string().array(),
-                  environment: z.record(z.string(), z.string()).optional(),
-                })
-                .array()
-                .optional(),
-            })
-            .optional(),
-          chatMaxRetries: z.number().optional().describe("Number of retries for chat completions on failure"),
-          disable_paste_summary: z.boolean().optional(),
           batch_tool: z.boolean().optional().describe("Enable the batch tool"),
-          openTelemetry: z
-            .boolean()
-            .optional()
-            .describe("Enable OpenTelemetry spans for AI SDK calls (using the 'experimental_telemetry' flag)"),
           primary_tools: z
             .array(z.string())
             .optional()
@@ -1269,10 +1503,30 @@ export namespace Config {
       })
         .then(async (mod) => {
           const { provider, model, ...rest } = mod.default
-          if (provider && model) result.model = `${provider}/${model}`
-          result["$schema"] = "https://syntheticsciences.ai/config.json"
-          result = mergeDeep(result, rest)
-          await Bun.write(path.join(Global.Path.config, "config.json"), JSON.stringify(result, null, 2))
+          const files = ["config.json", "openscience.json", "openscience.jsonc"].map((name) =>
+            path.join(Global.Path.config, name),
+          )
+          await CredentialLifecycle.serialized(async () => {
+            // Re-read every source under the shared config lease. The initial
+            // lazy-load snapshot may be stale if another process wrote MCP
+            // authority while the TOML module was loading.
+            let current: Info = {}
+            for (const file of files) {
+              const raw = await fs.readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
+                if (error.code === "ENOENT") return undefined
+                throw error
+              })
+              if (!raw) continue
+              const protectedText = await sealedConfigText(raw, file)
+              if (protectedText !== raw) await durableConfigWrite(file, protectedText)
+              current = mergeDeep(current, await McpSecretStorage.reveal(parseConfig(protectedText, file)))
+            }
+            if (provider && model) current.model = `${provider}/${model}`
+            result = mergeDeep(current, rest)
+            const target = path.join(Global.Path.config, "config.json")
+            const protectedText = await sealedConfigText(JSON.stringify(result, null, 2), target)
+            await durableConfigWrite(target, protectedText)
+          })
           await fs.unlink(legacy)
         })
         .catch(() => {})
@@ -1290,54 +1544,129 @@ export namespace Config {
         throw new JsonError({ path: filepath }, { cause: err })
       })
     if (!text) return {}
+    text = await protectConfigText(text, filepath)
+    if (!text) return {}
     return load(text, filepath)
   }
 
-  async function load(text: string, configFilepath: string) {
-    const original = text
-    text = text.replace(/\{env:([^}]+)\}/g, (_, varName) => {
-      return process.env[varName] || ""
-    })
-
-    const fileMatches = text.match(/\{file:[^}]+\}/g)
-    if (fileMatches) {
-      const configDir = path.dirname(configFilepath)
-      const lines = text.split("\n")
-
-      for (const match of fileMatches) {
-        const lineIndex = lines.findIndex((line) => line.includes(match))
-        if (lineIndex !== -1 && lines[lineIndex].trim().startsWith("//")) {
-          continue // Skip if line is commented
-        }
-        let filePath = match.replace(/^\{file:/, "").replace(/\}$/, "")
-        if (filePath.startsWith("~/")) {
-          filePath = path.join(os.homedir(), filePath.slice(2))
-        }
-        const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve(configDir, filePath)
-        const fileContent = (
-          await Bun.file(resolvedPath)
-            .text()
-            .catch((error) => {
-              const errMsg = `bad file reference: "${match}"`
-              if (error.code === "ENOENT") {
-                throw new InvalidError(
-                  {
-                    path: configFilepath,
-                    message: errMsg + ` ${resolvedPath} does not exist`,
-                  },
-                  { cause: error },
-                )
-              }
-              throw new InvalidError({ path: configFilepath, message: errMsg }, { cause: error })
-            })
-        ).trim()
-        // escape newlines/quotes, strip outer quotes
-        text = text.replace(match, JSON.stringify(fileContent).slice(1, -1))
-      }
-    }
-
+  async function sealedConfigText(text: string, filepath: string): Promise<string> {
     const errors: JsoncParseError[] = []
-    const data = parseJsonc(text, errors, { allowTrailingComma: true })
+    const value = parseJsonc(text, errors, { allowTrailingComma: true }) as unknown
+    if (errors.length || !value || typeof value !== "object" || Array.isArray(value)) return text
+    let result = text
+    for (const item of McpSecretStorage.paths(value)) {
+      const sealed = await McpSecretStorage.seal(item.value, item.context)
+      if (sealed === item.value) continue
+      result = applyEdits(
+        result,
+        modify(result, item.path, sealed, {
+          formattingOptions: { insertSpaces: true, tabSize: 2 },
+        }),
+      )
+    }
+    if (result === text) return text
+
+    const checked = parseJsonc(result, [], { allowTrailingComma: true }) as unknown
+    const revealed = await McpSecretStorage.reveal(checked)
+    const expected = Object.fromEntries(
+      await Promise.all(
+        McpSecretStorage.paths(value).map(async (item) => [
+          item.path.join("\u0000"),
+          await McpSecretStorage.open(item.value, item.context),
+        ]),
+      ),
+    )
+    const actual = Object.fromEntries(
+      McpSecretStorage.paths(revealed).map((item) => [item.path.join("\u0000"), item.value]),
+    )
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new JsonError({ path: filepath, message: "Encrypted MCP fields did not round-trip exactly" })
+    }
+    return result
+  }
+
+  async function durableConfigWrite(filepath: string, text: string): Promise<void> {
+    const parsed = parseConfig(text, filepath)
+    await McpSecretStorage.reveal(parsed).catch((error) => {
+      throw new JsonError({ path: filepath, message: "An encrypted MCP field could not be verified" }, { cause: error })
+    })
+    await fs.mkdir(path.dirname(filepath), { recursive: true })
+    const temporary = `${filepath}.${process.pid}.${crypto.randomUUID()}.tmp`
+    try {
+      const handle = await fs.open(temporary, "wx", 0o600)
+      await handle
+        .writeFile(text, "utf8")
+        .then(() => handle.chmod(0o600))
+        .then(() => handle.sync())
+        .finally(() => handle.close())
+      const persisted = await fs.readFile(temporary, "utf8")
+      if (persisted !== text) throw new Error("Config candidate changed before commit")
+      await McpSecretStorage.reveal(parseConfig(persisted, filepath))
+      await fs.rename(temporary, filepath)
+      if (process.platform !== "win32") {
+        const directory = await fs.open(path.dirname(filepath), "r")
+        await directory.sync().finally(() => directory.close())
+      }
+    } catch (error) {
+      await fs.rm(temporary, { force: true }).catch(() => undefined)
+      throw error
+    }
+  }
+
+  async function protectConfigText(text: string, filepath: string): Promise<string | undefined> {
+    if ((await sealedConfigText(text, filepath)) === text) return text
+    // Re-read under the same cross-process lease used by every config RMW.
+    // Computing from the pre-lease snapshot could overwrite a sibling setMcp
+    // that landed between read and migration.
+    return CredentialLifecycle.serialized(async () => {
+      const current = await fs.readFile(filepath, "utf8").catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined
+        throw error
+      })
+      if (current === undefined) return undefined
+      const protectedText = await sealedConfigText(current, filepath)
+      if (protectedText !== current) await durableConfigWrite(filepath, protectedText)
+      return protectedText
+    })
+  }
+
+  async function resolveReferences(value: unknown, configFilepath: string): Promise<unknown> {
+    if (typeof value === "string") {
+      let resolved = value.replace(/\{env:([^}]+)\}/g, (_, varName: string) => process.env[varName] || "")
+      const matches = [...resolved.matchAll(/\{file:([^}]+)\}/g)]
+      for (const match of matches) {
+        const reference = match[0]
+        let filePath = match[1]
+        if (filePath.startsWith("~/")) filePath = path.join(os.homedir(), filePath.slice(2))
+        const absolute = path.isAbsolute(filePath) ? filePath : path.resolve(path.dirname(configFilepath), filePath)
+        const contents = await Bun.file(absolute)
+          .text()
+          .catch((error: NodeJS.ErrnoException) => {
+            const message = `bad file reference: "${reference}"`
+            if (error.code === "ENOENT") {
+              throw new InvalidError(
+                { path: configFilepath, message: `${message} ${absolute} does not exist` },
+                { cause: error },
+              )
+            }
+            throw new InvalidError({ path: configFilepath, message }, { cause: error })
+          })
+        resolved = resolved.replace(reference, contents.trim())
+      }
+      return resolved
+    }
+    if (Array.isArray(value)) return Promise.all(value.map((item) => resolveReferences(item, configFilepath)))
+    if (!value || typeof value !== "object") return value
+    return Object.fromEntries(
+      await Promise.all(
+        Object.entries(value).map(async ([key, item]) => [key, await resolveReferences(item, configFilepath)]),
+      ),
+    )
+  }
+
+  async function load(text: string, configFilepath: string) {
+    const errors: JsoncParseError[] = []
+    const raw = parseJsonc(text, errors, { allowTrailingComma: true })
     if (errors.length) {
       const lines = text.split("\n")
       const errorDetails = errors
@@ -1360,14 +1689,13 @@ export namespace Config {
       })
     }
 
-    const parsed = Info.safeParse(data)
+    // Bound MCP envelopes intentionally use the literal, persisted authority
+    // representation as associated data. Reveal them before expanding
+    // `{env:...}` / `{file:...}` references so a legitimate reference-backed
+    // URL, client ID, scope, or local command cannot change the seal context.
+    const revealed = await McpSecretStorage.reveal(raw)
+    const parsed = Info.safeParse(await resolveReferences(revealed, configFilepath))
     if (parsed.success) {
-      if (!parsed.data.$schema) {
-        parsed.data.$schema = "https://syntheticsciences.ai/config.json"
-        // Write the $schema to the original text to preserve variables like {env:VAR}
-        const updated = original.replace(/^\s*\{/, '{\n  "$schema": "https://syntheticsciences.ai/config.json",')
-        await Bun.write(configFilepath, updated).catch(() => {})
-      }
       const data = parsed.data
       if (data.plugin) {
         for (let i = 0; i < data.plugin.length; i++) {
@@ -1415,6 +1743,72 @@ export namespace Config {
     return state().then((x) => x.config)
   }
 
+  export async function getExecution() {
+    const current = await state()
+    if (await ProjectTrust.allowed(Instance.project)) return current.config
+    return {
+      ...current.config,
+      command: current.execution.command,
+      agent: current.execution.agent,
+      mode: current.execution.mode,
+      default_agent: current.execution.default_agent,
+      permission: current.execution.permission,
+      tools: current.execution.tools,
+      plugin: current.execution.plugin,
+      mcp: current.execution.mcp,
+      formatter: current.execution.formatter,
+      lsp: current.execution.lsp,
+      skills: current.execution.skills,
+      provider: current.execution.provider,
+    }
+  }
+
+  /**
+   * Whether a named executable setting is supplied or changed by project
+   * config. This provenance is kept separate from getExecution(): callers with
+   * cached formatter/LSP definitions still need to re-check trust after a
+   * project is revoked.
+   */
+  export async function projectControls(section: "formatter" | "lsp", name: string) {
+    const current = await state()
+    const value = (config: Info) => {
+      const entries = config[section]
+      if (entries === false) return false
+      return entries?.[name]
+    }
+    return JSON.stringify(value(current.config)) !== JSON.stringify(value(current.execution))
+  }
+
+  /** Whether an exact provider token command entered through project-owned
+   * config. Unlike getExecution(), the baseline remains project-free after a
+   * project is trusted, so cached provider clients can keep enforcing trust at
+   * every later mint boundary. */
+  export async function projectControlsProviderToken(providerID: string, command: string) {
+    const current = await state()
+    const value = (config: Info) => config.provider?.[providerID]?.options?.tokenCommand
+    return value(current.config) === command && value(current.execution) !== command
+  }
+
+  /** Whether this exact plugin entry entered through project-owned config or a
+   * project-local plugin directory. The execution baseline contains only
+   * remote, global, custom-CLI, synced, and managed sources, so comparing the
+   * final deduplicated entries preserves provenance even when a local plugin
+   * overrides a global plugin with the same package name. */
+  export async function projectControlsPlugin(plugin: string) {
+    const current = await state()
+    const all = current.config.plugin ?? []
+    const trusted = current.execution.plugin ?? []
+    return all.includes(plugin) && !trusted.includes(plugin)
+  }
+
+  /** Whether an MCP definition entered through project-owned config. Kept as
+   * provenance so a tool object retained across revocation can re-check trust
+   * at its actual remote call boundary. */
+  export async function projectControlsMcp(name: string) {
+    const current = await state()
+    return JSON.stringify(current.config.mcp?.[name]) !== JSON.stringify(current.execution.mcp?.[name])
+  }
+
   export async function getGlobal() {
     return global()
   }
@@ -1425,9 +1819,31 @@ export namespace Config {
     // config, never as project config, so PATCH /config appeared to save but the
     // change vanished on the next Instance reload.
     const filepath = projectConfigFile()
-    const existing = await loadFile(filepath)
-    await Bun.write(filepath, JSON.stringify(mergeDeep(existing, config), null, 2))
-    await Instance.dispose()
+    // Read (and, for a legacy plaintext MCP config, migrate) before entering
+    // the update mutation. protectConfigText owns the same cross-process
+    // credential lease, so doing this inside `write` would self-deadlock.
+    await loadFile(filepath)
+    const write = async () => {
+      // Merge onto the file as written, not the loaded view: loading resolves
+      // {env:…} references and rewrites plugin specifiers, and writing that
+      // back would pin resolved secrets into a project file.
+      const before = await Bun.file(filepath)
+        .text()
+        .catch((err) => {
+          if (err.code === "ENOENT") return "{}"
+          throw new JsonError({ path: filepath }, { cause: err })
+        })
+      const existing = await McpSecretStorage.reveal(rawConfig(before, filepath))
+      const merged = mergeDeep(existing, config)
+      assertValid(merged, filepath)
+      const text = filepath.endsWith(".jsonc")
+        ? patchJsonc(before, await McpSecretStorage.protect(config))
+        : JSON.stringify(await McpSecretStorage.protect(merged), null, 2)
+      await durableConfigWrite(filepath, await sealedConfigText(text, filepath))
+      await Instance.dispose({ strict: config.mcp !== undefined })
+    }
+    if (config.mcp === undefined) return CredentialLifecycle.serialized(write)
+    return CredentialLifecycle.mutate("mcp-config.project-update", write)
   }
 
   function globalConfigFile() {
@@ -1463,7 +1879,14 @@ export namespace Config {
   }
 
   function patchJsonc(input: string, patch: unknown, path: string[] = []): string {
-    if (!isRecord(patch)) {
+    // Descend only into an existing object. Where the file holds a scalar
+    // (`"permission": "allow"`) or nothing, the patch value replaces the node
+    // whole; descending would ask jsonc-parser to index into a string.
+    const existing = path.length
+      ? findNodeAtLocation(parseTree(input) ?? { type: "null", offset: 0, length: 0 }, path)
+      : undefined
+    const descend = isRecord(patch) && (path.length === 0 || existing?.type === "object")
+    if (!descend) {
       const edits = modify(input, path, patch, {
         formattingOptions: {
           insertSpaces: true,
@@ -1473,47 +1896,121 @@ export namespace Config {
       return applyEdits(input, edits)
     }
 
-    return Object.entries(patch).reduce((result, [key, value]) => {
+    return Object.entries(patch as Record<string, unknown>).reduce((result, [key, value]) => {
       if (value === undefined) return result
       return patchJsonc(result, value, [...path, key])
     }, input)
   }
 
-  async function patchConfigPath(scope: Scope, target: string[], value: unknown) {
-    const filepath = scope === "global" ? globalConfigFile() : projectConfigFile()
-    const before = await Bun.file(filepath)
-      .text()
-      .catch((err) => {
-        if (err.code === "ENOENT") return "{}"
-        throw new JsonError({ path: filepath }, { cause: err })
-      })
-    const edits = modify(before, target, value, {
-      formattingOptions: {
-        insertSpaces: true,
-        tabSize: 2,
+  /**
+   * The file's own value, validated but not transformed. Schema transforms
+   * expand `"permission": "allow"` into an object and fill every keybind
+   * default; writing that view back would freeze defaults into the user's
+   * file and turn a scalar into an object the next patch cannot descend.
+   */
+  function rawConfig(text: string, filepath: string): Info {
+    parseConfig(text, filepath)
+    return (parseJsonc(text, [], { allowTrailingComma: true }) ?? {}) as Info
+  }
+
+  function assertValid(config: unknown, filepath: string) {
+    const parsed = Info.safeParse(config)
+    if (parsed.success) return
+    throw new InvalidError({ path: filepath, issues: parsed.error.issues })
+  }
+
+  /**
+   * Refresh per-project config after a GLOBAL write and announce it. Most
+   * global settings still dispose open project instances because their MCP,
+   * plugin, sandbox, formatter, or LSP state may need rebuilding. Narrow
+   * routing-only writes can preserve those instances: the revision carried by
+   * Config.state makes the new value visible to the next Config.get() without
+   * interrupting an active turn.
+   *
+   * The provider cache is dropped here too, and specifically BEFORE the
+   * announcement. Provider memoises the resolved provider/SDK map at module
+   * scope keyed only by directory + trust, which Instance.disposeAll() does
+   * not touch and this write does not change — so it outlives the write. The
+   * SPA refetches GET /provider the instant it sees `global.disposed`, and a
+   * refetch that lands in the gap re-memoises the PRE-write map (the key just
+   * added still missing, billing still reading managed) with nothing left to
+   * invalidate it afterwards. Announcing a disposal that the provider map has
+   * not honoured yet is the bug; the two belong together.
+   */
+  async function disposeGlobalInstances(options: { preserveInstances?: boolean; strict?: boolean } = {}) {
+    globalRevision++
+    if (!options.preserveInstances) {
+      if (options.strict) await Instance.disposeAll({ strict: true })
+      else await Instance.disposeAll().catch(() => undefined)
+    }
+    // Lazy because provider.ts imports Config — the same cycle-break
+    // provider/models.ts and openscience/index.ts already use to reach it.
+    // Best-effort like the disposal above: the config file is already written
+    // by the time this runs, so a throw here (e.g. provider module init
+    // failing) must not turn a landed write into a rejected one.
+    await import("../provider/provider")
+      .then((m) => m.Provider.invalidate())
+      .catch((e) =>
+        log.warn("failed to invalidate provider cache", { error: e instanceof Error ? e.message : String(e) }),
+      )
+    GlobalBus.emit("event", {
+      directory: "global",
+      payload: {
+        type: Event.Disposed.type,
+        properties: {},
       },
     })
-    const updated = applyEdits(before, edits)
-    await fs.mkdir(path.dirname(filepath), { recursive: true })
-    await Bun.write(filepath, updated)
-    const parsed = parseConfig(updated, filepath)
-    global.reset()
-    if (scope === "global") {
-      void Instance.disposeAll()
-        .catch(() => undefined)
-        .finally(() => {
-          GlobalBus.emit("event", {
-            directory: "global",
-            payload: {
-              type: Event.Disposed.type,
-              properties: {},
-            },
-          })
+  }
+
+  /**
+   * Config.updateGlobal is also the narrow write path for model selection and
+   * billing-route changes. Those values are consumed through Config.state (and
+   * Provider's separately invalidated memo), so the revision above is enough
+   * to make them visible immediately. Tearing down every project for these
+   * patches would interrupt active turns and reject unrelated approvals.
+   *
+   * Keep the allow-list deliberately small: MCP, provider definitions,
+   * plugins, permissions, sandboxing, formatters, LSP, and other runtime
+   * configuration still require the normal full instance rebuild.
+   */
+  function canPreserveInstances(config: Info) {
+    const refreshOnly = new Set<keyof Info>(["billing", "model", "small_model"])
+    return Object.keys(config).every(
+      (key) =>
+        refreshOnly.has(key as keyof Info) ||
+        (key === "skills" && Object.keys(config.skills ?? {}).every((field) => field === "disabled")),
+    )
+  }
+
+  async function patchConfigPath(scope: Scope, target: string[], value: unknown) {
+    const write = async () => {
+      const filepath = scope === "global" ? globalConfigFile() : projectConfigFile()
+      const before = await Bun.file(filepath)
+        .text()
+        .catch((err) => {
+          if (err.code === "ENOENT") return "{}"
+          throw new JsonError({ path: filepath }, { cause: err })
         })
-    } else {
-      await Instance.dispose()
+      const edits = modify(before, target, value, {
+        formattingOptions: {
+          insertSpaces: true,
+          tabSize: 2,
+        },
+      })
+      const updated = applyEdits(before, edits)
+      const protectedText = await sealedConfigText(updated, filepath)
+      await durableConfigWrite(filepath, protectedText)
+      const parsed = parseConfig(protectedText, filepath)
+      global.reset()
+      if (scope === "global") {
+        await disposeGlobalInstances({ strict: target[0] === "mcp" })
+      } else {
+        await Instance.dispose({ strict: target[0] === "mcp" })
+      }
+      return { config: parsed, path: filepath }
     }
-    return { config: parsed, path: filepath }
+    if (target[0] !== "mcp") return CredentialLifecycle.serialized(write)
+    return CredentialLifecycle.mutate(`mcp-config.patch:${target[1] ?? "root"}`, write)
   }
 
   export async function setMcp(name: string, mcp: Mcp, scope: Scope = "global") {
@@ -1549,7 +2046,10 @@ export namespace Config {
    * boundary, so an untrusted repo's `openscience.json` must not be able to weaken
    * or disable it. Managed (enterprise) config wins over the user's global config.
    */
-  export async function trustedSandbox(): Promise<Sandbox | undefined> {
+  export async function trustedSandboxPolicy(): Promise<{
+    config: Sandbox
+    managed: Sandbox
+  }> {
     const base = (await global()).sandbox
     let managed: Sandbox | undefined
     if (existsSync(managedConfigDir)) {
@@ -1557,8 +2057,23 @@ export namespace Config {
       for (const file of CONFIG_FILES) acc = mergeDeep(acc, await loadFile(path.join(managedConfigDir, file)))
       managed = acc.sandbox
     }
-    if (!base && !managed) return undefined
-    return { ...(base ?? {}), ...(managed ?? {}) }
+    const policy = { ...(base ?? {}), ...(managed ?? {}) }
+    return {
+      managed: managed ?? {},
+      config: {
+        // New installations start in the low-friction contained mode. `false`
+        // remains an explicit, durable Full access choice for existing users.
+        enabled: policy.enabled ?? true,
+        network: policy.network ?? "deny",
+        allowWrite: policy.allowWrite ?? [],
+        onUnavailable: policy.onUnavailable ?? "error",
+        requireProjectTrust: policy.requireProjectTrust ?? false,
+      },
+    }
+  }
+
+  export async function trustedSandbox(): Promise<Sandbox> {
+    return trustedSandboxPolicy().then((value) => value.config)
   }
 
   /** Merge a patch into the GLOBAL `sandbox` config block, JSONC-preserving. The
@@ -1592,23 +2107,15 @@ export namespace Config {
    *  removing keys, unlike the deep-merging updateGlobal). Validates that the
    *  content parses and matches the schema before writing. */
   export async function replaceGlobal(content: string) {
-    const filepath = globalConfigFile()
-    const parsed = parseConfig(content, filepath)
-    await fs.mkdir(path.dirname(filepath), { recursive: true })
-    await Bun.write(filepath, content)
-    global.reset()
-    void Instance.disposeAll()
-      .catch(() => undefined)
-      .finally(() => {
-        GlobalBus.emit("event", {
-          directory: "global",
-          payload: {
-            type: Event.Disposed.type,
-            properties: {},
-          },
-        })
-      })
-    return parsed
+    return CredentialLifecycle.mutate("mcp-config.replace-global", async () => {
+      const filepath = globalConfigFile()
+      const parsed = parseConfig(content, filepath)
+      const protectedText = await sealedConfigText(content, filepath)
+      await durableConfigWrite(filepath, protectedText)
+      global.reset()
+      await disposeGlobalInstances({ strict: true })
+      return parsed
+    })
   }
 
   function parseConfig(text: string, filepath: string): Info {
@@ -1645,47 +2152,61 @@ export namespace Config {
     })
   }
 
-  export async function updateGlobal(config: Info) {
-    const filepath = globalConfigFile()
-    const before = await Bun.file(filepath)
-      .text()
-      .catch((err) => {
-        if (err.code === "ENOENT") return "{}"
-        throw new JsonError({ path: filepath }, { cause: err })
+  export async function updateGlobal(config: Info, options: { preserveInstances?: boolean } = {}) {
+    const write = async () => {
+      const filepath = globalConfigFile()
+      const before = await Bun.file(filepath)
+        .text()
+        .catch((err) => {
+          if (err.code === "ENOENT") return "{}"
+          throw new JsonError({ path: filepath }, { cause: err })
+        })
+
+      const existing = await McpSecretStorage.reveal(rawConfig(before, filepath))
+      const merged = mergeDeep(existing, config)
+      assertValid(merged, filepath)
+      const next = await (async () => {
+        if (!filepath.endsWith(".jsonc")) {
+          const protectedMerged = await McpSecretStorage.protect(merged)
+          const protectedText = await sealedConfigText(JSON.stringify(protectedMerged, null, 2), filepath)
+          await durableConfigWrite(filepath, protectedText)
+          return parseConfig(protectedText, filepath)
+        }
+
+        // Patch only what the caller changed so comments and untouched
+        // values survive as written.
+        const updated = patchJsonc(before, await McpSecretStorage.protect(config))
+        const protectedText = await sealedConfigText(updated, filepath)
+        const result = parseConfig(protectedText, filepath)
+        await durableConfigWrite(filepath, protectedText)
+        return result
+      })()
+
+      global.reset()
+      await disposeGlobalInstances({
+        preserveInstances: options.preserveInstances ?? canPreserveInstances(config),
+        strict: config.mcp !== undefined,
       })
 
-    const next = await (async () => {
-      if (!filepath.endsWith(".jsonc")) {
-        const existing = parseConfig(before, filepath)
-        const merged = mergeDeep(existing, config)
-        await Bun.write(filepath, JSON.stringify(merged, null, 2))
-        return merged
+      if (config.skills?.disabled !== undefined) {
+        // Selection is read from live Config revision, so active work and
+        // terminals survive. Refresh catalogs without an instance teardown.
+        GlobalBus.emit("event", { directory: "global", payload: { type: "skill.updated", properties: {} } })
       }
 
-      const updated = patchJsonc(before, config)
-      const merged = parseConfig(updated, filepath)
-      await Bun.write(filepath, updated)
-      return merged
-    })()
-
-    global.reset()
-
-    void Instance.disposeAll()
-      .catch(() => undefined)
-      .finally(() => {
-        GlobalBus.emit("event", {
-          directory: "global",
-          payload: {
-            type: Event.Disposed.type,
-            properties: {},
-          },
-        })
-      })
-
-    return next
+      return McpSecretStorage.reveal(next)
+    }
+    if (config.mcp === undefined) return CredentialLifecycle.serialized(write)
+    return CredentialLifecycle.mutate("mcp-config.update-global", write)
   }
 
   export async function directories() {
     return state().then((x) => x.directories)
+  }
+
+  export async function executableDirectories() {
+    const current = await state()
+    if (await ProjectTrust.allowed(Instance.project)) return current.directories
+    return current.executableDirectories
   }
 }

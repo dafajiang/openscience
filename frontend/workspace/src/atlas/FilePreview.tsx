@@ -1,31 +1,85 @@
 import {
+  batch,
   createSignal,
-  createResource,
   createEffect,
   createMemo,
   onMount,
   onCleanup,
+  untrack,
   type JSX,
   Show,
   Switch,
   Match,
 } from "solid-js"
+import { createStore } from "solid-js/store"
 import { Portal } from "solid-js/web"
+import { useParams } from "@solidjs/router"
 import { Markdown } from "@synsci/ui/markdown"
 import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
-import { usePlatform } from "@/context/platform"
-import { FONT_MONO, FONT_SANS, FONT_CODE } from "@/styles/tokens"
 import { PdfViewer } from "@/science/renderers/documents/PdfViewer"
+import { ScienceArtifact } from "@/science/ScienceArtifact"
+import { detectScientificFile } from "@/science/files"
+import { ScientificDataView } from "@/science/formats/ScientificDataView"
+import { detectBiologicalFormat } from "@/science/formats/biological"
+import { BinaryScienceView } from "@/science/formats/BinaryScienceView"
+import { detectBinaryScienceFormat } from "@/science/formats/binary"
+import { DataTableView } from "@/data/DataTableView"
+import type { TableFormat } from "@/data/table"
+import { ManuscriptWorkbench } from "@/manuscript/ManuscriptWorkbench"
+import { parseManuscript } from "@/manuscript/model"
+import { artifactContext, createArtifactContext, resolveArtifactPath } from "@/artifacts/context"
+import { downloadBlob } from "@/artifacts/bytes"
+import { normalizeStoredArtifact, savedResultLabel } from "@/artifacts/store"
+import type { ArtifactInspection } from "@/science/renderers"
 import { toast } from "@/atlas/Toast"
-import { IconFile, IconX, IconCopy, IconDownload, IconBookOpen, IconBraces, IconRefresh } from "@/atlas/shared/Icon"
+import { showToast } from "@synsci/ui/toast"
+import { IconFile } from "@/atlas/shared/Icon"
+import { FileToolbar } from "@/atlas/FileToolbar"
+import { FileChromeProvider } from "@/atlas/file-chrome"
+import { uiStore } from "@/atlas/store/ui"
+import {
+  describeFile,
+  createFileRequestOwner,
+  fileRequestKey,
+  fileReadRetryDelay,
+  initialFileScope,
+  fileReadSession,
+  fileErrorMessage,
+  linkedFileTarget,
+  isMissingFileError,
+  missingFileFallback,
+  PDF_PREVIEW_LIMIT,
+  pdfPreviewMode,
+  readFile,
+  reconcileSavedDraft,
+  type FileData,
+  type FileKind,
+  type FileOpenScope,
+  type ResolvedFileScope,
+} from "@/atlas/file-viewer"
+import { LANG, extension as ext } from "@/atlas/files/artifact-thumb"
+import { resolveViewer } from "@/atlas/files/viewer-registry"
+import { NotebookDocument, type NotebookExecution } from "@/atlas/files/NotebookDocument"
+import { assetUrl, localAssetPath } from "@/utils/markdown-assets"
+import { discardFileDraft, recoverFileDraftState, rememberFileDraft } from "@/atlas/file-drafts"
+import { MarkdownDocument } from "@/atlas/MarkdownDocument"
+import { projectContains, rawFileQuery } from "@/utils/project-file"
+import { CodeEditor } from "@/atlas/CodeEditor"
+import { HTML_STYLESHEET_BYTES, htmlStylesheets, loadHtmlStylesheets, rewriteHtmlAssets } from "@/utils/html-assets"
+import "./FilePreview.css"
 
 /**
  * Slide-in SIDE PREVIEW pane for opening a file from the Files tree.
  *
  * A file's extension picks the renderer:
- *   .md / .markdown  → formatted markdown (@synsci/ui Markdown)
+ *   .md / .markdown  → formatted markdown (@synsci/ui Markdown); relative
+ *                      images resolve against the file's own directory via
+ *                      the backend /file/raw endpoint
+ *   .html / .htm     → sandboxed <iframe sandbox=""> document preview (no
+ *                      scripts, no same-origin access), with a Source toggle
  *   .pdf             → PdfViewer (pdfjs page rasterizer)
+ *   molecular/FASTA  → scientific artifact renderer, with editable source
  *   .tex / .latex    → highlighted LaTeX source (a .tex is a source FILE, not a
  *                      math expression — the KaTeX LatexView is reserved for
  *                      kind:"latex" math ARTIFACTS with a single math string)
@@ -37,460 +91,1089 @@ import { IconFile, IconX, IconCopy, IconDownload, IconBookOpen, IconBraces, Icon
  * click / the header × all close it.
  */
 
-const ext = (name: string): string => {
-  const i = name.lastIndexOf(".")
-  return i > 0 ? name.slice(i + 1).toLowerCase() : ""
+type Kind = FileKind
+
+interface ViewState {
+  source: boolean
+  draft: string
+  saved: string
+  saving: boolean
+  refresh: number
+  status: "loading" | "ready" | "interrupted" | "error"
+  data?: FileData
+  error?: Error
+  saveError?: string
+  revision?: string
+  conflict?: boolean
+  inspection?: ArtifactInspection
 }
 
-// Extension → shiki/highlight.js language id for the code fallback.
-const LANG: Record<string, string> = {
-  py: "python",
-  ts: "typescript",
-  tsx: "tsx",
-  js: "javascript",
-  jsx: "jsx",
-  mjs: "javascript",
-  cjs: "javascript",
-  json: "json",
-  jsonl: "json",
-  yaml: "yaml",
-  yml: "yaml",
-  toml: "toml",
-  ini: "ini",
-  cfg: "ini",
-  sh: "bash",
-  bash: "bash",
-  zsh: "bash",
-  rs: "rust",
-  go: "go",
-  swift: "swift",
-  java: "java",
-  kt: "kotlin",
-  rb: "ruby",
-  php: "php",
-  c: "c",
-  h: "c",
-  cpp: "cpp",
-  cc: "cpp",
-  hpp: "cpp",
-  cu: "cpp",
-  // .tex and friends are text/source files — highlight them as LaTeX source
-  // (shiki has a `latex` grammar). A full \documentclass document must never
-  // be fed to KaTeX (which only typesets a single math string → blank page).
-  tex: "latex",
-  latex: "latex",
-  sty: "latex",
-  cls: "latex",
-  bib: "latex",
-  css: "css",
-  scss: "scss",
-  html: "html",
-  xml: "xml",
-  svg: "xml",
-  sql: "sql",
-  r: "r",
-  jl: "julia",
-  lua: "lua",
-  dockerfile: "docker",
-  makefile: "makefile",
-  csv: "csv",
-  txt: "text",
-  log: "text",
+interface PdfState {
+  status: "idle" | "loading" | "ready" | "error"
+  bytes?: Uint8Array
+  error?: string
 }
 
-type Kind = "markdown" | "pdf" | "image" | "code" | "binary"
-
-type FileData = { content?: string; encoding?: string; mimeType?: string }
+interface HtmlState {
+  status: "idle" | "loading" | "ready"
+  value: string
+}
 
 /**
  * Inline file view — header (icon + name + subtitle + controls) over the
  * type-aware renderer body. This is the single source of truth for the
- * renderer dispatch; both the slide-in drawer (FilePreview, below) and the
- * center-pane document tabs mount it, so nothing about opening a file is
- * duplicated.
+ * renderer dispatch; both the contextual Files pane and the legacy slide-in
+ * drawer (FilePreview, below) mount it, so file rendering stays consistent.
  */
 export function FileView(props: {
   path: string
   directory?: string
+  sessionID?: string
+  scope?: FileOpenScope
   subtitle?: string
   onClose?: () => void
+  active?: boolean
+  writable?: boolean
+  onDirtyChange?: (dirty: boolean) => void
+  /** Explicit transport seam for embedding and component-level regression checks. */
+  services?: Pick<ReturnType<typeof useSDK>, "request" | "client" | "projectID" | "url">
 }): JSX.Element {
-  const sdk = useSDK()
-  const sync = useSync()
-  const platform = usePlatform()
-  const directory = () => props.directory || sync.project?.worktree || sync.data.path.directory || sdk.directory
-  const name = () => props.path.split("/").pop() || props.path
+  const production = props.services ? undefined : useSDK()
+  const sdk = props.services ?? production!
+  const sync = props.services ? undefined : useSync()
+  const params = props.services ? undefined : useParams()
+  const directory = () =>
+    props.directory || production?.directory || sync?.data.path.directory || sync?.project?.worktree || ""
+  const activeSessionID = () => props.sessionID ?? (params?.id && params.id !== "new" ? params.id : undefined)
+  const initialScope = () =>
+    initialFileScope(props.scope, { directory: directory(), path: props.path, sessionID: activeSessionID() })
+  const [resolvedScope, setResolvedScope] = createSignal<ResolvedFileScope>(initialScope())
+  const [resolvedPath, setResolvedPath] = createSignal(props.path)
+  const [resolvedWritable, setResolvedWritable] = createSignal<boolean>()
+  const [projectPreview, setProjectPreview] = createSignal(false)
+  let scopeIdentity = ""
+  createEffect(() => {
+    const next = [
+      sdk.url,
+      sdk.projectID,
+      props.scope ?? "project",
+      directory(),
+      props.path,
+      activeSessionID() ?? "",
+    ].join("\n")
+    if (next === scopeIdentity) return
+    scopeIdentity = next
+    batch(() => {
+      setResolvedScope(initialScope())
+      setResolvedPath(props.path)
+      setResolvedWritable(undefined)
+      setProjectPreview(false)
+    })
+  })
+  const requestPath = () =>
+    resolvedScope() === "session" ? resolvedPath() : resolveArtifactPath(directory(), resolvedPath())
+  const fileSessionID = () =>
+    fileReadSession({
+      scope: props.scope,
+      resolved: resolvedScope(),
+      directory: directory(),
+      path: requestPath(),
+      sessionID: activeSessionID(),
+    })
+  const name = () => resolvedPath().split("/").pop() || resolvedPath()
   const e = () => ext(name())
+  const owner = createMemo(() => ({
+    server: sdk.url,
+    projectID: sdk.projectID,
+    directory: directory(),
+    sessionID: activeSessionID(),
+    path: props.path,
+    target: requestPath(),
+    scope: props.scope,
+    projectPreview: projectPreview(),
+  }))
+  let mounted = true
+  onCleanup(() => (mounted = false))
 
-  // `showSource` flips rendered docs (md / tex) to their raw text; for code
-  // files it flips the read-only highlighted view into an editable textarea.
-  const [showSource, setShowSource] = createSignal(false)
-  const [draft, setDraft] = createSignal("")
-  const [savedText, setSavedText] = createSignal("")
-  const [saving, setSaving] = createSignal(false)
-  const [refreshKey, setRefreshKey] = createSignal(0)
+  const [view, setView] = createStore<ViewState>({
+    source: false,
+    draft: "",
+    saved: "",
+    saving: false,
+    refresh: 0,
+    status: "loading",
+  })
+  const [pdf, setPdf] = createStore<PdfState>({ status: "idle" })
+  const [htmlView, setHtmlView] = createStore<HtmlState>({ status: "idle", value: "" })
+  const request = createFileRequestOwner()
+  const readRetry = { key: "", count: 0 }
+  let readyKey = ""
+  let readyOwner: ReturnType<typeof owner> | undefined
+  let readRetryTimer: ReturnType<typeof setTimeout> | undefined
+  const pdfRequest = { current: 0 }
+  const pdfAbort = { current: undefined as AbortController | undefined }
+  const htmlRequest = { current: 0 }
+  const htmlAbort = { current: undefined as AbortController | undefined }
 
-  const [file] = createResource(
-    () => [directory(), props.path, refreshKey()] as const,
-    async ([dir, path]) => {
-      if (!dir || !path) return undefined
-      // Pass the params FLAT — the generated client maps `directory`/`path`
-      // into the query string; a `{ query: {...} }` wrapper is dropped and
-      // sends nothing. `directory` re-roots the backend Instance so any host
-      // file is readable by absolute directory + relative path (File.read).
-      const res: any = await sdk.client.file.read({ directory: dir, path })
-      return (res?.data ?? res) as FileData
-    },
-  )
+  createEffect(() => {
+    const dir = directory()
+    const path = requestPath()
+    const activeSession = fileSessionID()
+    const location = owner()
+    view.refresh
+    const key = fileRequestKey({
+      server: sdk.url,
+      projectID: sdk.projectID,
+      directory: dir,
+      sessionID: activeSession,
+      path,
+      projectPreview: projectPreview(),
+    })
+    if (readRetryTimer) {
+      clearTimeout(readRetryTimer)
+      readRetryTimer = undefined
+    }
+    if (readRetry.key !== key) {
+      readRetry.key = key
+      readRetry.count = 0
+    }
+    const ticket = request.begin(key)
+    // Read completion and editor state are outputs, not request dependencies:
+    // tracking them would launch another read when a refresh replaces data.
+    const retained = untrack(() => readyOwner === location && readyKey === key && view.status === "ready" && view.data)
+    if (retained) {
+      // A reconnect or explicit refresh must not blank a valid preview. Keep
+      // the rendered bytes and any unsaved draft while the replacement read
+      // happens in the background.
+      setView({ error: undefined })
+    } else {
+      readyKey = ""
+      setView({
+        status: "loading",
+        data: undefined,
+        error: undefined,
+        saveError: undefined,
+        source: false,
+        draft: "",
+        saved: "",
+        saving: false,
+        revision: undefined,
+        conflict: false,
+        inspection: undefined,
+      })
+    }
+    if (!dir || !path) {
+      setView({ status: "error", error: new Error("The file location is unavailable.") })
+      return
+    }
+    // Keep the project directory as the backend instance boundary. External
+    // absolute paths remain absolute and require a session filesystem grant.
+    void readFile(async () => {
+      const response = await sdk.client.file.read(
+        { path, sessionID: activeSession, ...(projectPreview() ? { projectPreview: "true" as const } : {}) },
+        { signal: ticket.controller.signal },
+      )
+      const envelope = response as unknown as { data?: FileData }
+      return envelope.data ?? (response as unknown as FileData)
+    }).then((result) => {
+      if (!request.owns(ticket, key) || owner() !== location) return
+      if (result.cancelled) {
+        const delay = fileReadRetryDelay(readRetry.count)
+        if (delay !== undefined) {
+          readRetry.count += 1
+          readRetryTimer = setTimeout(() => {
+            readRetryTimer = undefined
+            if (request.owns(ticket, key)) setView("refresh", (value) => value + 1)
+          }, delay)
+        } else if (readyKey !== key || view.status !== "ready" || !view.data) {
+          setView({ status: "interrupted", error: undefined, data: undefined })
+        } else {
+          // The last valid preview remains usable. Keep the transport detail in
+          // diagnostics rather than replacing the document with an error card.
+          console.warn("File preview transport remained interrupted after bounded retries", {
+            requestID: ticket.id,
+            requestKey: key,
+            retries: readRetry.count,
+          })
+        }
+        return
+      }
+      if (result.error) {
+        const fallback = missingFileFallback({
+          requested: props.scope ?? "project",
+          resolved: resolvedScope(),
+          error: result.error,
+        })
+        if (fallback) {
+          setResolvedScope(fallback)
+          return
+        }
+        const reference = resolvedPath()
+        const session = activeSessionID()
+        if (
+          (props.scope ?? "project") === "auto" &&
+          resolvedScope() === "project" &&
+          session &&
+          !projectPreview() &&
+          (isMissingFileError(result.error) || (result.denied && projectContains(dir, path)))
+        ) {
+          const originalError = result.error
+          void sdk
+            .request(
+              "/file/resolve",
+              { signal: ticket.controller.signal },
+              {
+                path: reference,
+                sessionID: session,
+                ...(result.denied ? { projectPreview: "true" } : {}),
+              },
+            )
+            .then(async (response) => {
+              if (!request.owns(ticket, key) || owner() !== location) return
+              if (!response.ok) throw new Error(await response.text())
+              const resolved = (await response.json()) as { path?: unknown; writable?: unknown; scope?: unknown }
+              if (!request.owns(ticket, key) || owner() !== location) return
+              if (
+                typeof resolved.path === "string" &&
+                resolved.path &&
+                (!result.denied || resolved.scope === "project")
+              ) {
+                batch(() => {
+                  if (typeof resolved.writable === "boolean") setResolvedWritable(resolved.writable)
+                  setProjectPreview(resolved.scope === "project")
+                  setResolvedPath(resolved.path as string)
+                })
+                return
+              }
+              setView({ status: "error", error: originalError, data: undefined })
+            })
+            .catch(() => {
+              if (request.owns(ticket, key) && owner() === location)
+                setView({ status: "error", error: originalError, data: undefined })
+            })
+          return
+        }
+        setView({ status: "error", error: result.error, data: undefined })
+        return
+      }
+      const data = result.data ?? {}
+      readRetry.count = 0
+      const text = data.encoding === "base64" ? "" : (data.content ?? "")
+      const recovered = recoverFileDraftState(
+        dir,
+        location.path,
+        text,
+        location.scope,
+        location.sessionID,
+        data.revision,
+        location.server,
+      )
+      const conflict = recovered.draft !== recovered.saved && recovered.revision !== data.revision
+      readyKey = key
+      readyOwner = location
+      setView({
+        status: "ready",
+        data,
+        error: undefined,
+        ...recovered,
+        conflict,
+        saveError: conflict
+          ? "This file changed on disk. Your edits are preserved; copy them before discarding and reloading the latest file."
+          : undefined,
+      })
+    })
+  })
 
-  const data = () => file()
+  onCleanup(() => {
+    if (readRetryTimer) clearTimeout(readRetryTimer)
+    request.dispose()
+  })
+
+  const data = () => view.data
+  const writable = () =>
+    projectPreview() || props.writable === false || resolvedWritable() === false
+      ? false
+      : (props.writable ?? resolvedWritable())
   const isBinary = () => data()?.encoding === "base64"
+  const truncated = () => data()?.truncated === true
   const mime = () => data()?.mimeType ?? ""
   const b64 = () => data()?.content ?? ""
   const dataUrl = () => `data:${mime() || "application/octet-stream"};base64,${b64()}`
-  const text = () => (!data() || isBinary() ? "" : (data()!.content ?? ""))
-  const dirty = () => draft() !== savedText()
+  const dirty = () => view.draft !== view.saved
+  createEffect(() => props.onDirtyChange?.(dirty()))
+  createEffect(() => {
+    if (view.status !== "ready") return
+    const location = owner()
+    if (readyOwner !== location) return
+    rememberFileDraft(
+      location.directory,
+      location.path,
+      view.draft,
+      view.saved,
+      location.scope,
+      location.sessionID,
+      view.revision,
+      location.server,
+    )
+  })
+  const scientific = createMemo(() => (isBinary() ? undefined : detectScientificFile(e(), view.draft)))
+  const biological = createMemo(() => (isBinary() ? undefined : detectBiologicalFormat(e())))
+  const binaryScience = createMemo(() => detectBinaryScienceFormat(e()))
+  const common = createMemo(() =>
+    resolveViewer({ name: name(), mimeType: mime(), encoding: data()?.encoding, content: view.draft }),
+  )
+  const tabular = createMemo<TableFormat | undefined>(() => common().table)
 
   const kind = createMemo<Kind>(() => {
-    const x = e()
     if (isBinary()) {
-      if (mime().startsWith("image/") || ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"].includes(x)) return "image"
-      if (mime() === "application/pdf" || x === "pdf") return "pdf"
+      if (common().kind === "image") return "image"
+      if (common().kind === "pdf") return "pdf"
+      if (binaryScience()) return "scientific-binary"
       return "binary"
     }
-    if (x === "md" || x === "markdown" || x === "mdx") return "markdown"
-    if (x === "pdf") return "pdf"
+    if (biological()) return "scientific-data"
+    if (scientific()) return "science"
+    if (common().kind === "markdown") return "markdown"
+    if (common().kind === "notebook") return "notebook"
+    if (common().kind === "html") return "html"
+    if (common().kind === "table") return "table"
+    if (common().kind === "pdf") return "pdf"
+    if (common().kind === "image") return "image"
+    if (common().kind === "binary") return "binary"
     // .tex / .latex / .sty / .cls are source files → highlighted "code" view
     // (LANG maps them to the shiki `latex` grammar). They are NEVER routed to
     // KaTeX, which blanks on a full \documentclass document.
     return "code"
   })
+  const pdfMode = createMemo(() => pdfPreviewMode({ truncated: truncated(), size: data()?.size }))
+  const manuscript = createMemo(() => parseManuscript(view.draft).bibliographies.length > 0)
+  // Relative image references in previewed markdown resolve against the
+  // file's own directory through the backend raw-file endpoint.
+  const rawUrl = (path: string, dir = directory(), session = fileSessionID()) =>
+    sdk.request.url(
+      "/file/raw",
+      rawFileQuery({
+        directory: dir,
+        path,
+        sessionID: session,
+        scope: resolvedScope(),
+        inline: true,
+        projectPreview: projectPreview(),
+      }),
+    )
+  const image = (src: string) =>
+    assetUrl(src, {
+      base: resolvedPath(),
+      url: (path) => rawUrl(path),
+    })
+  const file = (href: string) => localAssetPath(href, resolvedPath())
+  const openFile = (path: string) => {
+    const target = linkedFileTarget({
+      directory: directory(),
+      path,
+      scope: props.scope,
+      resolved: resolvedScope(),
+      sessionID: activeSessionID(),
+    })
+    uiStore.openFile(directory(), target.path, target)
+  }
+  const html = () => htmlView.value
+
+  createEffect(() => {
+    const source = view.draft
+    const dir = directory()
+    const session = fileSessionID()
+    const base = resolvedPath()
+    const active = view.status === "ready" && kind() === "html" && !view.source
+    const id = ++htmlRequest.current
+    htmlAbort.current?.abort()
+    htmlAbort.current = undefined
+    if (!active) {
+      setHtmlView("status", "idle")
+      return
+    }
+    const url = (path: string) => rawUrl(path, dir, session)
+    const resolve = (value: string) => assetUrl(value, { base, url })
+    const fallback = rewriteHtmlAssets(source, resolve)
+    setHtmlView({ status: "loading", value: fallback })
+    const local = (href: string) => localAssetPath(href, base) !== undefined
+    if (!htmlStylesheets(source).some(local)) {
+      setHtmlView("status", "ready")
+      return
+    }
+    const controller = new AbortController()
+    htmlAbort.current = controller
+    void loadHtmlStylesheets(
+      source,
+      async (href) => {
+        const path = localAssetPath(href, base)
+        if (!path) return
+        const response = await sdk.request(
+          "/file/raw",
+          { signal: controller.signal },
+          rawFileQuery({
+            directory: dir,
+            path,
+            sessionID: session,
+            scope: resolvedScope(),
+            maxBytes: HTML_STYLESHEET_BYTES,
+            projectPreview: projectPreview(),
+          }),
+        )
+        if (!response.ok) return
+        return response.text()
+      },
+      local,
+      (stylesheet, value) => localAssetPath(value, stylesheet),
+    ).then(
+      (stylesheets) => {
+        if (htmlRequest.current !== id || controller.signal.aborted) return
+        setHtmlView({
+          status: "ready",
+          value: rewriteHtmlAssets(source, resolve, {
+            stylesheets,
+            resolveStylesheetPath: (stylesheet, value) => localAssetPath(value, stylesheet),
+            resolveStylesheet: (stylesheet, value) => {
+              const path = localAssetPath(stylesheet, base)
+              return path ? assetUrl(value, { base: path, url }) : resolve(value)
+            },
+          }),
+        })
+      },
+      () => {
+        if (htmlRequest.current !== id || controller.signal.aborted) return
+        setHtmlView("status", "ready")
+      },
+    )
+  })
 
   const badge = () => {
     const k = kind()
-    if (k === "code") return LANG[e()] ?? e() ?? "text"
-    return k
+    if (k === "code") return e() || "text"
+    if (k === "science") return scientific()?.format ?? e()
+    if (k === "scientific-data") return biological() ?? e()
+    if (k === "scientific-binary") return binaryScience() ?? e()
+    if (k === "table") return tabular() ?? e()
+    return e() || k
   }
+  const description = createMemo(() =>
+    describeFile({
+      kind: kind(),
+      format: badge(),
+      binary: isBinary(),
+      truncated: truncated(),
+    }),
+  )
+  const context = createMemo(() =>
+    createArtifactContext({
+      directory: directory(),
+      path: resolvedPath(),
+      format: badge(),
+      scienceKind: scientific()?.kind,
+      inspection: view.inspection,
+    }),
+  )
 
   createEffect(() => {
-    if (file.loading) return
-    const next = text()
-    setDraft(next)
-    setSavedText(next)
+    const mode = kind() === "pdf" ? pdfMode() : "inline"
+    const path = requestPath()
+    const session = fileSessionID()
+    const id = ++pdfRequest.current
+    pdfAbort.current?.abort()
+    pdfAbort.current = undefined
+    setPdf({ status: "idle", bytes: undefined, error: undefined })
+    if (view.status !== "ready" || mode !== "raw" || !path) return
+    const controller = new AbortController()
+    pdfAbort.current = controller
+    setPdf({ status: "loading" })
+    void sdk
+      .request(
+        "/file/raw",
+        { signal: controller.signal },
+        rawFileQuery({
+          directory: directory(),
+          path,
+          sessionID: session,
+          scope: resolvedScope(),
+          maxBytes: PDF_PREVIEW_LIMIT,
+          projectPreview: projectPreview(),
+        }),
+      )
+      .then(async (response) => {
+        if (response.ok) return new Uint8Array(await response.arrayBuffer())
+        const detail = (await response.text().catch(() => "")).trim()
+        throw new Error(detail || `PDF preview failed (${response.status})`)
+      })
+      .then(
+        (bytes) => {
+          if (pdfRequest.current !== id || controller.signal.aborted) return
+          setPdf({ status: "ready", bytes, error: undefined })
+        },
+        (error: unknown) => {
+          if (pdfRequest.current !== id || controller.signal.aborted) return
+          setPdf({
+            status: "error",
+            bytes: undefined,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        },
+      )
+  })
+
+  createEffect(() => {
+    const current = context()
+    if (props.active === false) {
+      artifactContext.clear(current.id)
+      return
+    }
+    artifactContext.activate(current)
+  })
+
+  onCleanup(() => artifactContext.clear(context().id))
+  onCleanup(() => {
+    pdfRequest.current += 1
+    pdfAbort.current?.abort()
+    htmlRequest.current += 1
+    htmlAbort.current?.abort()
   })
 
   const save = async () => {
-    if (saving() || isBinary() || !dirty()) return
-    setSaving(true)
+    if (view.status !== "ready" || view.saving || isBinary() || truncated() || !dirty() || view.conflict) return
+    if (!view.revision) {
+      setView(
+        "saveError",
+        "This server did not provide a file revision. Your edits are preserved. Update the server and reload before saving.",
+      )
+      return
+    }
+    if (writable() === false) {
+      toast.error("read-only source", "Reconnect this location with Read & write access to change files.")
+      return
+    }
+    const session = activeSessionID()
+    if (!session) {
+      toast.error("save unavailable", "Start a research session before changing workspace files.")
+      return
+    }
+    const location = owner()
+    const owns = () => mounted && owner() === location
+    const path = requestPath()
+    const content = view.draft
+    const expectedRevision = view.revision
+    const title = name()
+    // A pending read must not replace the base revision after this write starts.
+    request.dispose()
+    setView({ saving: true, saveError: undefined })
     try {
-      // The generated SDK has no file.write; hit the real PUT /file/content
-      // route directly. `directory` re-roots the backend Instance, `path` is
-      // relative to it (see server middleware + File.write).
-      const url = `${sdk.url.replace(/\/$/, "")}/file/content?directory=${encodeURIComponent(directory())}`
-      const doFetch = platform.fetch ?? fetch
-      const res = await doFetch(url, {
+      const res = await sdk.request("/file/content", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: props.path, content: draft() }),
+        body: JSON.stringify({ path, content, sessionID: session, expectedRevision }),
       })
-      if (!res.ok) throw new Error(`save failed (${res.status})`)
-      const d: any = await res.json().catch(() => ({}))
-      const next = typeof d?.content === "string" ? d.content : draft()
-      setDraft(next)
-      setSavedText(next)
-      toast.success("saved", name())
-    } catch (err: any) {
-      toast.error("save failed", err?.message ?? String(err))
+      const payload = (await res.json().catch(() => undefined)) as FileData | undefined
+      if (!res.ok) {
+        if (res.status === 409 && owns()) setView("conflict", true)
+        throw new Error(
+          res.status === 409
+            ? "This file changed on disk. Your edits are preserved; copy them before discarding and reloading the latest file."
+            : payload
+              ? fileErrorMessage(payload)
+              : `Save failed (${res.status}). Your edits are preserved.`,
+        )
+      }
+      if (!payload?.revision)
+        throw new Error(
+          "The server did not confirm the saved revision. Your edits are preserved; reload the file before trying again.",
+        )
+      const next = typeof payload.content === "string" ? payload.content : content
+      const previous = recoverFileDraftState(
+        location.directory,
+        location.path,
+        content,
+        location.scope,
+        location.sessionID,
+        expectedRevision,
+        location.server,
+      )
+      if (previous.revision === expectedRevision) {
+        const settled = reconcileSavedDraft(previous.draft, content, next)
+        rememberFileDraft(
+          location.directory,
+          location.path,
+          settled.draft,
+          settled.saved,
+          location.scope,
+          location.sessionID,
+          payload.revision,
+          location.server,
+        )
+      }
+      if (!owns()) return
+      setView({
+        ...reconcileSavedDraft(view.draft, content, next),
+        saving: false,
+        saveError: undefined,
+        revision: payload.revision,
+        conflict: false,
+        data: { ...view.data, content: next, revision: payload.revision },
+      })
+      toast.success("saved", title)
+    } catch (error) {
+      if (!owns()) return
+      const message = error instanceof Error ? error.message : String(error)
+      setView({ saving: false, saveError: message })
+      toast.error("save failed", message)
+    }
+  }
+
+  // Explicit save into the immutable artifact store — the backend reads the
+  // file's bytes on disk (not the unsaved draft) and registers a durable,
+  // versioned artifact with provenance.
+  const [archiving, setArchiving] = createSignal(false)
+  createEffect(() => {
+    owner()
+    setArchiving(false)
+  })
+  const artifact = async () => {
+    if (archiving()) return
+    if (dirty()) {
+      toast.info("save file first", "Save your changes before creating an immutable Result version.")
+      return
+    }
+    const session = activeSessionID()
+    if (!session) {
+      toast.error("artifact unavailable", "Open this file inside a research session to save artifacts.")
+      return
+    }
+    const location = owner()
+    const owns = () => mounted && owner() === location
+    const title = name()
+    setArchiving(true)
+    try {
+      const res = await sdk.request("/file/artifact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: requestPath(), sessionID: session }),
+      })
+      if (!res.ok) throw new Error(`artifact save failed (${res.status})`)
+      const saved = normalizeStoredArtifact(await res.json().catch(() => undefined))
+      if (!owns()) return
+      window.dispatchEvent(new CustomEvent("openscience:artifacts-changed"))
+      showToast({
+        variant: "success",
+        title: "Saved to Results",
+        description: saved ? savedResultLabel(saved) : title,
+        actions: saved
+          ? [
+              {
+                label: "Open",
+                onClick: () => {
+                  if (owns()) uiStore.openSaved(saved)
+                },
+              },
+            ]
+          : undefined,
+      })
+    } catch (error) {
+      if (!owns()) return
+      toast.error("artifact save failed", error instanceof Error ? error.message : String(error))
     } finally {
-      setSaving(false)
+      if (owns()) setArchiving(false)
     }
   }
 
   const copy = async () => {
+    const location = owner()
+    const title = name()
     try {
-      await navigator.clipboard?.writeText(isBinary() ? dataUrl() : draft())
-      toast.success("copied", name())
+      await navigator.clipboard?.writeText(isBinary() ? dataUrl() : view.draft)
+      if (mounted && owner() === location) toast.success("copied", title)
     } catch {}
   }
 
-  const toggleable = () => kind() === "markdown" || kind() === "code"
+  const download = async () => {
+    const location = owner()
+    const title = name()
+    try {
+      const session = fileSessionID()
+      const response = await sdk.request(
+        "/file/raw",
+        undefined,
+        rawFileQuery({
+          directory: directory(),
+          path: requestPath(),
+          sessionID: session,
+          scope: resolvedScope(),
+          projectPreview: projectPreview(),
+        }),
+      )
+      if (!response.ok) throw new Error(`download failed (${response.status})`)
+      const blob = await response.blob()
+      if (mounted && owner() === location) downloadBlob(title, blob)
+    } catch (error) {
+      if (!mounted || owner() !== location) return
+      toast.error("download failed", error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const location = () => {
+    if (props.subtitle) return props.subtitle
+    const path = resolvedPath()
+    const index = path.lastIndexOf("/")
+    if (props.scope === "auto") {
+      const source =
+        projectContains(directory(), requestPath()) && resolvedScope() === "project"
+          ? "Project files"
+          : /^(?:\/|[A-Za-z]:[\\/])/.test(path)
+            ? "Connected file"
+            : "Session scratch"
+      return index > 0 ? `${source} · ${path.slice(0, index)}` : source
+    }
+    return index > 0 ? path.slice(0, index) : resolvedScope() === "session" ? "Session files" : "Project files"
+  }
 
   return (
-    <div
-      style={{
-        flex: 1,
-        "min-height": 0,
-        "min-width": 0,
-        display: "flex",
-        "flex-direction": "column",
-        background: "var(--color-surface-solid)",
-        overflow: "hidden",
-      }}
-    >
-      {/* header */}
-      <div
-        style={{
-          display: "flex",
-          "align-items": "center",
-          gap: "10px",
-          padding: "10px 12px 10px 16px",
-          "border-bottom": "1px solid var(--color-border)",
-          background: "var(--color-bg)",
-          "flex-shrink": 0,
-        }}
-      >
-        <IconFile size={14} strokeWidth={1.5} />
-        <div style={{ flex: 1, "min-width": 0, display: "flex", "flex-direction": "column", gap: "1px" }}>
-          <span
-            title={props.path}
-            style={{
-              "font-family": FONT_CODE,
-              "font-size": "12px",
-              color: "var(--color-text)",
-              overflow: "hidden",
-              "text-overflow": "ellipsis",
-              "white-space": "nowrap",
-            }}
-          >
-            {name()}
-          </span>
-          <Show when={props.subtitle}>
-            <span
-              title={props.subtitle}
-              style={{
-                "font-family": FONT_MONO,
-                "font-size": "10px",
-                color: "var(--color-text-faint)",
-                overflow: "hidden",
-                "text-overflow": "ellipsis",
-                "white-space": "nowrap",
-              }}
-            >
-              {props.subtitle}
-            </span>
-          </Show>
-        </div>
-        <span
-          style={{
-            "flex-shrink": 0,
-            padding: "2px 8px",
-            "border-radius": "4px",
-            border: "1px solid var(--color-border)",
-            background: "var(--color-bg-subtle)",
-            "font-family": FONT_MONO,
-            "font-size": "10px",
-            color: "var(--color-text-faint)",
-            "letter-spacing": "0.03em",
+    <FileChromeProvider>
+      <div class="atlas-file-view" data-component="file-view" data-artifact-id={context().id}>
+        <FileToolbar
+          name={name()}
+          location={location()}
+          description={description()}
+          source={view.source}
+          sourceLabel={description().source && writable() !== false ? "Edit" : undefined}
+          dirty={dirty()}
+          saving={view.saving}
+          saveDisabled={!view.revision || view.conflict === true}
+          writable={writable()}
+          disabled={view.status !== "ready"}
+          artifact={Boolean(activeSessionID()) && !projectPreview()}
+          archiving={archiving()}
+          onPreview={() => setView("source", false)}
+          onSource={() => setView("source", true)}
+          onDiscard={() => {
+            discardFileDraft(directory(), props.path, props.scope, activeSessionID(), sdk.url)
+            if (view.conflict) {
+              setView({ conflict: false, saveError: undefined, draft: view.saved, refresh: view.refresh + 1 })
+              return
+            }
+            setView({ draft: view.saved, saveError: undefined })
           }}
-        >
-          {badge()}
-        </span>
+          onSave={() => void save()}
+          onArtifact={() => void artifact()}
+          onCopy={() => void copy()}
+          onDownload={() => void download()}
+          onClose={props.onClose}
+        />
 
-        <Show when={dirty()}>
-          <button type="button" onClick={() => setDraft(savedText())} style={ctlBtn()}>
-            reset
-          </button>
-          <button type="button" onClick={() => void save()} style={ctlBtn(true)}>
-            {saving() ? "saving…" : "save"}
-          </button>
-        </Show>
-
-        <Show when={toggleable()}>
-          <button
-            type="button"
-            onClick={() => setShowSource((v) => !v)}
-            title={showSource() ? "rendered view" : kind() === "code" ? "edit source" : "raw source"}
-            style={iconBtn(showSource())}
-          >
-            <Show when={showSource()} fallback={<IconBraces size={13} strokeWidth={1.6} />}>
-              <IconBookOpen size={13} strokeWidth={1.6} />
-            </Show>
-          </button>
-        </Show>
-
-        <Show when={!isBinary()}>
-          <button type="button" onClick={() => void copy()} title="copy contents" style={iconBtn()}>
-            <IconCopy size={13} strokeWidth={1.6} />
-          </button>
-        </Show>
-        <Show when={isBinary()}>
-          <a href={dataUrl()} download={name()} title="download" style={{ ...iconBtn(), "text-decoration": "none" }}>
-            <IconDownload size={13} strokeWidth={1.6} />
-          </a>
-        </Show>
-
-        <button type="button" onClick={() => setRefreshKey((k) => k + 1)} title="refresh" style={iconBtn()}>
-          <IconRefresh size={13} strokeWidth={1.6} />
-        </button>
-
-        <Show when={props.onClose}>
-          <button type="button" onClick={() => props.onClose!()} title="close" style={iconBtn()}>
-            <IconX size={14} strokeWidth={1.7} />
-          </button>
-        </Show>
-      </div>
-
-      {/* body */}
-      <Show
-        when={!file.loading}
-        fallback={
-          <div
-            style={{ padding: "20px", "font-family": FONT_MONO, "font-size": "12px", color: "var(--color-text-faint)" }}
-          >
-            loading…
-          </div>
-        }
-      >
-        <Show
-          when={!file.error}
-          fallback={
-            <div
-              style={{
-                flex: 1,
-                "min-height": 0,
-                display: "flex",
-                "flex-direction": "column",
-                "align-items": "center",
-                "justify-content": "center",
-                gap: "10px",
-                padding: "40px 24px",
-                "text-align": "center",
-                background: "var(--color-bg-subtle)",
-              }}
-            >
-              <IconFile size={20} strokeWidth={1.4} />
-              <div
-                style={{
-                  "font-family": FONT_SANS,
-                  "font-size": "13px",
-                  "font-weight": 500,
-                  color: "var(--color-text)",
-                }}
-              >
-                couldn't open this file
-              </div>
-              <div
-                style={{
-                  "font-family": FONT_SANS,
-                  "font-size": "12px",
-                  color: "var(--color-text-faint)",
-                  "line-height": 1.5,
-                  "max-width": "340px",
-                }}
-              >
-                {file.error instanceof Error ? file.error.message : String(file.error)}
-              </div>
-              <button type="button" onClick={() => setRefreshKey((k) => k + 1)} style={retryBtn()}>
-                retry
-              </button>
-            </div>
-          }
-        >
-          <div
-            class="atlas-scroll"
-            style={{
-              flex: 1,
-              "min-height": 0,
-              overflow: "auto",
-              background: "var(--color-bg-subtle)",
-            }}
-          >
-            <Switch>
-              {/* markdown */}
-              <Match when={kind() === "markdown" && !showSource()}>
-                <div style={{ padding: "22px 26px", "max-width": "820px", margin: "0 auto" }}>
-                  <Markdown class="atlas-md" text={draft()} />
-                </div>
-              </Match>
-
-              {/* pdf */}
-              <Match when={kind() === "pdf"}>
-                <div style={{ padding: "14px" }}>
-                  <PdfViewer kind="pdf" data={{ base64: b64(), maxPages: 40 }} height={100000} />
-                </div>
-              </Match>
-
-              {/* image */}
-              <Match when={kind() === "image"}>
-                <div style={{ display: "grid", "place-items": "center", padding: "22px", "min-height": "100%" }}>
-                  <img
-                    src={dataUrl()}
-                    alt={name()}
-                    style={{
-                      "max-width": "100%",
-                      "max-height": "100%",
-                      "object-fit": "contain",
-                      "border-radius": "4px",
-                    }}
-                  />
-                </div>
-              </Match>
-
-              {/* binary */}
-              <Match when={kind() === "binary"}>
-                <div
-                  style={{
-                    display: "grid",
-                    "place-items": "center",
-                    padding: "40px 24px",
-                    "min-height": "100%",
-                    "text-align": "center",
+        <Show when={view.saveError}>
+          {(error) => (
+            <div class="atlas-file-save-error" role="alert">
+              Couldn’t save changes. {error()}
+              <Show when={view.conflict}>
+                <button
+                  type="button"
+                  class="atlas-file-button"
+                  onClick={() => {
+                    discardFileDraft(directory(), props.path, props.scope, activeSessionID(), sdk.url)
+                    setView({ draft: view.saved, conflict: false, saveError: undefined, refresh: view.refresh + 1 })
                   }}
                 >
-                  <div
-                    style={{
-                      "font-family": FONT_SANS,
-                      "font-size": "13px",
-                      color: "var(--color-text-muted)",
-                      "line-height": 1.6,
-                    }}
-                  >
-                    Binary file — no inline preview.
-                    <br />
-                    Use the download button above to open it.
-                  </div>
-                </div>
-              </Match>
-
-              {/* code / text — editable source, or highlighted read view */}
-              <Match when={kind() === "code" && showSource()}>
-                <textarea
-                  value={draft()}
-                  spellcheck={false}
-                  onInput={(ev) => setDraft(ev.currentTarget.value)}
-                  class="atlas-scroll"
-                  style={{
-                    all: "unset",
-                    "box-sizing": "border-box",
-                    display: "block",
-                    width: "100%",
-                    "min-height": "100%",
-                    padding: "16px 18px",
-                    "font-family": FONT_CODE,
-                    "font-size": "12px",
-                    "line-height": 1.65,
-                    color: "var(--color-text)",
-                    "white-space": "pre",
-                    "tab-size": 2,
-                  }}
-                />
-              </Match>
-              <Match when={kind() === "code" || (kind() === "markdown" && showSource())}>
-                <div style={{ padding: "14px 16px" }}>
-                  <Markdown
-                    class="atlas-md"
-                    text={fence(
-                      showSource() && kind() !== "code" ? langFor(kind(), e()) : (LANG[e()] ?? "text"),
-                      draft(),
-                    )}
-                  />
-                </div>
-              </Match>
-            </Switch>
+                  Discard changes and reload
+                </button>
+              </Show>
+            </div>
+          )}
+        </Show>
+        <Show
+          when={
+            view.status === "ready" &&
+            !isBinary() &&
+            !truncated() &&
+            !view.revision &&
+            !view.saveError &&
+            writable() !== false
+          }
+        >
+          <div class="atlas-file-save-error" role="status">
+            Saving is unavailable because this server did not provide a file revision. Your edits are preserved; update
+            the server and reload before saving.
           </div>
         </Show>
-      </Show>
-    </div>
+
+        <div class="atlas-file-body" data-slot="file-body">
+          <Show
+            when={view.status !== "loading"}
+            fallback={
+              <div class="atlas-file-loading" role="status" aria-live="polite">
+                <div class="atlas-file-loading-heading" />
+                <div class="atlas-file-loading-line" />
+                <div class="atlas-file-loading-line is-short" />
+                <span>Loading {name()}…</span>
+              </div>
+            }
+          >
+            <Show
+              when={view.status === "ready"}
+              fallback={
+                <Show
+                  when={view.status === "interrupted"}
+                  fallback={
+                    <section class="atlas-file-error" role="alert" aria-live="polite">
+                      <IconFile size={20} strokeWidth={1.5} />
+                      <h2>Couldn’t open this file</h2>
+                      <p>{view.error?.message ?? "The file could not be read."}</p>
+                      <button
+                        type="button"
+                        class="atlas-file-button"
+                        onClick={() => setView("refresh", (key) => key + 1)}
+                      >
+                        Retry
+                      </button>
+                    </section>
+                  }
+                >
+                  <section class="atlas-file-error" role="status" aria-live="polite">
+                    <IconFile size={20} strokeWidth={1.5} />
+                    <h2>File preview interrupted</h2>
+                    <p>The read ended before it finished. Your file was not changed.</p>
+                    <button
+                      type="button"
+                      class="atlas-file-button"
+                      onClick={() => {
+                        readRetry.count = 0
+                        setView("refresh", (key) => key + 1)
+                      }}
+                    >
+                      Retry
+                    </button>
+                  </section>
+                </Show>
+              }
+            >
+              <div
+                class="atlas-scroll atlas-file-scroll"
+                classList={{
+                  "is-managed-scroll": !view.source && (kind() === "table" || kind() === "pdf"),
+                  "is-editor-scroll": view.source,
+                }}
+              >
+                <Switch>
+                  <Match when={truncated() && kind() !== "pdf"}>
+                    <div class="atlas-file-source atlas-file-truncated">
+                      <div class="atlas-file-notice" role="status">
+                        Preview limited to 8 MB of {formatBytes(data()?.size ?? 0)}. Download the file or use a compute
+                        tool for the complete dataset.
+                      </div>
+                      <pre>{view.draft}</pre>
+                    </div>
+                  </Match>
+                  {/* citation-aware manuscripts keep the research authoring workbench */}
+                  <Match when={kind() === "markdown" && !view.source && manuscript()}>
+                    <ManuscriptWorkbench
+                      directory={directory()}
+                      path={requestPath()}
+                      sessionID={fileSessionID()}
+                      scope={resolvedScope()}
+                      openScope={props.scope}
+                      text={view.draft}
+                      dirty={dirty()}
+                      saving={view.saving}
+                      onChange={(draft) => {
+                        if (writable() === false) return
+                        setView({ draft, saveError: view.conflict ? view.saveError : undefined })
+                      }}
+                    />
+                  </Match>
+
+                  {/* ordinary Markdown opens as a quiet document */}
+                  <Match when={kind() === "markdown" && !view.source && !manuscript()}>
+                    <MarkdownDocument
+                      name={name()}
+                      text={view.draft}
+                      resolveImage={image}
+                      resolveFile={file}
+                      onOpenFile={openFile}
+                    />
+                  </Match>
+
+                  <Match when={kind() === "notebook" && !view.source}>
+                    <NotebookDocument
+                      name={name()}
+                      text={view.draft}
+                      format={e()}
+                      sessionID={activeSessionID()}
+                      resolveImage={image}
+                      resolveFile={file}
+                      onOpenFile={openFile}
+                      run={
+                        activeSessionID() && writable() !== false
+                          ? async (cell, index) => {
+                              const response = await sdk.request("/kernels/execute", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                  sessionID: activeSessionID(),
+                                  language: cell.language,
+                                  code: cell.source,
+                                  source: `${requestPath()}#cell-${index + 1}`,
+                                  timeout: 60000,
+                                }),
+                                signal: AbortSignal.timeout(65000),
+                              })
+                              if (!response.ok)
+                                throw new Error(
+                                  fileErrorMessage(
+                                    await response
+                                      .json()
+                                      .catch(() => ({ message: `Kernel request failed (${response.status})` })),
+                                  ),
+                                )
+                              return (await response.json()) as NotebookExecution
+                            }
+                          : undefined
+                      }
+                    />
+                  </Match>
+
+                  {/* HTML documents render fully sandboxed — no scripts, no same-origin access */}
+                  <Match when={kind() === "html" && !view.source}>
+                    <div class="atlas-file-html">
+                      <iframe class="atlas-file-html-frame" sandbox="" srcdoc={html()} title={name()} />
+                    </div>
+                  </Match>
+
+                  {/* tabular data */}
+                  <Match when={kind() === "table" && !view.source}>
+                    <Show when={tabular()}>
+                      {(format) => <DataTableView text={view.draft} format={format()} name={name()} />}
+                    </Show>
+                  </Match>
+
+                  {/* genomic, alignment, and mass-spectrometry data */}
+                  <Match when={kind() === "scientific-data" && !view.source}>
+                    <Show when={biological()}>
+                      {(format) => <ScientificDataView text={view.draft} format={format()} name={name()} />}
+                    </Show>
+                  </Match>
+
+                  {/* large scientific containers */}
+                  <Match when={kind() === "scientific-binary"}>
+                    <Show when={binaryScience()}>
+                      {(format) => (
+                        <BinaryScienceView
+                          path={requestPath()}
+                          directory={directory()}
+                          sessionID={fileSessionID()}
+                          format={format()}
+                        />
+                      )}
+                    </Show>
+                  </Match>
+
+                  {/* pdf */}
+                  <Match when={kind() === "pdf"}>
+                    <div class="atlas-file-pdf">
+                      <Switch>
+                        <Match when={pdfMode() === "inline"}>
+                          <PdfViewer kind="pdf" data={{ base64: b64(), maxPages: 40 }} />
+                        </Match>
+                        <Match when={pdfMode() === "raw" && pdf.status === "ready"}>
+                          <Show when={pdf.bytes}>
+                            {(bytes) => <PdfViewer kind="pdf" data={{ bytes: bytes(), maxPages: 40 }} />}
+                          </Show>
+                        </Match>
+                        <Match when={pdfMode() === "raw" && pdf.status === "loading"}>
+                          <div class="atlas-file-loading" role="status" aria-live="polite">
+                            <div class="atlas-file-loading-heading" />
+                            <div class="atlas-file-loading-line" />
+                            <div class="atlas-file-loading-line is-short" />
+                            <span>Loading the complete {formatBytes(data()?.size ?? 0)} PDF…</span>
+                          </div>
+                        </Match>
+                        <Match when={pdfMode() === "raw" && pdf.status === "error"}>
+                          <div class="atlas-file-notice" role="alert">
+                            Couldn’t load the PDF preview. {pdf.error} Use Download above to open the original file.
+                          </div>
+                        </Match>
+                        <Match when={pdfMode() === "download"}>
+                          <div class="atlas-file-notice" role="status">
+                            This {formatBytes(data()?.size ?? 0)} PDF exceeds the {formatBytes(PDF_PREVIEW_LIMIT)}{" "}
+                            browser preview limit. Use Download above to open the original file.
+                          </div>
+                        </Match>
+                      </Switch>
+                    </div>
+                  </Match>
+
+                  {/* image */}
+                  <Match when={kind() === "image"}>
+                    <div class="atlas-file-image">
+                      <img src={dataUrl()} alt={name()} />
+                    </div>
+                  </Match>
+
+                  {/* scientific file */}
+                  <Match when={kind() === "science" && !view.source}>
+                    <Show when={scientific()}>
+                      {(artifact) => (
+                        <div class="atlas-file-science">
+                          <ScienceArtifact
+                            kind={artifact().kind}
+                            data={artifact().data}
+                            height={560}
+                            onInspect={(inspection) => setView("inspection", inspection)}
+                          />
+                        </div>
+                      )}
+                    </Show>
+                  </Match>
+
+                  {/* binary */}
+                  <Match when={kind() === "binary"}>
+                    <div class="atlas-file-empty">
+                      <div>
+                        Binary file — no inline preview.
+                        <br />
+                        Use Download to open it in another application.
+                      </div>
+                    </div>
+                  </Match>
+
+                  {/* code / text — editable source, or highlighted read view */}
+                  <Match
+                    when={
+                      (kind() === "code" ||
+                        kind() === "notebook" ||
+                        kind() === "markdown" ||
+                        kind() === "html" ||
+                        kind() === "science" ||
+                        kind() === "scientific-data" ||
+                        kind() === "table") &&
+                      view.source
+                    }
+                  >
+                    <CodeEditor
+                      label={`${name()} source`}
+                      value={view.draft}
+                      language={LANG[e()] ?? "text"}
+                      readOnly={writable() === false}
+                      wrap={kind() === "markdown"}
+                      onChange={(draft) => setView({ draft, saveError: view.conflict ? view.saveError : undefined })}
+                      onSave={() => void save()}
+                    />
+                  </Match>
+                  <Match when={kind() === "code"}>
+                    <div class="atlas-file-code">
+                      <Markdown class="atlas-md" text={fence(LANG[e()] ?? "text", view.draft)} />
+                    </div>
+                  </Match>
+                </Switch>
+              </div>
+            </Show>
+          </Show>
+        </div>
+      </div>
+    </FileChromeProvider>
   )
 }
 
@@ -551,9 +1234,11 @@ export function FilePreview(props: { path: string; onClose: () => void }): JSX.E
   )
 }
 
-function langFor(k: Kind, x: string): string {
-  if (k === "markdown") return "markdown"
-  return LANG[x] ?? "text"
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }
 
 // Wrap raw file text in a fenced code block so the shared Markdown renderer
@@ -564,54 +1249,3 @@ function fence(lang: string, body: string): string {
   while (body.includes(ticks)) ticks += "`"
   return `${ticks}${lang}\n${body}\n${ticks}`
 }
-
-function iconBtn(active = false): JSX.CSSProperties {
-  return {
-    all: "unset",
-    cursor: "pointer",
-    display: "inline-flex",
-    "align-items": "center",
-    "justify-content": "center",
-    width: "28px",
-    height: "28px",
-    "border-radius": "4px",
-    color: active ? "var(--color-text)" : "var(--color-text-faint)",
-    background: active ? "var(--color-accent-subtle)" : "transparent",
-    "flex-shrink": 0,
-    transition: "background 120ms ease, color 120ms ease",
-  } as JSX.CSSProperties
-}
-
-function retryBtn(): JSX.CSSProperties {
-  return {
-    all: "unset",
-    cursor: "pointer",
-    "margin-top": "2px",
-    padding: "5px 12px",
-    "border-radius": "4px",
-    border: "1px solid var(--color-border)",
-    "font-family": FONT_MONO,
-    "font-size": "11px",
-    color: "var(--color-text)",
-  } as JSX.CSSProperties
-}
-
-function ctlBtn(primary = false): JSX.CSSProperties {
-  return {
-    all: "unset",
-    cursor: "pointer",
-    display: "inline-flex",
-    "align-items": "center",
-    padding: "5px 11px",
-    "border-radius": "4px",
-    border: primary ? "1px solid var(--color-text)" : "1px solid var(--color-border)",
-    background: primary ? "var(--color-text)" : "var(--color-bg-subtle)",
-    color: primary ? "var(--color-bg)" : "var(--color-text-muted)",
-    "font-family": FONT_MONO,
-    "font-size": "11px",
-    "font-weight": primary ? 600 : 500,
-    "flex-shrink": 0,
-  } as JSX.CSSProperties
-}
-
-export default FilePreview

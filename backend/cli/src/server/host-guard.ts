@@ -1,5 +1,7 @@
-// The local openscience server only ever binds to loopback. Two independent checks
-// gate every NETWORK request (in-process callers bypass both via a per-process
+import { timingSafeEqual } from "../util/timing-safe"
+
+// The local openscience server only ever binds to loopback. Independent checks
+// gate every NETWORK request (in-process callers bypass them via a per-process
 // nonce header — see Server.internalFetch):
 //
 //   isAllowedHost   — rejects DNS-rebinding. An attacker page on evil.com that
@@ -12,24 +14,17 @@
 //     WebSocket upgrades (which CORS does not cover). A page on evil.com that
 //     fetches http://localhost:<port> directly sends `Host: localhost` (passing
 //     the host check) but `Origin: https://evil.com`. Only the local UI, the
-//     desktop (tauri) shell, *.syntheticsciences.ai, and configured CORS
-//     domains are allowed. This MUST stay in lockstep with the cors() policy
+//     desktop (tauri) shell, and explicitly configured CORS domains are
+//     allowed. This MUST stay in lockstep with the cors() policy
 //     in server.ts (the cors middleware reuses this function).
 
 const ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"])
 
-// Apex domains whose https subdomains are trusted for CORS/WebSocket origins.
-// The hosted web UI lives on <subdomain>.syntheticsciences.ai; forks and
-// self-hosters add their own via OPENSCIENCE_CORS_DOMAINS (comma-separated apexes,
-// e.g. "example.org,foo.dev"). Loopback + tauri stay auto-trusted regardless.
-const DEFAULT_CORS_DOMAINS = ["syntheticsciences.ai"]
-
 function allowedApexDomains(): string[] {
-  const configured = (process.env["OPENSCIENCE_CORS_DOMAINS"] ?? "")
+  return (process.env["OPENSCIENCE_CORS_DOMAINS"] ?? "")
     .split(",")
     .map((domain) => domain.trim().toLowerCase())
     .filter(Boolean)
-  return [...DEFAULT_CORS_DOMAINS, ...configured]
 }
 
 function matchesAllowedSubdomain(origin: string): boolean {
@@ -55,8 +50,7 @@ export function isAllowedOrigin(origin: string, extraWhitelist: string[] = []): 
   if (origin.startsWith("http://localhost:") || origin === "http://localhost") return true
   if (origin.startsWith("http://127.0.0.1:") || origin === "http://127.0.0.1") return true
   if (origin === "tauri://localhost" || origin === "http://tauri.localhost") return true
-  // Trusted hosted-UI subdomains (default syntheticsciences.ai, extended via
-  // OPENSCIENCE_CORS_DOMAINS). See matchesAllowedSubdomain.
+  // User-configured hosted UI subdomains. There is no built-in hosted origin.
   if (matchesAllowedSubdomain(origin)) return true
   return extraWhitelist.includes(origin)
 }
@@ -74,4 +68,19 @@ export function isCrossOrigin(
 ): boolean {
   if (origin !== undefined) return !isAllowedOrigin(origin, extraWhitelist)
   return secFetchSite === "cross-site"
+}
+
+export function isCorsPreflight(
+  method: string,
+  origin: string | undefined,
+  requestedMethod: string | undefined,
+): boolean {
+  return method === "OPTIONS" && origin !== undefined && requestedMethod !== undefined
+}
+
+/** Verify the optional deployment credential without changing local defaults. */
+export function isDeploymentAuthorized(token: string | undefined, authorization: string | undefined): boolean {
+  if (!token) return true
+  if (!authorization || authorization.slice(0, 7).toLowerCase() !== "bearer ") return false
+  return timingSafeEqual(authorization.slice(7), token)
 }

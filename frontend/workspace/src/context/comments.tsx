@@ -4,6 +4,7 @@ import { createSimpleContext } from "@synsci/ui/context"
 import { useParams } from "@solidjs/router"
 import { Persist, persisted } from "@/utils/persist"
 import type { SelectedLineRange } from "@/context/file"
+import { useSDK } from "./sdk"
 
 export type LineComment = {
   id: string
@@ -96,6 +97,7 @@ export const { use: useComments, provider: CommentsProvider } = createSimpleCont
   gate: false,
   init: () => {
     const params = useParams()
+    const sdk = useSDK()
     const cache = new Map<string, CommentCacheEntry>()
 
     const disposeAll = () => {
@@ -136,7 +138,7 @@ export const { use: useComments, provider: CommentsProvider } = createSimpleCont
       return entry.value
     }
 
-    const session = createMemo(() => load(params.dir!, params.id))
+    const session = createMemo(() => load(sdk.scope, params.id))
 
     return {
       ready: () => session().ready(),

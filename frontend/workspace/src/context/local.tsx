@@ -3,9 +3,13 @@ import { batch, createMemo } from "solid-js"
 import { createSimpleContext } from "@synsci/ui/context"
 import { useSDK } from "./sdk"
 import { useSync } from "./sync"
-import { base64Encode } from "@synsci/util/encode"
 import { useProviders } from "@/hooks/use-providers"
 import { useModels } from "@/context/models"
+import { foldedRouteMode, routableModelKey } from "@/context/model-catalog"
+import { modelTierOptions, normalizedTier, promptTier, resolvedTier } from "@/context/model-tier"
+import { resolveModelAccessRoute, type ModelAccessRoute, type ModelRouteAccess } from "@/context/model-route-resolution"
+import { modelVariantDefault, modelVariantOptions, normalizedVariant, promptVariant } from "@/context/model-variant"
+import { modelContextOptions, modelDefaultContext } from "@/context/model-context"
 
 export type ModelKey = { providerID: string; modelID: string }
 
@@ -15,8 +19,9 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const sdk = useSDK()
     const sync = useSync()
     const providers = useProviders()
+    const models = useModels()
 
-    function isModelValid(model: ModelKey) {
+    function isExactModelValid(model: ModelKey) {
       const provider = providers.all().find((x) => x.id === model.providerID)
       return (
         !!provider?.models[model.modelID] &&
@@ -27,21 +32,30 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       )
     }
 
+    function resolveModel(model: ModelKey) {
+      const routed = routableModelKey(model, isExactModelValid)
+      if (isExactModelValid(routed)) return routed
+    }
+
+    function isModelValid(model: ModelKey) {
+      return !!resolveModel(model)
+    }
+
     function getFirstValidModel(...modelFns: (() => ModelKey | undefined)[]) {
       for (const modelFn of modelFns) {
         const model = modelFn()
         if (!model) continue
-        if (isModelValid(model)) return model
+        const resolved = resolveModel(model)
+        if (resolved) return resolved
       }
     }
 
-    const RESEARCH_AGENTS = ["research"] as const
-    const BIOLOGY_AGENTS = ["biology"] as const
-    const ALL_CYCLABLE = ["research", "biology", "physics", "ml"] as const
-
     const agent = (() => {
-      const list = createMemo(() => sync.data.agent.filter((x) => x.mode !== "subagent" && !x.hidden))
-      const all = createMemo(() => sync.data.agent.filter((x) => x.mode !== "subagent"))
+      // Planning is adaptive in the research agent, so the legacy read-only
+      // plan agent is not exposed as a picker entry.
+      const agents = () => (Array.isArray(sync.data.agent) ? sync.data.agent : [])
+      const list = createMemo(() => agents().filter((x) => x.name === "research"), [])
+      const all = createMemo(() => agents().filter((x) => x.mode !== "subagent"), [])
       const [store, setStore] = createStore<{
         current?: string
       }>({
@@ -90,77 +104,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       }
     })()
 
-    const research = (() => {
-      let previousAgent: string | undefined
-      return {
-        current() {
-          const name = agent.current()?.name
-          if (name && RESEARCH_AGENTS.includes(name as any)) return name as (typeof RESEARCH_AGENTS)[number]
-          return undefined
-        },
-        list() {
-          return RESEARCH_AGENTS.filter((name) => agent.all().some((a) => a.name === name))
-        },
-        cycle() {
-          if (biology.current()) {
-            biology.cycle()
-            return
-          }
-          const levels = this.list()
-          if (levels.length === 0) return
-          const current = this.current()
-          if (!current) {
-            previousAgent = agent.current()?.name
-            agent.set(levels[0])
-            return
-          }
-          const index = levels.indexOf(current)
-          if (index === -1 || index === levels.length - 1) {
-            const restore = previousAgent && !ALL_CYCLABLE.includes(previousAgent as any) ? previousAgent : "research"
-            previousAgent = undefined
-            agent.set(restore)
-            return
-          }
-          agent.set(levels[index + 1])
-        },
-      }
-    })()
-
-    const biology = (() => {
-      let previousAgent: string | undefined
-      return {
-        current() {
-          const name = agent.current()?.name
-          if (name && BIOLOGY_AGENTS.includes(name as any)) return name as (typeof BIOLOGY_AGENTS)[number]
-          return undefined
-        },
-        list() {
-          return BIOLOGY_AGENTS.filter((name) => agent.all().some((a) => a.name === name))
-        },
-        cycle() {
-          const levels = this.list()
-          if (levels.length === 0) return
-          const current = this.current()
-          if (!current) {
-            previousAgent = agent.current()?.name
-            agent.set(levels[0])
-            return
-          }
-          const index = levels.indexOf(current)
-          if (index === -1 || index === levels.length - 1) {
-            const restore = previousAgent && !ALL_CYCLABLE.includes(previousAgent as any) ? previousAgent : "research"
-            previousAgent = undefined
-            agent.set(restore)
-            return
-          }
-          agent.set(levels[index + 1])
-        },
-      }
-    })()
-
     const model = (() => {
-      const models = useModels()
-
       const [ephemeral, setEphemeral] = createStore<{
         model: Record<string, ModelKey | undefined>
       }>({
@@ -168,21 +112,55 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       })
 
       const fallbackModel = createMemo<ModelKey | undefined>(() => {
-        if (sync.data.config.model) {
-          const [providerID, modelID] = sync.data.config.model.split("/")
-          if (isModelValid({ providerID, modelID })) {
-            return {
-              providerID,
-              modelID,
-            }
-          }
+        // The composer's last explicit choice outranks every default: it is the
+        // user's most recent intent, and it must survive leaving the project.
+        const chosen = models.selected.get()
+        if (chosen) {
+          if (isExactModelValid(chosen)) return chosen
+          const routed = resolveModel(chosen)
+          if (routed) return routed
         }
 
-        for (const item of models.recent.list()) {
-          if (isModelValid(item)) {
-            return item
-          }
+        if (sync.data.config.model) {
+          const [providerID, ...parts] = sync.data.config.model.split("/")
+          const modelID = parts.join("/")
+          const configured = { providerID, modelID }
+          // Settings owns the exact default route. Never silently replace it
+          // with another provider route for the same logical model.
+          return isExactModelValid(configured) ? configured : undefined
         }
+
+        // Earlier picks whose exact route is gone still beat the Sol default,
+        // which is only for installs that never chose.
+        for (const item of models.recent.list()) {
+          const resolved = resolveModel(item)
+          if (resolved) return resolved
+        }
+
+        // Resolve one connected Sol route without treating provider identities
+        // as interchangeable. The active access contract decides which route
+        // is eligible; Automatic still prefers the user's ChatGPT connection.
+        const connected = new Map(providers.connected().map((provider) => [provider.id, provider]))
+        const candidates = [
+          { providerID: "openai", modelID: "gpt-5.6-sol" },
+          { providerID: "openai-codex", modelID: "gpt-5.6-sol" },
+          { providerID: "openrouter", modelID: "openai/gpt-5.6-sol" },
+        ].flatMap((route): ModelAccessRoute[] => {
+          const provider = connected.get(route.providerID)
+          if (!provider?.models[route.modelID]) return []
+          const access: ModelRouteAccess =
+            provider.id === "openai-codex"
+              ? "chatgpt"
+              : provider.source === "managed" || provider.id.startsWith("synsci")
+                ? "managed"
+                : "byok"
+          return [{ ...route, access }]
+        })
+        const initial = resolveModelAccessRoute({
+          routes: candidates,
+          billing: sync.data.config.billing?.llm,
+        })
+        if (initial) return initial
 
         const defaults = providers.default()
         for (const p of providers.connected()) {
@@ -201,19 +179,35 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         return undefined
       })
 
-      const current = createMemo(() => {
+      const selected = createMemo(() => {
         const a = agent.current()
         if (!a) return undefined
-        const key = getFirstValidModel(
-          () => ephemeral.model[a.name],
-          () => a.model,
-          fallbackModel,
-        )
+        const explicit = ephemeral.model[a.name]
+        // A composer selection is an exact provider contract, even if a
+        // provider refresh temporarily makes that route unavailable.
+        if (explicit) return isExactModelValid(explicit) ? explicit : undefined
+        return getFirstValidModel(() => a.model, fallbackModel)
+      })
+
+      const current = createMemo(() => {
+        const key = selected()
         if (!key) return undefined
         return models.find(key)
       })
 
-      const recent = createMemo(() => models.recent.list().map(models.find).filter(Boolean))
+      const recent = createMemo(() =>
+        models.recent
+          .list()
+          .map((item) => models.find(resolveModel(item) ?? item))
+          .filter(Boolean),
+      )
+
+      const pinned = createMemo(() =>
+        models.pinned
+          .list()
+          .map((item) => models.find(resolveModel(item) ?? item))
+          .filter(Boolean),
+      )
 
       const cycle = (direction: 1 | -1) => {
         const recentList = recent()
@@ -232,25 +226,27 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         const val = recentList[next]
         if (!val) return
 
-        model.set({
-          providerID: val.provider.id,
-          modelID: val.id,
-        })
+        model.set({ providerID: val.provider.id, modelID: val.id }, { remember: true })
       }
 
       return {
         ready: models.ready,
         current,
         recent,
+        pinned,
         list: models.list,
         cycle,
-        set(model: ModelKey | undefined, options?: { recent?: boolean }) {
+        set(model: ModelKey | undefined, options?: { recent?: boolean; remember?: boolean }) {
           batch(() => {
             const currentAgent = agent.current()
-            const next = model ?? fallbackModel()
+            const selected = model
+            const next = selected ?? fallbackModel()
             if (currentAgent) setEphemeral("model", currentAgent.name, next)
-            if (model) models.setVisibility(model, true)
-            if (options?.recent && model) models.recent.push(model)
+            if (selected) models.setVisibility(selected, true)
+            // Only the user's own picks are remembered across projects; an
+            // agent's configured model applies to that agent alone.
+            if (selected && (options?.recent || options?.remember)) models.selected.set(selected)
+            if (options?.recent && selected) models.recent.push(selected)
           })
         },
         visible(model: ModelKey) {
@@ -259,48 +255,120 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         setVisibility(model: ModelKey, visible: boolean) {
           models.setVisibility(model, visible)
         },
+        pin: {
+          has(model: ModelKey) {
+            return models.pinned.has(resolveModel(model) ?? model)
+          },
+          toggle(model: ModelKey) {
+            const selected = resolveModel(model) ?? model
+            models.setVisibility(selected, true)
+            return models.pinned.toggle(selected)
+          },
+        },
         variant: {
           current() {
             const m = current()
-            if (!m) return undefined
-            return models.variant.get({ providerID: m.provider.id, modelID: m.id })
+            if (!m) return "default"
+            return normalizedVariant(
+              models.variant.get({ providerID: m.provider.id, modelID: m.id }),
+              Object.keys(m.variants ?? {}),
+              modelVariantDefault(m),
+            )
           },
           list() {
             const m = current()
             if (!m) return []
-            if (!m.variants) return []
-            return Object.keys(m.variants)
+            return modelVariantOptions(Object.keys(m.variants ?? {}), modelVariantDefault(m))
           },
           set(value: string | undefined) {
             const m = current()
             if (!m) return
-            models.variant.set({ providerID: m.provider.id, modelID: m.id }, value)
+            const variants = Object.keys(m.variants ?? {})
+            models.variant.set(
+              { providerID: m.provider.id, modelID: m.id },
+              promptVariant(value, variants, modelVariantDefault(m)),
+            )
           },
           cycle() {
             const variants = this.list()
             if (variants.length === 0) return
-            const currentVariant = this.current()
-            if (!currentVariant) {
-              this.set(variants[0])
-              return
-            }
-            const index = variants.indexOf(currentVariant)
-            if (index === -1 || index === variants.length - 1) {
-              this.set(undefined)
-              return
-            }
-            this.set(variants[index + 1])
+            const index = variants.indexOf(this.current())
+            this.set(variants[index === -1 || index === variants.length - 1 ? 0 : index + 1])
+          },
+          prompt() {
+            const m = current()
+            if (!m) return undefined
+            return promptVariant(this.current(), Object.keys(m.variants ?? {}), modelVariantDefault(m))
+          },
+        },
+        tier: {
+          current() {
+            const m = current()
+            if (!m) return "standard"
+            const saved = models.tier.get({ providerID: m.provider.id, modelID: m.id })
+            const legacy = selected()
+            const migrated = legacy ? foldedRouteMode(legacy, m) : undefined
+            return resolvedTier(saved, Object.keys(m.modes ?? {}), migrated)
+          },
+          list() {
+            const m = current()
+            if (!m) return []
+            return modelTierOptions(Object.keys(m.modes ?? {})).map((option) => option.id)
+          },
+          set(value: string | undefined) {
+            const m = current()
+            if (!m) return
+            const modes = Object.keys(m.modes ?? {})
+            models.tier.set({ providerID: m.provider.id, modelID: m.id }, normalizedTier(value, modes))
+          },
+          cycle() {
+            const tiers = this.list()
+            if (tiers.length <= 1) return
+            const index = tiers.indexOf(this.current())
+            this.set(tiers[index === -1 || index === tiers.length - 1 ? 0 : index + 1])
+          },
+          prompt() {
+            const m = current()
+            if (!m) return undefined
+            return promptTier(this.current(), Object.keys(m.modes ?? {}))
+          },
+        },
+        context: {
+          list() {
+            const m = current()
+            if (!m) return []
+            return modelContextOptions(m)
+          },
+          current() {
+            const m = current()
+            if (!m) return 0
+            const value = models.context.get({ providerID: m.provider.id, modelID: m.id })
+            return value && this.list().includes(value) ? value : modelDefaultContext(m)
+          },
+          set(value: number | undefined) {
+            const m = current()
+            if (!m) return
+            // The full window is stored too: a person who chose it past a
+            // pricing boundary must not fall back to the boundary default.
+            const selected = value && this.list().includes(value) ? value : undefined
+            models.context.set({ providerID: m.provider.id, modelID: m.id }, selected)
+          },
+          prompt() {
+            const m = current()
+            if (!m) return undefined
+            const value = models.context.get({ providerID: m.provider.id, modelID: m.id })
+            // No choice: the server applies the same boundary default.
+            if (!value || !this.list().includes(value)) return undefined
+            return value
           },
         },
       }
     })()
 
     const result = {
-      slug: createMemo(() => base64Encode(sdk.directory)),
+      slug: createMemo(() => sdk.scope),
       model,
       agent,
-      research,
-      biology,
     }
     return result
   },

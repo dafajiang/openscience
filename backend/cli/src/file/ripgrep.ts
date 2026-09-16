@@ -4,8 +4,7 @@ import { Global } from "../global"
 import fs from "fs/promises"
 import z from "zod"
 import { NamedError } from "@synsci/util/error"
-import { lazy } from "../util/lazy"
-import { $ } from "bun"
+import { lazy } from "@synsci/util/lazy"
 
 import { ZipReader, BlobReader, BlobWriter } from "@zip.js/zip.js"
 import { Log } from "@/util/log"
@@ -213,8 +212,8 @@ export namespace Ripgrep {
   }) {
     input.signal?.throwIfAborted()
 
-    const args = [await filepath(), "--files", "--glob=!.git/*"]
-    if (input.follow !== false) args.push("--follow")
+    const args = [await filepath(), "--files", "--glob=!.git/*", "--glob=!.openscience-trash/**"]
+    if (input.follow === true) args.push("--follow")
     if (input.hidden !== false) args.push("--hidden")
     if (input.maxDepth !== undefined) args.push(`--max-depth=${input.maxDepth}`)
     if (input.glob) {
@@ -244,13 +243,17 @@ export namespace Ripgrep {
     const reader = proc.stdout.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
+    let finished = false
 
     try {
       while (true) {
         input.signal?.throwIfAborted()
 
         const { done, value } = await reader.read()
-        if (done) break
+        if (done) {
+          finished = true
+          break
+        }
 
         buffer += decoder.decode(value, { stream: true })
         // Handle both Unix (\n) and Windows (\r\n) line endings
@@ -264,6 +267,10 @@ export namespace Ripgrep {
 
       if (buffer) yield buffer
     } finally {
+      if (!finished) {
+        proc.kill()
+        await reader.cancel().catch(() => undefined)
+      }
       reader.releaseLock()
       await proc.exited
     }
@@ -380,8 +387,9 @@ export namespace Ripgrep {
     limit?: number
     follow?: boolean
   }) {
-    const args = [`${await filepath()}`, "--json", "--hidden", "--glob='!.git/*'"]
-    if (input.follow !== false) args.push("--follow")
+    const executable = await filepath()
+    const args = ["--json", "--hidden", "--glob=!.git/*"]
+    if (input.follow === true) args.push("--follow")
 
     if (input.glob) {
       for (const g of input.glob) {
@@ -396,14 +404,28 @@ export namespace Ripgrep {
     args.push("--")
     args.push(input.pattern)
 
-    const command = args.join(" ")
-    const result = await $`${{ raw: command }}`.cwd(input.cwd).quiet().nothrow()
-    if (result.exitCode !== 0) {
+    // The pattern is untrusted HTTP input. Keep it as one argv element after
+    // `--`; constructing a shell command here turns newlines, substitutions,
+    // and metacharacters into host command execution before project trust.
+    const proc = Bun.spawn([executable, ...args], {
+      cwd: input.cwd,
+      env: Object.fromEntries(
+        ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"].flatMap((key) =>
+          process.env[key] === undefined ? [] : [[key, process.env[key]!]],
+        ),
+      ),
+      stdout: "pipe",
+      stderr: "ignore",
+      maxBuffer: 1024 * 1024 * 20,
+    })
+    const [exitCode, output] = await Promise.all([proc.exited, Bun.readableStreamToText(proc.stdout)])
+    // ripgrep uses 1 for a valid search with no matches.
+    if (exitCode !== 0 && exitCode !== 1) {
       return []
     }
 
     // Handle both Unix (\n) and Windows (\r\n) line endings
-    const lines = result.text().trim().split(/\r?\n/).filter(Boolean)
+    const lines = output.trim().split(/\r?\n/).filter(Boolean)
     // Parse JSON lines from ripgrep output
 
     return lines

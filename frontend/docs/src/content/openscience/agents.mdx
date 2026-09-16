@@ -1,89 +1,145 @@
 ---
-title: "Agents"
-description: "The research agent roster — a default research agent, three domain specialists, critique sub-agents, and a read-only plan mode — plus how to build your own."
-icon: "bot"
+title: "Research controls"
+description: "Plan a task, choose research effort, and decide when OpenScience should ask you."
 ---
 
-The default agent is `research`, a scientific research agent that runs the whole loop: literature review, hypothesis, code, experiments on real compute, analysis, and write-up. Three domain specialists ship alongside it, backed by read-only critique sub-agents and a `plan` mode that cannot edit files.
+**Research** is the default agent. It can search the literature, analyze data, write code, run experiments, and prepare a report. Skills supply procedures for particular domains.
 
-## Built-in roster
+Start with a clear goal, the inputs, an output location, and any limits on time or spending.
 
-| Agent | Role | What it does |
-| --- | --- | --- |
-| `research` | Default | Scientific research across the full skill library — literature, data analysis, GPU compute, and synthesis. |
-| `biology` | Specialist | Computational biology: bioinformatics workflows and 30+ biological database integrations. |
-| `physics` | Specialist | Computational physics: simulation, PDE solving, dynamical systems, symbolic regression. |
-| `ml` | Specialist | Trains, evaluates, and analyzes models end to end — deep learning, LLMs, classical ML, RL. |
-| `plan` | Mode | Read-only planning. Edit tools are disabled except for plan files. |
+## Plan before execution
 
-Two sub-agents back the roster. The main agent delegates to them like tools:
-
-| Sub-agent | What it does |
-| --- | --- |
-| `critique` | Read-only scientific critique. Finds blocking errors — data leakage, wrong statistics, unsupported claims — before expensive or irreversible actions. |
-| `literature-review` | Full PRISMA literature review: systematic search, screening, eligibility, synthesis, verification. |
-
-Run `openscience agent list` to print the complete set on your install, including utility sub-agents like `explore` and `reviewer`.
-
-## Pick an agent
-
-```bash
-# one-shot run with a specific agent
-openscience run --agent physics "Fit the dispersion relation in data/spectra.csv"
-```
-
-In the workspace, switch agents from the session picker. To change the default, set `default_agent` in `openscience.json`. Only agents with mode `primary` or `all` can lead a session; `subagent` profiles are reachable only by delegation.
-
-## Create a custom agent
-
-`openscience agent create` walks you through it interactively. The non-interactive form:
-
-```bash
-openscience agent create \
-  --path .openscience \
-  --description "Reviews analysis notebooks for data leakage and unsound statistics" \
-  --mode subagent \
-  --tools "read,grep,glob" \
-  --model anthropic/claude-sonnet-5
-```
-
-| Flag | Use |
-| --- | --- |
-| `--path <dir>` | Where to write the definition; an `agent/` folder is created inside it. Omit to choose project or global interactively. |
-| `--description <text>` | What the agent is for. A model expands this into the name, system prompt, and delegation description. |
-| `--mode <all\|primary\|subagent>` | `primary`: leads a session. `subagent`: only reachable by delegation. `all`: both. |
-| `--tools <tool[,tool...]>` | Allow-list of tools. Anything left off the list is disabled. |
-| `--model <provider/model>` | Default model for this agent. |
-
-The result is a Markdown file: YAML frontmatter (description, mode, tools) plus a body that is the system prompt. Edit it like any prose file.
-
-## Tool restrictions
-
-`--tools "read,grep,glob"` produces a read-only agent that cannot be tricked into editing files. The available tools are `bash`, `read`, `write`, `edit`, `list`, `glob`, `grep`, `webfetch`, `task`, `todowrite`, and `todoread` — run `openscience agent create --help` for the list on your version.
-
-## Where agents live
+Use `/plan` when you want to agree on an approach before implementation:
 
 ```text
-.openscience/agent/             # project-scoped
-~/.config/openscience/agent/    # user-global
-<bundled>                       # ships with OpenScience
+/plan Compare these treatment groups. Identify assumptions, possible
+confounders, the statistical test, and the outputs we should save.
 ```
 
-Resolution is project-local, then user-global, then built-in.
+Plan mode inspects the available material and prepares a plan. It does not carry out the proposed analysis or edit project files, apart from its plan files. After reviewing the plan, return to Research and ask it to execute the agreed steps.
 
-## What's next
+## Normal and Ultra effort
 
-<Columns cols={2}>
-  <Card title="Skills" icon="book-open" href="/openscience/skills">
-    The 250+ skill library the agents draw on.
-  </Card>
-  <Card title="Sessions" icon="terminal" href="/openscience/sessions">
-    Start, resume, and share sessions with any agent.
-  </Card>
-  <Card title="Models" icon="package-check" href="/openscience/models">
-    Per-agent default models and provider routing.
-  </Card>
-  <Card title="Commands" icon="terminal" href="/openscience/commands">
-    Full `agent create` and `agent list` reference.
-  </Card>
-</Columns>
+| Effort | Use it for |
+| --- | --- |
+| Normal | Focused questions, a known analysis, or a small implementation. |
+| Ultra | Investigations where comparing additional approaches could change the conclusion. |
+
+Ultra can involve more work and model usage. It does not guarantee a better answer or a fixed number of parallel workers.
+
+```bash
+openscience run --effort normal "Check the assumptions in results/analysis.md"
+openscience run --effort ultra "Compare defensible approaches to the missing data in this project"
+```
+
+A model's reasoning tier is a separate setting; see [Models](/openscience/models).
+
+## Delegation and independence
+
+In the research controls, delegation determines how readily OpenScience divides independent work:
+
+| Delegation | Behavior |
+| --- | --- |
+| Off | Keep the task with the lead agent. |
+| Auto | Delegate when separate work would help. |
+| High | Prefer more delegation when the task can benefit from it. |
+
+**Independence** controls how often the agent asks you to resolve choices:
+
+- **Interactive:** plan together and discuss consequential choices.
+- **Balanced:** ask about meaningful ambiguities while continuing routine work.
+- **Independent:** proceed within the task's constraints and ask when blocked.
+
+These settings guide collaboration. They do not replace your action-approval settings or a service's spending controls.
+
+### Workers
+
+The built-in workers are `explore` (a read-only scout for files, data, code and papers) and five specialists built from one template: `ml`, `biology`, `physics`, `chemistry` and `data` (pipelines, processing, coding, visualization; the general execution worker). Each specialist carries an index of its skill categories and the domain tools those need; the lead dispatches one by name through the Task tool, and independent workers run at the same time with no fixed cap.
+
+A worker runs on its own configured model when the agent has one, otherwise on the **Worker model** from **Customize → Models**, otherwise on the lead's model. No built-in agent has a model in code; the recommended configuration is documented below. Workers work in the lead's own directory: the files they write there are the deliverables, and the lead reads them directly. The lead writes a self-contained brief with a definition of done, waits for the result (returned once, in a `<task_result>` envelope with a `task_id` that can resume the same worker), and integrates it; checking the lead's own output is never delegated. A worker started in the background returns immediately and wakes the lead with its result when it finishes. Workers cannot dispatch workers unless `subagent_depth` in `openscience.json` allows deeper nesting (default 1).
+
+A delegated task shows as one line (what it is doing, which agent, its state and elapsed time) and streams nothing while it runs; open it for the result, its saved Results and **Open agent**, which shows the worker's own conversation. Stopping the lead also cancels its active delegated work. A stopped task's saved files and recorded tool results remain available.
+
+Only the latest assistant message's text after its final tool call counts as the
+result; earlier progress text cannot make an unfinished worker look complete. A
+result without a Verification section (the command, its exit code, what it
+proves) is a claim, and the lead is told so.
+
+#### Recommended models
+
+Put the models you want each agent to use in `openscience.json`; nothing is hard-coded:
+
+```json
+{
+  "model": "openai/gpt-6-astra",
+  "agent": {
+    "explore": { "model": "google/gemini-3.8-flash" },
+    "ml": { "model": "openai/gpt-5.6-sol", "variant": "high" },
+    "biology": { "model": "openai/gpt-5.6-sol" },
+    "physics": { "model": "openai/gpt-5.6-sol" },
+    "chemistry": { "model": "openai/gpt-5.6-sol" },
+    "data": { "model": "openai/gpt-5.6-sol" }
+  }
+}
+```
+
+A worker on a different model than the lead uses its own `variant` (reasoning effort); on the lead's model it inherits the lead's. Add your own specialist the same way, with `mode: "subagent"`, `skills: ["<category>", ...]` for its domain index and a `permission` rule per domain tool it may use without a skill.
+
+Handoffs retain command receipt references and failures. A shell exit of zero
+describes the outer process; it does not establish that nested tests passed or
+that a scientific conclusion is valid. Those claims still need their actual
+test or evaluation evidence.
+
+The **Show reasoning and activity** control stays available during execution. Some
+providers return tool activity without readable reasoning; OpenScience indicates that
+state rather than presenting missing reasoning as an empty trace. A compute submission
+receipt records its state at that moment; use **View current job** for its latest status.
+
+## Action approval
+
+Choose how much oversight you want from the composer's research controls. **Ask always**, **Ask risky**, and **Full access** offer progressively fewer routine approval prompts.
+
+Keep your request specific about changes or costs you want to review. See [Permissions and control](/openscience/permissions) for choosing an approval mode and understanding a request.
+
+## Persistent goals and progress
+
+Use `/goal` for an objective you want to pursue across multiple steps:
+
+```text
+/goal Produce a reproducible analysis of data/samples.csv, with code,
+a figure, a methods note, and a list of unresolved limitations.
+```
+
+The session header shows progress and context usage. `/checkpoint` captures a recovery point; `/handoff` saves a continuation note and compacts the conversation. Commands offered as skills must be enabled in your setup.
+
+A persistent goal does not mean OpenScience can keep working while your computer or app is off. Save a checkpoint before interrupting a long task.
+
+## Custom agents
+
+Create a reusable specialist when you need a consistent role across projects:
+
+```bash
+openscience agent create
+openscience agent list
+```
+
+The creation wizard produces a Markdown definition you can review and edit. Custom agents live in `.openscience/agent/` for a project or `~/.config/openscience/agent/` for your user account.
+
+For a manually authored reviewer:
+
+```markdown
+---
+description: Review analysis plans for confounding and data leakage
+mode: primary
+permission:
+  edit: deny
+  bash: deny
+---
+
+Review the analysis plan and identify unsupported assumptions.
+Explain each concern and suggest a check before the analysis runs.
+```
+
+Save it as `analysis-reviewer.md` in the agent directory. Select it with `--agent analysis-reviewer`. A `primary` agent can lead a session, a `subagent` is for delegated tasks, and `all` supports both.
+
+Custom definitions change the agent's instructions and permitted actions. Test a new profile on a small task before relying on it.

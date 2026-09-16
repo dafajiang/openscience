@@ -8,11 +8,10 @@ import { usePlatform } from "@/context/platform"
 import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { Binary } from "@synsci/util/binary"
-import { base64Encode } from "@synsci/util/encode"
-import { decode64 } from "@/utils/base64"
 import { EventSessionError } from "@synsci/sdk/v2"
 import { Persist, persisted } from "@/utils/persist"
-import { playSound, soundSrc } from "@/utils/sound"
+import { playSound, preloadSound, soundSrc } from "@/utils/sound"
+import { projectForDirectory, projectHref, resolveProjectRoute } from "@/utils/project-route"
 
 type NotificationBase = {
   directory?: string
@@ -53,7 +52,7 @@ function pruneNotifications(list: Notification[]) {
   return pruned.slice(pruned.length - MAX_NOTIFICATIONS)
 }
 
-export const { use: useNotification, provider: NotificationProvider } = createSimpleContext({
+export const { provider: NotificationProvider } = createSimpleContext({
   name: "Notification",
   init: () => {
     const params = useParams()
@@ -66,7 +65,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
     const empty: Notification[] = []
 
     const currentDirectory = createMemo(() => {
-      return decode64(params.dir)
+      return resolveProjectRoute(params.dir, globalSync.data.project)?.directory
     })
 
     const currentSession = createMemo(() => params.id)
@@ -85,6 +84,12 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
       if (meta.pruned) return
       meta.pruned = true
       setStore("list", pruneNotifications(store.list))
+    })
+
+    createEffect(() => {
+      if (!settings.sounds.enabled()) return
+      preloadSound(soundSrc(settings.sounds.agent()))
+      preloadSound(soundSrc(settings.sounds.errors()))
     })
 
     const append = (notification: Notification) => {
@@ -140,6 +145,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
       if (event.type !== "session.idle" && event.type !== "session.error") return
 
       const directory = e.name
+      const project = projectForDirectory(globalSync.data.project, directory)
       const time = Date.now()
       const viewed = (sessionID?: string) => {
         const activeDirectory = currentDirectory()
@@ -158,7 +164,9 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
           const session = match.found ? syncStore.session[match.index] : undefined
           if (session?.parentID) break
 
-          playSound(soundSrc(settings.sounds.agent()))
+          if (settings.sounds.enabled()) {
+            playSound(soundSrc(settings.sounds.agent()), settings.sounds.volume())
+          }
 
           append({
             directory,
@@ -168,7 +176,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
             session: sessionID,
           })
 
-          const href = `/${base64Encode(directory)}/session/${sessionID}`
+          const href = project ? projectHref(project, directory, sessionID) : "/"
           if (settings.notifications.agent()) {
             void platform.notify(
               language.t("notification.session.responseReady.title"),
@@ -188,7 +196,9 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
           const error = "error" in event.properties ? event.properties.error : undefined
           if (isTransientError(error)) break
 
-          playSound(soundSrc(settings.sounds.errors()))
+          if (settings.sounds.enabled()) {
+            playSound(soundSrc(settings.sounds.errors()), settings.sounds.volume())
+          }
 
           append({
             directory,
@@ -201,7 +211,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
           const description =
             session?.title ??
             (typeof error === "string" ? error : language.t("notification.session.error.fallbackDescription"))
-          const href = sessionID ? `/${base64Encode(directory)}/session/${sessionID}` : `/${base64Encode(directory)}`
+          const href = project ? projectHref(project, directory, sessionID) : "/"
           if (settings.notifications.errors()) {
             void platform.notify(language.t("notification.session.error.title"), description, href)
           }

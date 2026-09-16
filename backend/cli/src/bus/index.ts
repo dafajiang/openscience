@@ -3,6 +3,7 @@ import { Log } from "../util/log"
 import { Instance } from "../project/instance"
 import { BusEvent } from "./bus-event"
 import { GlobalBus } from "./global"
+import { RuntimeEvents } from "../runtime/events"
 
 export namespace Bus {
   const log = Log.create({ service: "bus" })
@@ -46,9 +47,13 @@ export namespace Bus {
       type: def.type,
       properties,
     }
-    log.info("publishing", {
+    log.debug("publishing", {
       type: def.type,
     })
+    // Public runtime streams journal every event in publish order, behind the
+    // delivery rather than ahead of it: a journal rewrite must never hold the
+    // bus, and replay waits for the pending captures before it reads.
+    void RuntimeEvents.enqueue(payload)
     const pending = []
     for (const key of [def.type, "*"]) {
       const match = state().subscriptions.get(key)

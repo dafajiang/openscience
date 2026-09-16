@@ -51,7 +51,7 @@ export const dict = {
   "command.terminal.new": "Новый терминал",
   "command.terminal.new.description": "Создать новую вкладку терминала",
   "command.steps.toggle": "Переключить шаги",
-  "command.steps.toggle.description": "Показать или скрыть шаги для текущего сообщения",
+  "command.steps.toggle.description": "Показать или скрыть трассировку выполнения текущего сообщения",
   "command.message.previous": "Предыдущее сообщение",
   "command.message.previous.description": "Перейти к предыдущему сообщению пользователя",
   "command.message.next": "Следующее сообщение",
@@ -78,10 +78,6 @@ export const dict = {
   "command.session.compact.description": "Сократить сессию для уменьшения размера контекста",
   "command.session.fork": "Создать ответвление",
   "command.session.fork.description": "Создать новую сессию из сообщения",
-  "command.session.share": "Поделиться сессией",
-  "command.session.share.description": "Поделиться сессией и скопировать URL в буфер обмена",
-  "command.session.unshare": "Отменить публикацию",
-  "command.session.unshare.description": "Прекратить публикацию сессии",
 
   "palette.search.placeholder": "Поиск файлов и команд",
   "palette.empty": "Ничего не найдено",
@@ -93,7 +89,6 @@ export const dict = {
   "dialog.provider.group.popular": "Популярные",
   "dialog.provider.group.other": "Другие",
   "dialog.provider.tag.recommended": "Рекомендуемые",
-  "dialog.provider.synsci.note": "curated models including Claude, GPT, Gemini and more",
   "dialog.provider.anthropic.note": "Подключитесь с помощью Claude Pro/Max или API ключа",
   "dialog.provider.openai.note": "Подключитесь с помощью ChatGPT Pro/Plus или API ключа",
   "dialog.provider.google.note": "Gemini models for fast, structured responses",
@@ -106,10 +101,6 @@ export const dict = {
   "dialog.model.empty": "Модели не найдены",
   "dialog.model.manage": "Управление моделями",
   "dialog.model.manage.description": "Настройте какие модели появляются в выборе модели",
-
-  "dialog.model.unpaid.freeModels.title": "Бесплатные модели от подключённых провайдеров",
-  "dialog.model.unpaid.empty": "no free models available yet — connect a provider to add models.",
-  "dialog.model.unpaid.addMore.title": "Добавьте больше моделей от популярных провайдеров",
 
   "dialog.provider.viewAll": "Показать больше провайдеров",
 
@@ -179,37 +170,11 @@ export const dict = {
   "common.attachment": "вложение",
 
   "prompt.placeholder.shell": "Введите команду оболочки...",
-  "prompt.placeholder.normal": 'Спросите что угодно... "{{example}}"',
+  "prompt.placeholder.normal": "Опишите исследовательскую задачу, над которой хотите работать…",
   "prompt.placeholder.summarizeComments": "Суммировать комментарии…",
   "prompt.placeholder.summarizeComment": "Суммировать комментарий…",
   "prompt.mode.shell": "Оболочка",
   "prompt.mode.shell.exit": "esc для выхода",
-
-  "prompt.example.1": "Исправить TODO в коде",
-  "prompt.example.2": "Какой технологический стек этого проекта?",
-  "prompt.example.3": "Исправить сломанные тесты",
-  "prompt.example.4": "Объясни как работает аутентификация",
-  "prompt.example.5": "Найти и исправить уязвимости безопасности",
-  "prompt.example.6": "Добавить юнит-тесты для сервиса пользователя",
-  "prompt.example.7": "Рефакторить эту функцию для лучшей читаемости",
-  "prompt.example.8": "Что означает эта ошибка?",
-  "prompt.example.9": "Помоги мне отладить эту проблему",
-  "prompt.example.10": "Сгенерировать документацию API",
-  "prompt.example.11": "Оптимизировать запросы к базе данных",
-  "prompt.example.12": "Добавить валидацию ввода",
-  "prompt.example.13": "Создать новый компонент для...",
-  "prompt.example.14": "Как развернуть этот проект?",
-  "prompt.example.15": "Проверь мой код на лучшие практики",
-  "prompt.example.16": "Добавить обработку ошибок в эту функцию",
-  "prompt.example.17": "Объясни этот паттерн regex",
-  "prompt.example.18": "Конвертировать это в TypeScript",
-  "prompt.example.19": "Добавить логирование по всему проекту",
-  "prompt.example.20": "Какие зависимости устарели?",
-  "prompt.example.21": "Помоги написать скрипт миграции",
-  "prompt.example.22": "Реализовать кэширование для этой конечной точки",
-  "prompt.example.23": "Добавить пагинацию в этот список",
-  "prompt.example.24": "Создать CLI команду для...",
-  "prompt.example.25": "Как работают переменные окружения здесь?",
 
   "prompt.popover.emptyResults": "Нет совпадений",
   "prompt.popover.emptyCommands": "Нет совпадающих команд",
@@ -289,16 +254,10 @@ export const dict = {
   "dialog.project.edit.worktree.startup.description":
     "Запускается после создания нового рабочего пространства (worktree).",
   "dialog.project.edit.worktree.startup.placeholder": "например, bun install",
-  "context.breakdown.title": "Разбивка контекста",
-  "context.breakdown.note":
-    'Приблизительная разбивка входных токенов. "Другое" включает определения инструментов и накладные расходы.',
-  "context.breakdown.system": "Система",
   "context.breakdown.user": "Пользователь",
   "context.breakdown.assistant": "Ассистент",
   "context.breakdown.tool": "Вызовы инструментов",
-  "context.breakdown.other": "Другое",
 
-  "context.systemPrompt.title": "Системный промпт",
   "context.rawMessages.title": "Исходные сообщения",
 
   "context.stats.session": "Сессия",
@@ -359,16 +318,6 @@ export const dict = {
   "toast.file.listFailed.title": "Не удалось получить список файлов",
   "toast.context.noLineSelection.title": "Нет выделения строк",
   "toast.context.noLineSelection.description": "Сначала выберите диапазон строк во вкладке файла.",
-  "toast.session.share.copyFailed.title": "Не удалось скопировать URL в буфер обмена",
-  "toast.session.share.success.title": "Сессия опубликована",
-  "toast.session.share.success.description": "URL скопирован в буфер обмена!",
-  "toast.session.share.failed.title": "Не удалось опубликовать сессию",
-  "toast.session.share.failed.description": "Произошла ошибка при публикации сессии",
-
-  "toast.session.unshare.success.title": "Публикация отменена",
-  "toast.session.unshare.success.description": "Публикация успешно отменена!",
-  "toast.session.unshare.failed.title": "Не удалось отменить публикацию",
-  "toast.session.unshare.failed.description": "Произошла ошибка при отмене публикации",
 
   "toast.session.listFailed.title": "Не удалось загрузить сессии для {{project}}",
 
@@ -465,20 +414,6 @@ export const dict = {
   "status.popover.tab.lsp": "LSP",
   "status.popover.tab.plugins": "Плагины",
   "status.popover.action.manageServers": "Управлять серверами",
-
-  "session.share.popover.title": "Опубликовать в интернете",
-  "session.share.popover.description.shared":
-    "Эта сессия общедоступна. Доступ к ней может получить любой, у кого есть ссылка.",
-  "session.share.popover.description.unshared":
-    "Опубликуйте сессию в интернете. Доступ к ней сможет получить любой, у кого есть ссылка.",
-  "session.share.action.share": "Поделиться",
-  "session.share.action.publish": "Опубликовать",
-  "session.share.action.publishing": "Публикация...",
-  "session.share.action.unpublish": "Отменить публикацию",
-  "session.share.action.unpublishing": "Отмена публикации...",
-  "session.share.action.view": "Посмотреть",
-  "session.share.copy.copied": "Скопировано",
-  "session.share.copy.copyLink": "Копировать ссылку",
 
   "lsp.tooltip.none": "Нет LSP серверов",
   "lsp.label.connected": "{{count}} LSP",

@@ -7,7 +7,6 @@ export {
   QueryStringTool,
   QueryPdbTool,
 } from "./database"
-export { NotebookTool } from "./notebook"
 
 import {
   QueryUniprotTool,
@@ -18,7 +17,6 @@ import {
   QueryStringTool,
   QueryPdbTool,
 } from "./database"
-import { NotebookTool } from "./notebook"
 
 export const BiologyTools = [
   QueryUniprotTool,
@@ -28,16 +26,6 @@ export const BiologyTools = [
   QueryNcbiGeneTool,
   QueryStringTool,
   QueryPdbTool,
-  NotebookTool,
 ]
 
-export const BIOLOGY_TOOL_IDS = new Set([
-  "query_uniprot",
-  "query_ensembl",
-  "query_kegg",
-  "query_pubmed",
-  "query_ncbi_gene",
-  "query_string",
-  "query_pdb",
-  "notebook",
-])
+export { BIOLOGY_TOOL_IDS } from "./ids"

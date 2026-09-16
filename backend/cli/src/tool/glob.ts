@@ -1,10 +1,10 @@
 import z from "zod"
 import path from "path"
 import { Tool } from "./tool"
+import { displayPath } from "./display-path"
 import DESCRIPTION from "./glob.txt"
 import { Ripgrep } from "../file/ripgrep"
-import { Instance } from "../project/instance"
-import { assertExternalDirectory } from "./external-directory"
+import { assertExternalDirectory, sessionToolDirectory } from "./external-directory"
 
 export const GlobTool = Tool.define("glob", {
   description: DESCRIPTION,
@@ -28,9 +28,12 @@ export const GlobTool = Tool.define("glob", {
       },
     })
 
-    let search = params.path ?? Instance.directory
-    search = path.isAbsolute(search) ? search : path.resolve(Instance.directory, search)
-    await assertExternalDirectory(ctx, search, { kind: "directory" })
+    const directory = await sessionToolDirectory(ctx)
+    let search = params.path ?? directory
+    search = path.isAbsolute(search) ? search : path.resolve(directory, search)
+    using authorized = await assertExternalDirectory(ctx, search, { kind: "directory" })
+    search = authorized?.path ?? search
+    search = (await authorized?.revalidate()) ?? search
 
     const limit = 100
     const files = []
@@ -67,7 +70,7 @@ export const GlobTool = Tool.define("glob", {
     }
 
     return {
-      title: path.relative(Instance.worktree, search),
+      title: await displayPath(search, ctx.sessionID),
       metadata: {
         count: files.length,
         truncated,

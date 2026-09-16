@@ -2,7 +2,7 @@ import z from "zod"
 import * as path from "path"
 import { Tool } from "./tool"
 import { LSP } from "../lsp"
-import { createTwoFilesPatch } from "diff"
+import { createTwoFilesPatch, diffLines } from "diff"
 import DESCRIPTION from "./write.txt"
 import { Bus } from "../bus"
 import { File } from "../file"
@@ -11,7 +11,10 @@ import { FileTime } from "../file/time"
 import { Filesystem } from "../util/filesystem"
 import { Instance } from "../project/instance"
 import { trimDiff } from "./edit"
-import { assertExternalDirectory } from "./external-directory"
+import { assertExternalDirectory, sessionToolDirectory } from "./external-directory"
+import { SafeFileIO } from "@/file/safe-io"
+import { AuthoritySignal } from "@/project/authority-signal"
+import { PayloadIntegrity } from "./payload-integrity"
 
 const MAX_DIAGNOSTICS_PER_FILE = 20
 const MAX_PROJECT_DIAGNOSTICS_FILES = 5
@@ -23,15 +26,23 @@ export const WriteTool = Tool.define("write", {
     filePath: z.string().describe("The absolute path to the file to write (must be absolute, not relative)"),
   }),
   async execute(params, ctx) {
-    const filepath = path.isAbsolute(params.filePath) ? params.filePath : path.join(Instance.directory, params.filePath)
-    await assertExternalDirectory(ctx, filepath)
+    const directory = await sessionToolDirectory(ctx)
+    const requested = path.isAbsolute(params.filePath) ? params.filePath : path.join(directory, params.filePath)
+    using access = await assertExternalDirectory(ctx, requested, { access: "write" })
+    const filepath = access?.path ?? requested
 
-    const file = Bun.file(filepath)
-    const exists = await file.exists()
-    const contentOld = exists ? await file.text() : ""
+    const approved = await SafeFileIO.optional(filepath)
+    const exists = !!approved
+    const contentOld = approved?.bytes.toString("utf8") ?? ""
     if (exists) await FileTime.assert(ctx.sessionID, filepath)
+    PayloadIntegrity.assert({ content: params.content, before: contentOld, messages: ctx.messages })
 
     const diff = trimDiff(createTwoFilesPatch(filepath, filepath, contentOld, params.content))
+    const filediff = { file: filepath, additions: 0, deletions: 0 }
+    for (const change of diffLines(contentOld, params.content)) {
+      if (change.added) filediff.additions += change.count ?? 0
+      if (change.removed) filediff.deletions += change.count ?? 0
+    }
     await ctx.ask({
       permission: "edit",
       patterns: [path.relative(Instance.worktree, filepath)],
@@ -42,7 +53,11 @@ export const WriteTool = Tool.define("write", {
       },
     })
 
-    await Bun.write(filepath, params.content)
+    await AuthoritySignal.exclusive(async () => {
+      const current = (await access?.revalidate()) ?? filepath
+      if (current !== filepath) throw new Error("File authority changed before the write")
+      await SafeFileIO.write(current, params.content, approved)
+    })
     await Bus.publish(File.Event.Edited, {
       file: filepath,
     })
@@ -78,6 +93,7 @@ export const WriteTool = Tool.define("write", {
         diagnostics,
         filepath,
         exists: exists,
+        filediff,
       },
       output,
     }

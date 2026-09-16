@@ -3,12 +3,13 @@ import {
   createEffect,
   createRoot,
   createSignal,
+  For,
   getOwner,
   onCleanup,
-  Show,
   type Owner,
   type ParentProps,
   runWithOwner,
+  Suspense,
   useContext,
   type JSX,
 } from "solid-js"
@@ -28,30 +29,19 @@ type Active = {
 export interface ShowOptions {
   onClose?: () => void
   /**
-   * Lightweight, non-modal presentation: no backdrop overlay and no body
-   * scroll lock (so opening the dialog doesn't visibly reflow the page).
-   * The dialog content still mounts inside a portal and dismisses on its
-   * own controls — it just doesn't dim/lock the page behind it.
+   * Open above the current dialog instead of replacing it. Closing the
+   * stacked dialog returns to the one underneath with its state intact, so a
+   * confirmation raised from inside Settings does not throw the user out of
+   * Settings.
    */
-  lite?: boolean
+  stack?: boolean
 }
 
 const Context = createContext<ReturnType<typeof init>>()
 
-const LiteContext = createContext<boolean>(false)
-
-/**
- * True when the surrounding dialog was opened in `lite` mode (no backdrop,
- * no scroll lock, no Kobalte focus-trap). Used by `<Dialog>` to render its
- * content as a plain `<div>` instead of `Kobalte.Content`, which would
- * otherwise throw without a Kobalte root.
- */
-export function useDialogLite(): boolean {
-  return useContext(LiteContext)
-}
-
 function init() {
-  const [active, setActive] = createSignal<Active | undefined>()
+  const [stack, setStack] = createSignal<Active[]>([])
+  const active = () => stack().at(-1)
   const timer = { current: undefined as ReturnType<typeof setTimeout> | undefined }
   const lock = { value: false }
 
@@ -77,7 +67,7 @@ function init() {
     timer.current = setTimeout(() => {
       timer.current = undefined
       current.dispose()
-      if (active()?.id === id) setActive(undefined)
+      setStack((items) => items.filter((item) => item.id !== id))
       lock.value = false
     }, 100)
   }
@@ -87,6 +77,8 @@ function init() {
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return
+      const target = event.target
+      if (target instanceof Element && target.closest('[data-dialog-escape-scope="true"]')) return
       close()
       event.preventDefault()
       event.stopPropagation()
@@ -96,12 +88,12 @@ function init() {
     onCleanup(() => window.removeEventListener("keydown", onKeyDown, true))
   })
 
-  const show = (element: DialogElement, owner: Owner, onClose?: () => void, options?: { lite?: boolean }) => {
-    // Immediately dispose any existing dialog when showing a new one
-    const current = active()
-    if (current) {
-      current.dispose()
-      setActive(undefined)
+  const show = (element: DialogElement, owner: Owner, onClose?: () => void, options?: { stack?: boolean }) => {
+    // A dialog still animating shut cannot be stacked on; finish closing it.
+    const stacked = options?.stack === true && active() !== undefined && !lock.value
+    if (!stacked) {
+      for (const item of stack()) item.dispose()
+      setStack([])
     }
 
     if (timer.current !== undefined) {
@@ -114,55 +106,26 @@ function init() {
     let dispose: (() => void) | undefined
     let setClosing: ((closing: boolean) => void) | undefined
 
-    const lite = options?.lite === true
-
     const node = runWithOwner(owner, () =>
       createRoot((d: () => void) => {
         dispose = d
         const [closing, setClosingSignal] = createSignal(false)
         setClosing = setClosingSignal
-        // Lite mode bypasses Kobalte entirely. Kobalte's modal Dialog mounts
-        // a Portal at <body>, adds focus-trap attributes, and (even with
-        // modal={false}) momentarily reshuffles body siblings during mount,
-        // which read as a page "refresh" the instant the dialog appears.
-        // Rendering inside the existing dialog-stack with no portal removes
-        // every body-level side effect — the element just appears in place.
-        if (lite) {
-          return (
-            <Show when={!closing()}>
-              <LiteContext.Provider value={true}>
-                <div
-                  data-component="dialog-lite"
-                  style={{
-                    position: "fixed",
-                    inset: "0",
-                    "z-index": "50",
-                    display: "flex",
-                    "align-items": "center",
-                    "justify-content": "center",
-                    "pointer-events": "none",
-                  }}
-                >
-                  <div data-slot="dialog-lite-content" style={{ "pointer-events": "auto" }}>
-                    {element()}
-                  </div>
-                </div>
-              </LiteContext.Provider>
-            </Show>
-          )
-        }
         return (
           <Kobalte
             modal
             open={!closing()}
             onOpenChange={(open: boolean) => {
               if (open) return
+              // Only the topmost dialog answers dismissal; the one underneath a
+              // stacked dialog stays put until its turn.
+              if (active()?.id !== id) return
               close()
             }}
           >
             <Kobalte.Portal>
               <Kobalte.Overlay data-component="dialog-overlay" onClick={close} />
-              {element()}
+              <Suspense fallback={null}>{element()}</Suspense>
             </Kobalte.Portal>
           </Kobalte>
         )
@@ -171,12 +134,16 @@ function init() {
 
     if (!dispose || !setClosing) return
 
-    setActive({ id, node, dispose, owner, onClose, setClosing })
+    const entry: Active = { id, node, dispose, owner, onClose, setClosing }
+    setStack((items) => [...items, entry])
   }
 
   return {
     get active() {
       return active()
+    },
+    get stack() {
+      return stack()
     },
     close,
     show,
@@ -188,7 +155,9 @@ export function DialogProvider(props: ParentProps) {
   return (
     <Context.Provider value={ctx}>
       {props.children}
-      <div data-component="dialog-stack">{ctx.active?.node}</div>
+      <div data-component="dialog-stack">
+        <For each={ctx.stack}>{(item) => item.node}</For>
+      </div>
     </Context.Provider>
   )
 }
@@ -210,14 +179,13 @@ export function useDialog() {
     },
     /**
      * Show a dialog. Pass a function for `optionsOrOnClose` to use just an
-     * onClose callback (legacy two-arg form), or an options object to opt
-     * into features like `lite` (no backdrop, no scroll lock).
+     * onClose callback (legacy two-arg form), or an options object.
      */
     show(element: DialogElement, optionsOrOnClose?: (() => void) | ShowOptions) {
       const base = ctx.active?.owner ?? owner
       const opts: ShowOptions =
         typeof optionsOrOnClose === "function" ? { onClose: optionsOrOnClose } : (optionsOrOnClose ?? {})
-      ctx.show(element, base, opts.onClose, { lite: opts.lite })
+      ctx.show(element, base, opts.onClose, { stack: opts.stack })
     },
     close() {
       ctx.close()

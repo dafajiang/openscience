@@ -4,6 +4,7 @@ import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { batch, onCleanup } from "solid-js"
 import { usePlatform } from "./platform"
 import { useServer } from "./server"
+import { consumeReconnectingStream } from "./reconnecting-event-stream"
 
 export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleContext({
   name: "GlobalSDK",
@@ -28,6 +29,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
     const coalesced = new Map<string, number>()
     let timer: ReturnType<typeof setTimeout> | undefined
     let last = 0
+    let disposed = false
 
     const key = (directory: string, payload: Event) => {
       if (payload.type === "session.status") return `session.status:${directory}:${payload.properties.sessionID}`
@@ -42,6 +44,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
       if (timer) clearTimeout(timer)
       timer = undefined
 
+      if (disposed) return
       if (queue.length === 0) return
 
       const events = queue
@@ -67,10 +70,11 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
       timer = setTimeout(flush, Math.max(0, 16 - elapsed))
     }
 
-    void (async () => {
-      const events = await eventSdk.global.event()
-      let yielded = Date.now()
-      for await (const event of events.stream) {
+    let yielded = Date.now()
+    void consumeReconnectingStream({
+      connect: () => eventSdk.global.event(),
+      signal: abort.signal,
+      onEvent: async (event) => {
         const directory = event.directory ?? "global"
         const payload = event.payload
         const k = key(directory, payload)
@@ -84,17 +88,18 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
         queue.push({ directory, payload })
         schedule()
 
-        if (Date.now() - yielded < 8) continue
+        if (Date.now() - yielded < 8) return
         yielded = Date.now()
         await new Promise<void>((resolve) => setTimeout(resolve, 0))
-      }
-    })()
-      .finally(flush)
-      .catch(() => undefined)
+      },
+    }).finally(flush)
 
+    // Deliver what is already queued while the owner is still alive; anything
+    // that arrives after this point must not be emitted into a disposed tree.
     onCleanup(() => {
-      abort.abort()
       flush()
+      disposed = true
+      abort.abort()
     })
 
     const sdk = createOpenScienceClient({

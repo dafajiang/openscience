@@ -11,6 +11,7 @@ describe("Filesystem.contains", () => {
     expect(Filesystem.contains("/project", "/project/src")).toBe(true)
     expect(Filesystem.contains("/project", "/project/src/file.ts")).toBe(true)
     expect(Filesystem.contains("/project", "/project")).toBe(true)
+    expect(Filesystem.contains("/project", "/project/..hidden/file.ts")).toBe(true)
   })
 
   test("blocks ../ traversal", () => {
@@ -84,6 +85,64 @@ describe("File.read path traversal protection", () => {
       },
     })
   })
+
+  test("rejects reads through an internal symlink that resolves outside the project", async () => {
+    await using outside = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "secret.txt"), "external secret")
+      },
+    })
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await fs.symlink(outside.path, path.join(dir, "escape"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        await expect(File.read("escape/secret.txt")).rejects.toThrow("Access denied: path escapes project directory")
+        await expect(File.raw("escape/secret.txt")).rejects.toThrow("Access denied: path escapes project directory")
+        await expect(File.inspect("escape/secret.txt")).rejects.toThrow("Access denied: path escapes project directory")
+      },
+    })
+  })
+
+  test("allows a new file below an internal directory", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await fs.mkdir(path.join(dir, "results"), { recursive: true })
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const result = await File.write("results/new.txt", "new result")
+        expect(result.content).toBe("new result")
+        expect(await Bun.file(path.join(tmp.path, "results", "new.txt")).text()).toBe("new result")
+      },
+    })
+  })
+
+  test("rejects a new write below an internal symlink to an external directory", async () => {
+    await using outside = await tmpdir()
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await fs.symlink(outside.path, path.join(dir, "escape"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        await expect(File.write("escape/new.txt", "escaped")).rejects.toThrow(
+          "Access denied: path escapes project directory",
+        )
+        expect(await Bun.file(path.join(outside.path, "new.txt")).exists()).toBe(false)
+      },
+    })
+  })
 })
 
 describe("File.list path traversal protection", () => {
@@ -110,6 +169,26 @@ describe("File.list path traversal protection", () => {
       fn: async () => {
         const result = await File.list("subdir")
         expect(Array.isArray(result)).toBe(true)
+      },
+    })
+  })
+
+  test("rejects listing through an internal symlink that resolves outside the project", async () => {
+    await using outside = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "secret.txt"), "external secret")
+      },
+    })
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await fs.symlink(outside.path, path.join(dir, "escape"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        await expect(File.list("escape")).rejects.toThrow("Access denied: path escapes project directory")
       },
     })
   })
@@ -192,6 +271,25 @@ describe("Instance.containsPath", () => {
         expect(Instance.containsPath(path.join(tmp.path, "file.txt"))).toBe(true)
         expect(Instance.containsPath("/etc/passwd")).toBe(false)
         expect(Instance.containsPath("/tmp/other")).toBe(false)
+      },
+    })
+  })
+
+  test("canonical containment rejects a symlink escape but keeps an internal missing target", async () => {
+    await using outside = await tmpdir()
+    await using tmp = await tmpdir({
+      git: true,
+      init: async (dir) => {
+        await fs.mkdir(path.join(dir, "results"), { recursive: true })
+        await fs.symlink(outside.path, path.join(dir, "escape"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        expect(await Instance.containsCanonicalPath(path.join(tmp.path, "escape", "secret.txt"))).toBe(false)
+        expect(await Instance.containsCanonicalPath(path.join(tmp.path, "results", "new.txt"))).toBe(true)
       },
     })
   })

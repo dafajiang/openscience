@@ -1,86 +1,48 @@
 import { test, expect } from "./fixtures"
-import { modKey, promptSelector } from "./utils"
+import { modelPopoverSelector, modelTriggerSelector } from "./utils"
+
+async function openModelPicker(page: import("@playwright/test").Page) {
+  await page.locator(modelTriggerSelector).click()
+  const picker = page.locator(modelPopoverSelector)
+  const search = picker.getByLabel("Find a model or provider")
+  if (!(await search.isVisible().catch(() => false))) await picker.locator('[data-model-menu-row="model"]').click()
+  await expect(search).toBeVisible()
+  return picker
+}
 
 test("hiding a model removes it from the model picker", async ({ page, gotoSession }) => {
   await gotoSession()
 
-  await page.locator(promptSelector).click()
-  await page.keyboard.type("/model")
+  const picker = await openModelPicker(page)
 
-  const command = page.locator('[data-slash-id="model.choose"]')
-  await expect(command).toBeVisible()
-  await command.hover()
-  await page.keyboard.press("Enter")
-
-  const picker = page.getByRole("dialog")
-  await expect(picker).toBeVisible()
-
-  const target = picker.locator('[data-slot="list-item"]').first()
+  const target = picker.locator('[data-model-catalog-item][aria-checked="false"]').first()
   await expect(target).toBeVisible()
 
-  const key = await target.getAttribute("data-key")
-  if (!key) throw new Error("Failed to resolve model key from list item")
-
-  const name = (await target.locator("span").first().innerText()).trim()
+  const name = (await target.locator(".model-settings-model > strong").textContent())?.trim() ?? ""
   if (!name) throw new Error("Failed to resolve model name from list item")
 
-  await page.keyboard.press("Escape")
-  await expect(picker).toHaveCount(0)
+  await picker.getByRole("button", { name: "manage models" }).first().click()
 
-  const settings = page.getByRole("dialog")
-
-  await page.keyboard.press(`${modKey}+Comma`).catch(() => undefined)
-  const opened = await settings
-    .waitFor({ state: "visible", timeout: 3000 })
-    .then(() => true)
-    .catch(() => false)
-
-  if (!opened) {
-    await page.getByRole("button", { name: "Settings" }).first().click()
-    await expect(settings).toBeVisible()
-  }
-
-  await settings.getByRole("tab", { name: "Models" }).click()
-  const search = settings.getByPlaceholder("Search models")
+  const manage = page.getByRole("dialog")
+  await expect(manage.getByRole("heading", { name: "Models", exact: true })).toBeVisible()
+  await manage.locator(".models-preferences-card").getByRole("button", { name: "Edit", exact: true }).click()
+  const search = manage.getByLabel("Filter models")
   await expect(search).toBeVisible()
   await search.fill(name)
 
-  const toggle = settings.locator('[data-component="switch"]').filter({ hasText: name }).first()
-  const input = toggle.locator('[data-slot="switch-input"]')
-  await expect(toggle).toBeVisible()
-  await expect(input).toHaveAttribute("aria-checked", "true")
-  await toggle.locator('[data-slot="switch-control"]').click()
-  await expect(input).toHaveAttribute("aria-checked", "false")
+  const input = manage.getByRole("switch", { name: `Show ${name} in composer`, exact: true })
+  await expect(input).toBeChecked()
+  await input.locator("..").locator('[data-slot="switch-control"]').click()
+  await expect(input).not.toBeChecked()
 
-  await page.keyboard.press("Escape")
-  const closed = await settings
-    .waitFor({ state: "detached", timeout: 1500 })
-    .then(() => true)
-    .catch(() => false)
-  if (!closed) {
-    await page.keyboard.press("Escape")
-    const closedSecond = await settings
-      .waitFor({ state: "detached", timeout: 1500 })
-      .then(() => true)
-      .catch(() => false)
-    if (!closedSecond) {
-      await page.locator('[data-component="dialog-overlay"]').click({ position: { x: 5, y: 5 } })
-      await expect(settings).toHaveCount(0)
-    }
-  }
+  await manage.getByRole("button", { name: "Close" }).click()
+  await expect(manage).toHaveCount(0)
 
-  await page.locator(promptSelector).click()
-  await page.keyboard.type("/model")
-  await expect(command).toBeVisible()
-  await command.hover()
-  await page.keyboard.press("Enter")
+  const pickerAgain = await openModelPicker(page)
+  await expect(
+    pickerAgain.locator("[data-model-catalog-item]").filter({ has: pickerAgain.getByText(name, { exact: true }) }),
+  ).toHaveCount(0)
 
-  const pickerAgain = page.getByRole("dialog")
-  await expect(pickerAgain).toBeVisible()
-  await expect(pickerAgain.locator('[data-slot="list-item"]').first()).toBeVisible()
-
-  await expect(pickerAgain.locator(`[data-slot="list-item"][data-key="${key}"]`)).toHaveCount(0)
-
-  await page.keyboard.press("Escape")
-  await expect(pickerAgain).toHaveCount(0)
+  await page.locator(modelTriggerSelector).click()
+  await expect(pickerAgain).toBeHidden()
 })

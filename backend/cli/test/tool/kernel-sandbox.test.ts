@@ -23,8 +23,10 @@ describe("Sandbox.wrapArgv — kernel confinement", () => {
 
     const work = fs.mkdtempSync(path.join(os.tmpdir(), "openscience-kernel-test-"))
     const script = path.join(os.tmpdir(), `openscience-kernel-probe-${process.pid}.sh`)
+    const missing = path.join(os.tmpdir(), `openscience-kernel-missing-secret-${process.pid}`)
     const outside = path.join(os.homedir(), `.openscience-kernel-escape-${process.pid}`)
     fs.writeFileSync(script, `printf hi > "${work}/inside" && printf x > "${outside}"\n`)
+    fs.rmSync(missing, { force: true })
     fs.rmSync(outside, { force: true })
 
     try {
@@ -33,6 +35,7 @@ describe("Sandbox.wrapArgv — kernel confinement", () => {
         args: [script],
         workspace: [work],
         extraWritable: [script],
+        unreadable: [missing],
         options: { enabled: true, network: "deny" },
       })
       expect(wrapped.sandboxed).toBe(true)
@@ -45,6 +48,7 @@ describe("Sandbox.wrapArgv — kernel confinement", () => {
       expect(fs.existsSync(outside)).toBe(false)
     } finally {
       fs.rmSync(script, { force: true })
+      fs.rmSync(missing, { force: true })
       fs.rmSync(outside, { force: true })
       fs.rmSync(work, { recursive: true, force: true })
     }

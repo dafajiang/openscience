@@ -1,12 +1,12 @@
 import z from "zod"
 import { Tool } from "./tool"
+import { displayPath } from "./display-path"
 import * as path from "path"
 import DESCRIPTION from "./ls.txt"
-import { Instance } from "../project/instance"
 import { Ripgrep } from "../file/ripgrep"
-import { assertExternalDirectory } from "./external-directory"
+import { assertExternalDirectory, isAuthorizedPath, sessionToolDirectory } from "./external-directory"
 
-export const IGNORE_PATTERNS = [
+const IGNORE_PATTERNS = [
   "node_modules/",
   "__pycache__/",
   ".git/",
@@ -42,17 +42,27 @@ export const ListTool = Tool.define("list", {
     ignore: z.array(z.string()).describe("List of glob patterns to ignore").optional(),
   }),
   async execute(params, ctx) {
-    const searchPath = path.resolve(Instance.directory, params.path || ".")
-    await assertExternalDirectory(ctx, searchPath, { kind: "directory" })
+    let searchPath = path.resolve(await sessionToolDirectory(ctx), params.path || ".")
+    const retained = isAuthorizedPath(ctx.extra?.["fileAuthorization"]) ? ctx.extra?.["fileAuthorization"] : undefined
+    if (retained && retained.path !== searchPath) {
+      throw new Error("Retained directory authorization does not match the requested path")
+    }
+    using owned = retained ? undefined : await assertExternalDirectory(ctx, searchPath, { kind: "directory" })
+    const authorized = retained ?? owned
+    searchPath = authorized?.path ?? searchPath
 
-    await ctx.ask({
-      permission: "list",
-      patterns: [searchPath],
-      always: ["*"],
-      metadata: {
-        path: searchPath,
-      },
-    })
+    if (!retained) {
+      await ctx.ask({
+        permission: "list",
+        patterns: [searchPath],
+        always: ["*"],
+        metadata: {
+          path: searchPath,
+        },
+      })
+    }
+
+    searchPath = (await authorized?.revalidate()) ?? searchPath
 
     const ignoreGlobs = IGNORE_PATTERNS.map((p) => `!${p}*`).concat(params.ignore?.map((p) => `!${p}`) || [])
     const files = []
@@ -110,7 +120,7 @@ export const ListTool = Tool.define("list", {
     const output = `${searchPath}/\n` + renderDir(".", 0)
 
     return {
-      title: path.relative(Instance.worktree, searchPath),
+      title: await displayPath(searchPath, ctx.sessionID),
       metadata: {
         count: files.length,
         truncated: files.length >= LIMIT,

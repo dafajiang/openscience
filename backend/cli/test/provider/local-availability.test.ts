@@ -64,16 +64,15 @@ describe("local provider availability", () => {
     })
   })
 
-  test("a local provider stays available even in managed-wallet mode (it's free)", async () => {
-    await using tmp = await tmpdir({ config: { billing: { llm: "managed" }, provider: { ollama: ollamaBlock } } })
+  test("a local provider stays available with explicit user-owned routing", async () => {
+    await using tmp = await tmpdir({ config: { billing: { llm: "byok" }, provider: { ollama: ollamaBlock } } })
     await Instance.provide({
       directory: tmp.path,
       init: async () => Provider.invalidate(),
       fn: async () => {
         const providers = await Provider.list()
-        // managed drops anthropic/openai/google, but NOT the local endpoint.
         expect(providers["ollama"]).toBeDefined()
-        expect(providers["anthropic"]).toBeUndefined()
+        expect(providers["ollama"].options.baseURL).toBe("http://localhost:11434/v1")
       },
     })
   })

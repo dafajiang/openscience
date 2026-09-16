@@ -1,5 +1,5 @@
 import type { Connector, ConnectorHit } from "../types"
-import { getJSON, getText, orFallback } from "../http"
+import { getJSON, getText } from "../http"
 import { raw, snippet } from "./shared"
 
 /**
@@ -11,6 +11,10 @@ import { raw, snippet } from "./shared"
  */
 
 const BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+// NCBI allows ~3 requests/second without an API key, counted per host across
+// every eutils consumer (this module, literature/pubmed.ts, omics/geo.ts).
+const RATE_LIMIT = { minIntervalMs: 350 }
 
 interface ESearch {
   esearchresult?: { idlist?: string[]; count?: string }
@@ -59,13 +63,14 @@ export const pubmed: Connector = {
     const size = Math.min(opts?.limit ?? 10, 50)
     const esearch = await getJSON<ESearch>(
       `${BASE}/esearch.fcgi?db=pubmed&retmode=json&sort=relevance&retmax=${size}&term=${encodeURIComponent(query)}`,
-      { signal: opts?.signal },
+      { signal: opts?.signal, rateLimit: RATE_LIMIT },
     )
     const ids = esearch.esearchresult?.idlist ?? []
     if (ids.length === 0) return []
 
     const esummary = await getJSON<ESummary>(`${BASE}/esummary.fcgi?db=pubmed&retmode=json&id=${ids.join(",")}`, {
       signal: opts?.signal,
+      rateLimit: RATE_LIMIT,
     })
     const result = esummary.result ?? {}
     return ids
@@ -84,17 +89,15 @@ export const pubmed: Connector = {
     const clean = id.replace(/[^0-9]/g, "")
     const esummary = await getJSON<ESummary>(`${BASE}/esummary.fcgi?db=pubmed&retmode=json&id=${clean}`, {
       signal: opts?.signal,
+      rateLimit: RATE_LIMIT,
     })
     const record = esummary.result?.[clean]
     const summary = record && !Array.isArray(record) ? record : undefined
 
-    const abstract = await orFallback(
-      getText(`${BASE}/efetch.fcgi?db=pubmed&rettype=abstract&retmode=text&id=${clean}`, {
-        signal: opts?.signal,
-      }),
-      undefined,
-      opts?.signal,
-    )
+    const abstract = await getText(`${BASE}/efetch.fcgi?db=pubmed&rettype=abstract&retmode=text&id=${clean}`, {
+      signal: opts?.signal,
+      rateLimit: RATE_LIMIT,
+    })
 
     return {
       pmid: clean,

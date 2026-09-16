@@ -1,5 +1,5 @@
-import type { Connector, ConnectorHit } from "../types"
-import { getText, orFallback } from "../http"
+import type { Connector, ConnectorHit, FetchedFile, FetchOptions } from "../types"
+import { getText } from "../http"
 import { asText, clampLimit } from "./util"
 
 const REST = "https://rest.kegg.jp"
@@ -22,7 +22,7 @@ export const kegg: Connector = {
     const limit = clampLimit(opts?.limit, 10, 50)
     const database = asText(opts?.params?.["database"]) ?? "pathway"
     const url = `${REST}/find/${encodeURIComponent(database)}/${encodeURIComponent(query)}`
-    const text = await orFallback(getText(url, { signal: opts?.signal }), "", opts?.signal)
+    const text = await getText(url, { signal: opts?.signal })
 
     const hits: ConnectorHit[] = []
     for (const line of text.split("\n")) {
@@ -48,7 +48,15 @@ export const kegg: Connector = {
 
   async fetch(id, opts) {
     const url = `${REST}/get/${encodeURIComponent(id)}`
-    const text = await orFallback(getText(url, { signal: opts?.signal }), "", opts?.signal)
+    const text = await getText(url, { signal: opts?.signal })
     return { id, format: "kegg-flat", text }
+  },
+
+  formats: ["fasta"],
+
+  async fetchFile(id, format, opts?: FetchOptions): Promise<FetchedFile> {
+    // KEGG appends the representation as a path suffix; aaseq is amino-acid FASTA.
+    const body = await getText(`${REST}/get/${encodeURIComponent(id)}/aaseq`, { signal: opts?.signal })
+    return { body, contentType: "text/x-fasta", filename: `${id.replace(/:/g, "_")}.${format}` }
   },
 }

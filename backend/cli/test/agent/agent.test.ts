@@ -1,13 +1,48 @@
-import { test, expect } from "bun:test"
-import { tmpdir } from "../fixture/fixture"
+import { afterEach, test, expect, spyOn } from "bun:test"
+import * as AI from "ai"
+import { tmpdir, trustProject } from "../fixture/fixture"
 import { Instance } from "../../src/project/instance"
 import { Agent } from "../../src/agent/agent"
 import { PermissionNext } from "../../src/permission/next"
+import { ProjectTrust } from "../../src/project/trust"
+import { Config } from "../../src/config/config"
+import { Provider } from "../../src/provider/provider"
+import { Auth } from "../../src/auth"
+
+const restores: Array<{ mockRestore(): void }> = []
+
+afterEach(() => {
+  for (const restore of restores.splice(0)) restore.mockRestore()
+})
 
 // Helper to evaluate permission for a tool with wildcard pattern
 function evalPerm(agent: Agent.Info | undefined, permission: string): PermissionNext.Action | undefined {
   if (!agent) return undefined
   return PermissionNext.evaluate(permission, "*", agent.permission).action
+}
+
+function generatedModel() {
+  return {
+    id: "anthropic/claude-test",
+    providerID: "openrouter",
+    api: { id: "anthropic/claude-test", npm: "@openrouter/ai-sdk-provider" },
+    name: "Claude Test",
+    capabilities: {
+      temperature: true,
+      reasoning: false,
+      attachment: false,
+      toolcall: true,
+      input: { text: true, audio: false, image: false, video: false, pdf: false },
+      output: { text: true, audio: false, image: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: 100_000, output: 8_000 },
+    status: "active",
+    options: {},
+    headers: {},
+    release_date: "2026-01-01",
+  } as Provider.Model
 }
 
 test("returns default native agents when no config", async () => {
@@ -16,13 +51,25 @@ test("returns default native agents when no config", async () => {
     directory: tmp.path,
     fn: async () => {
       const agents = await Agent.list()
-      const names = agents.map((a) => a.name)
-      expect(names).toContain("research")
-      expect(names).toContain("plan")
-      expect(names).toContain("task")
-      expect(names).toContain("explore")
-      expect(names).toContain("compaction")
-      expect(names).toContain("title")
+      // The exact built-in list, its modes, and its hidden flags.
+      expect(agents.map((a) => [a.name, a.mode, a.hidden === true])).toEqual([
+        ["research", "primary", false],
+        ["plan", "primary", true],
+        ["explore", "subagent", true],
+        ["ml", "subagent", true],
+        ["biology", "subagent", true],
+        ["physics", "subagent", true],
+        ["chemistry", "subagent", true],
+        ["data", "subagent", true],
+        ["compaction", "primary", true],
+        ["title", "primary", true],
+        ["summary", "primary", true],
+      ])
+      // No built-in agent carries a model; the user's configuration chooses.
+      for (const agent of agents) expect(agent.model, agent.name).toBeUndefined()
+      for (const name of ["execute", "task", "write", "critique", "physics-critique", "literature-review"]) {
+        expect(await Agent.get(name), name).toBeUndefined()
+      }
     },
   })
 })
@@ -38,6 +85,59 @@ test("research agent has correct default properties", async () => {
       expect(research?.native).toBe(true)
       expect(evalPerm(research, "edit")).toBe("allow")
       expect(evalPerm(research, "bash")).toBe("allow")
+    },
+  })
+})
+
+test("domain agents are delegated specialists instead of competing primary modes", async () => {
+  await using tmp = await tmpdir()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      expect((await Agent.get("biology"))?.mode).toBe("subagent")
+      expect((await Agent.get("physics"))?.mode).toBe("subagent")
+      expect((await Agent.get("ml"))?.mode).toBe("subagent")
+      expect((await Agent.get("biology"))?.hidden).toBe(true)
+      expect((await Agent.get("physics"))?.hidden).toBe(true)
+      expect((await Agent.get("ml"))?.hidden).toBe(true)
+    },
+  })
+})
+
+test("Research is the only built-in user-facing primary", async () => {
+  await using tmp = await tmpdir()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const visiblePrimary = (await Agent.list())
+        .filter((agent) => agent.native && agent.mode !== "subagent" && agent.hidden !== true)
+        .map((agent) => agent.name)
+      expect(visiblePrimary).toEqual(["research"])
+      const research = await Agent.get("research")
+      // Research has no prompt of its own: it takes the model-family header.
+      expect(research?.prompt).toBeUndefined()
+      expect((await Agent.get("plan"))?.hidden).toBe(true)
+    },
+  })
+})
+
+test("removed reviewer aliases cannot be restored by persisted agent config", async () => {
+  await using tmp = await tmpdir({
+    config: {
+      agent: {
+        review: { description: "legacy review alias" },
+        reviewer: { description: "legacy reviewer" },
+        "artifact-reviewer": { description: "legacy artifact reviewer" },
+      },
+    },
+  })
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await trustProject()
+      expect(await Agent.get("review")).toBeUndefined()
+      expect(await Agent.get("reviewer")).toBeUndefined()
+      expect(await Agent.get("artifact-reviewer")).toBeUndefined()
     },
   })
 })
@@ -67,23 +167,10 @@ test("explore agent denies edit and write", async () => {
       expect(explore?.mode).toBe("subagent")
       expect(evalPerm(explore, "edit")).toBe("deny")
       expect(evalPerm(explore, "write")).toBe("deny")
+      expect(evalPerm(explore, "webfetch")).toBe("allow")
+      expect(evalPerm(explore, "network")).toBe("ask")
       expect(evalPerm(explore, "todoread")).toBe("deny")
       expect(evalPerm(explore, "todowrite")).toBe("deny")
-    },
-  })
-})
-
-test("task agent denies todo tools", async () => {
-  await using tmp = await tmpdir()
-  await Instance.provide({
-    directory: tmp.path,
-    fn: async () => {
-      const task = await Agent.get("task")
-      expect(task).toBeDefined()
-      expect(task?.mode).toBe("subagent")
-      expect(task?.hidden).toBeUndefined()
-      expect(evalPerm(task, "todoread")).toBe("deny")
-      expect(evalPerm(task, "todowrite")).toBe("deny")
     },
   })
 })
@@ -99,6 +186,37 @@ test("compaction agent denies all permissions", async () => {
       expect(evalPerm(compaction, "bash")).toBe("deny")
       expect(evalPerm(compaction, "edit")).toBe("deny")
       expect(evalPerm(compaction, "read")).toBe("deny")
+    },
+  })
+})
+
+test("untrusted project agent configuration stays inert", async () => {
+  await using tmp = await tmpdir({
+    config: {
+      default_agent: "repo-agent",
+      permission: { bash: "deny" },
+      agent: {
+        "repo-agent": {
+          mode: "primary",
+          prompt: "repository-controlled",
+        },
+        research: {
+          prompt: "repository-controlled",
+          color: "#FF0000",
+        },
+      },
+    },
+  })
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await ProjectTrust.update(Instance.project, { trusted: false })
+      expect(await Agent.get("repo-agent")).toBeUndefined()
+      const research = await Agent.get("research")
+      expect(research?.prompt).toBeUndefined()
+      expect(research?.color).toBe("#d48765")
+      expect(evalPerm(research, "bash")).toBe("ask")
+      expect(await Agent.defaultAgent()).toBe("research")
     },
   })
 })
@@ -119,6 +237,7 @@ test("custom agent from config creates new agent", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const custom = await Agent.get("my_custom_agent")
       expect(custom).toBeDefined()
       expect(custom?.model?.providerID).toBe("openai")
@@ -128,6 +247,28 @@ test("custom agent from config creates new agent", async () => {
       expect(custom?.topP).toBe(0.9)
       expect(custom?.native).toBe(false)
       expect(custom?.mode).toBe("all")
+    },
+  })
+})
+
+test("legacy docs config remains a subagent", async () => {
+  await using tmp = await tmpdir({
+    config: {
+      agent: {
+        docs: {
+          description: "Documentation specialist",
+          mode: "all",
+        },
+      },
+    },
+  })
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await trustProject()
+      const docs = await Agent.get("docs")
+      expect(docs?.mode).toBe("subagent")
+      expect(docs?.description).toBe("Documentation specialist")
     },
   })
 })
@@ -148,6 +289,7 @@ test("custom agent config overrides native agent properties", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(research).toBeDefined()
       expect(research?.model?.providerID).toBe("anthropic")
@@ -171,6 +313,7 @@ test("agent disable removes agent from list", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const explore = await Agent.get("explore")
       expect(explore).toBeUndefined()
       const agents = await Agent.list()
@@ -197,6 +340,7 @@ test("agent permission config merges with defaults", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(research).toBeDefined()
       // Specific pattern is denied
@@ -218,6 +362,7 @@ test("global permission config applies to all agents", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(research).toBeDefined()
       expect(evalPerm(research, "bash")).toBe("deny")
@@ -237,6 +382,7 @@ test("agent steps/maxSteps config sets steps property", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       const plan = await Agent.get("plan")
       expect(research?.steps).toBe(50)
@@ -256,6 +402,7 @@ test("agent mode can be overridden", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const explore = await Agent.get("explore")
       expect(explore?.mode).toBe("primary")
     },
@@ -273,6 +420,7 @@ test("agent name can be overridden", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(research?.name).toBe("Builder")
     },
@@ -290,6 +438,7 @@ test("agent prompt can be set from config", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(research?.prompt).toBe("Custom system prompt")
     },
@@ -310,6 +459,7 @@ test("unknown agent properties are placed into options", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(research?.options.random_property).toBe("hello")
       expect(research?.options.another_random).toBe(123)
@@ -333,6 +483,7 @@ test("agent options merge correctly", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(research?.options.custom_option).toBe(true)
       expect(research?.options.another_option).toBe("value")
@@ -358,6 +509,7 @@ test("multiple custom agents can be defined", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const agentA = await Agent.get("agent_a")
       const agentB = await Agent.get("agent_b")
       expect(agentA?.description).toBe("Agent A")
@@ -379,27 +531,65 @@ test("Agent.get returns undefined for non-existent agent", async () => {
   })
 })
 
-test("default permission includes doom_loop and external_directory as ask", async () => {
+test("fresh Approve mode auto-allows safe sandboxed work and asks at external boundaries", async () => {
   await using tmp = await tmpdir()
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
       const research = await Agent.get("research")
-      expect(evalPerm(research, "doom_loop")).toBe("ask")
+      expect(evalPerm(research, "edit")).toBe("allow")
+      expect(evalPerm(research, "bash")).toBe("allow")
+      expect(evalPerm(research, "network")).toBe("ask")
+      expect(evalPerm(research, "webfetch")).toBe("allow")
+      expect(evalPerm(research, "websearch")).toBe("allow")
+      expect(evalPerm(research, "mcp")).toBe("ask")
       expect(evalPerm(research, "external_directory")).toBe("ask")
+      expect(evalPerm(research, "compute_job")).toBe("ask")
+      expect(PermissionNext.evaluate("read", ".env", research!.permission).action).toBe("ask")
     },
   })
 })
 
-test("webfetch is allowed by default", async () => {
+test("persisted Ask mode overrides built-in subagent convenience allows", async () => {
   await using tmp = await tmpdir()
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await ProjectTrust.update(Instance.project, { trusted: false })
+      Agent.invalidate()
+      expect(await ProjectTrust.status(Instance.project)).toMatchObject({ source: "persisted", state: "revoked" })
       const research = await Agent.get("research")
-      expect(evalPerm(research, "webfetch")).toBe("allow")
+      const explore = await Agent.get("explore")
+      expect(evalPerm(research, "edit")).toBe("ask")
+      expect(evalPerm(explore, "edit")).toBe("deny")
+      for (const permission of ["bash", "network", "webfetch", "websearch"]) {
+        expect(evalPerm(research, permission)).toBe("ask")
+        expect(evalPerm(explore, permission)).toBe("ask")
+      }
+      expect(evalPerm(research, "external_directory")).toBe("ask")
+      expect(evalPerm(explore, "external_directory")).toBe("deny")
     },
   })
+})
+
+test("explicit Full mode removes file command and internet approval prompts", async () => {
+  const previous = await Config.trustedSandbox()
+  await Config.setSandbox({ enabled: false })
+  try {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const research = await Agent.get("research")
+        for (const permission of ["edit", "bash", "network", "webfetch", "websearch", "external_directory"]) {
+          expect(evalPerm(research, permission)).toBe("allow")
+        }
+        expect(PermissionNext.evaluate("read", ".env", research!.permission).action).toBe("allow")
+      },
+    })
+  } finally {
+    await Config.setSandbox(previous)
+  }
 })
 
 test("legacy tools config converts to permissions", async () => {
@@ -418,6 +608,7 @@ test("legacy tools config converts to permissions", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(evalPerm(research, "bash")).toBe("deny")
       expect(evalPerm(research, "read")).toBe("deny")
@@ -440,13 +631,14 @@ test("legacy tools config maps write/edit/patch/multiedit to edit permission", a
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(evalPerm(research, "edit")).toBe("deny")
     },
   })
 })
 
-test("Truncate.DIR is allowed even when user denies external_directory globally", async () => {
+test("a global external_directory deny also protects the tool-output broker", async () => {
   const { Truncate } = await import("../../src/tool/truncation")
   await using tmp = await tmpdir({
     config: {
@@ -458,9 +650,10 @@ test("Truncate.DIR is allowed even when user denies external_directory globally"
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
-      expect(PermissionNext.evaluate("external_directory", Truncate.DIR, research!.permission).action).toBe("allow")
-      expect(PermissionNext.evaluate("external_directory", Truncate.GLOB, research!.permission).action).toBe("allow")
+      expect(PermissionNext.evaluate("external_directory", Truncate.DIR, research!.permission).action).toBe("deny")
+      expect(PermissionNext.evaluate("external_directory", Truncate.GLOB, research!.permission).action).toBe("deny")
       expect(PermissionNext.evaluate("external_directory", "/some/other/path", research!.permission).action).toBe(
         "deny",
       )
@@ -468,7 +661,7 @@ test("Truncate.DIR is allowed even when user denies external_directory globally"
   })
 })
 
-test("Truncate.DIR is allowed even when user denies external_directory per-agent", async () => {
+test("a per-agent external_directory deny also protects the tool-output broker", async () => {
   const { Truncate } = await import("../../src/tool/truncation")
   await using tmp = await tmpdir({
     config: {
@@ -484,9 +677,10 @@ test("Truncate.DIR is allowed even when user denies external_directory per-agent
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
-      expect(PermissionNext.evaluate("external_directory", Truncate.DIR, research!.permission).action).toBe("allow")
-      expect(PermissionNext.evaluate("external_directory", Truncate.GLOB, research!.permission).action).toBe("allow")
+      expect(PermissionNext.evaluate("external_directory", Truncate.DIR, research!.permission).action).toBe("deny")
+      expect(PermissionNext.evaluate("external_directory", Truncate.GLOB, research!.permission).action).toBe("deny")
       expect(PermissionNext.evaluate("external_directory", "/some/other/path", research!.permission).action).toBe(
         "deny",
       )
@@ -509,6 +703,7 @@ test("explicit Truncate.DIR deny is respected", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const research = await Agent.get("research")
       expect(PermissionNext.evaluate("external_directory", Truncate.DIR, research!.permission).action).toBe("deny")
       expect(PermissionNext.evaluate("external_directory", Truncate.GLOB, research!.permission).action).toBe("deny")
@@ -536,6 +731,7 @@ test("defaultAgent respects default_agent config set to plan", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const agent = await Agent.defaultAgent()
       expect(agent).toBe("plan")
     },
@@ -556,6 +752,7 @@ test("defaultAgent respects default_agent config set to custom agent with mode a
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       const agent = await Agent.defaultAgent()
       expect(agent).toBe("my_custom")
     },
@@ -571,6 +768,7 @@ test("defaultAgent throws when default_agent points to subagent", async () => {
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       await expect(Agent.defaultAgent()).rejects.toThrow('default agent "explore" is a subagent')
     },
   })
@@ -585,6 +783,7 @@ test("defaultAgent throws when default_agent points to hidden agent", async () =
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       await expect(Agent.defaultAgent()).rejects.toThrow('default agent "compaction" is hidden')
     },
   })
@@ -599,12 +798,13 @@ test("defaultAgent throws when default_agent points to non-existent agent", asyn
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       await expect(Agent.defaultAgent()).rejects.toThrow('default agent "does_not_exist" not found')
     },
   })
 })
 
-test("defaultAgent returns next primary agent when first is disabled", async () => {
+test("defaultAgent does not silently replace disabled research with plan mode", async () => {
   await using tmp = await tmpdir({
     config: {
       agent: {
@@ -615,9 +815,8 @@ test("defaultAgent returns next primary agent when first is disabled", async () 
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
-      const agent = await Agent.defaultAgent()
-      // research is disabled, so it should return the next primary agent
-      expect(agent).toBe("biology")
+      await trustProject()
+      await expect(Agent.defaultAgent()).rejects.toThrow("no primary visible agent found")
     },
   })
 })
@@ -637,7 +836,138 @@ test("defaultAgent throws when all primary visible agents are disabled", async (
   await Instance.provide({
     directory: tmp.path,
     fn: async () => {
+      await trustProject()
       await expect(Agent.defaultAgent()).rejects.toThrow("no primary visible agent found")
+    },
+  })
+})
+
+test("agent configuration generation disables AI SDK telemetry", async () => {
+  await using tmp = await tmpdir()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const model = generatedModel()
+      const getModel = spyOn(Provider, "getModel").mockResolvedValue(model)
+      const getLanguage = spyOn(Provider, "getLanguage").mockResolvedValue({} as never)
+      const auth = spyOn(Auth, "get").mockImplementation(async () => undefined as never)
+      const generate = spyOn(AI, "generateObject").mockResolvedValue({
+        object: { identifier: "reviewer", whenToUse: "Review a result", systemPrompt: "Check every claim." },
+        usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30 },
+        finishReason: "stop",
+      } as never)
+      restores.push(getModel, getLanguage, auth, generate)
+
+      const output = await Agent.generate({
+        description: "Create a careful reviewer",
+        model: { providerID: "requested-provider", modelID: "requested-model" },
+      })
+
+      expect(output).toEqual({
+        identifier: "reviewer",
+        whenToUse: "Review a result",
+        systemPrompt: "Check every claim.",
+      })
+      expect(generate).toHaveBeenCalledTimes(1)
+      expect(generate.mock.calls[0]?.[0]).toMatchObject({
+        experimental_telemetry: { isEnabled: false, recordInputs: false, recordOutputs: false },
+        temperature: 0.3,
+      })
+    },
+  })
+})
+
+test("OAuth configuration generation streams without provider telemetry", async () => {
+  await using tmp = await tmpdir()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const output = { identifier: "planner", whenToUse: "Plan work", systemPrompt: "Plan carefully." }
+      const model = { ...generatedModel(), id: "gpt-test", providerID: "openai" }
+      const getModel = spyOn(Provider, "getModel").mockResolvedValue(model)
+      const getLanguage = spyOn(Provider, "getLanguage").mockResolvedValue({} as never)
+      const auth = spyOn(Auth, "get").mockResolvedValue({
+        type: "oauth",
+        refresh: "refresh",
+        access: "access",
+        expires: Date.now() + 60_000,
+      })
+      const generate = spyOn(AI, "generateObject")
+      const stream = spyOn(AI, "streamObject").mockReturnValue({
+        object: Promise.resolve(output),
+        usage: Promise.resolve({ inputTokens: 20, outputTokens: 10, totalTokens: 30 }),
+        finishReason: Promise.resolve("stop"),
+        fullStream: (async function* () {
+          yield { type: "finish" }
+        })(),
+      } as never)
+      restores.push(getModel, getLanguage, auth, generate, stream)
+
+      expect(
+        await Agent.generate({
+          description: "Create a planning agent",
+          model: { providerID: "openai", modelID: "gpt-test" },
+        }),
+      ).toEqual(output)
+
+      expect(generate).not.toHaveBeenCalled()
+      expect(stream).toHaveBeenCalledTimes(1)
+      expect(stream.mock.calls[0]?.[0]).toMatchObject({
+        experimental_telemetry: { isEnabled: false, recordInputs: false, recordOutputs: false },
+      })
+    },
+  })
+})
+
+test("specialists are one template plus their skill categories and domain tools", async () => {
+  await using tmp = await tmpdir()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const biology = await Agent.get("biology")
+      expect(biology?.skills).toEqual(["biology", "databases"])
+      expect(biology?.unlocks).toContain("query_uniprot")
+      expect(biology?.prompt).toContain("biology specialist")
+      expect(biology?.prompt).toContain("{{DOMAIN_SKILLS}}")
+      expect(evalPerm(biology, "todowrite")).toBe("deny")
+      expect(evalPerm(biology, "task")).toBe("deny")
+      expect(evalPerm(biology, "question")).toBe("deny")
+      expect(evalPerm(biology, "edit")).toBe("allow")
+      const data = await Agent.get("data")
+      expect(data?.skills).toEqual(["data-engineering", "coding", "visualization", "cloud-compute"])
+      expect(data?.unlocks).toEqual(["r"])
+      expect((await Agent.get("summary"))?.prompt).toContain("lab-notebook")
+    },
+  })
+})
+
+test("a configured agent model, variant and skill categories resolve for the child", async () => {
+  await using tmp = await tmpdir({
+    git: true,
+    config: {
+      agent: {
+        biology: { model: "openai/gpt-5.6-sol", variant: "high" },
+        geoscience: {
+          mode: "subagent",
+          description: "Geoscience specialist",
+          skills: ["physics"],
+          permission: { r: "allow" },
+        },
+      },
+    },
+  })
+  await Instance.provide({
+    directory: tmp.path,
+    init: trustProject,
+    fn: async () => {
+      const biology = await Agent.get("biology")
+      expect(biology?.model).toEqual({ providerID: "openai", modelID: "gpt-5.6-sol" })
+      expect(biology?.variant).toBe("high")
+      const geoscience = await Agent.get("geoscience")
+      expect(geoscience?.mode).toBe("subagent")
+      expect(geoscience?.skills).toEqual(["physics"])
+      expect(geoscience?.unlocks).toEqual(["r"])
+      expect(geoscience?.model).toBeUndefined()
     },
   })
 })

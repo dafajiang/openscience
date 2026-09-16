@@ -11,11 +11,27 @@
  *   POST /commit  { directory, message }
  *   POST /push    { directory, branch? }
  *   POST /remote  { directory, url } — sets origin (add or replace)
+ *
+ * Every operation requires the opaque project selector. A directory may be
+ * supplied only as a checked worktree override; a caller-owned directory by
+ * itself never grants repository execution authority.
  */
 
 import { Hono } from "hono"
 import { spawn } from "child_process"
-import { lazy } from "../../util/lazy"
+import { lazy } from "@synsci/util/lazy"
+import { projectSelection } from "../project-selection"
+import { Instance } from "@/project/instance"
+import { InstanceBootstrap } from "@/project/bootstrap"
+import { Project } from "@/project/project"
+import { ProjectTrust } from "@/project/trust"
+import { AuthoritySignal } from "@/project/authority-signal"
+import { Config } from "@/config/config"
+import { HostCredentials } from "@/credentials/host"
+import { Sandbox } from "@/sandbox/sandbox"
+import { OpenScience } from "@/openscience"
+import { CommandRuntime } from "@/science/command/registry"
+import { Shell } from "@/shell/shell"
 
 interface RunResult {
   code: number
@@ -35,40 +51,133 @@ export function assertSafeRemoteUrl(url: unknown): string {
   return value
 }
 
-function run(command: string, args: string[], cwd: string, ok: number[] = [0]): Promise<RunResult> {
-  return new Promise((resolveP, rejectP) => {
-    const child = spawn(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      cwd,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        // Defense in depth: refuse the code-executing helper transports even if a
-        // malicious remote URL slips past assertSafeRemoteUrl.
-        GIT_CONFIG_COUNT: "2",
-        GIT_CONFIG_KEY_0: "protocol.ext.allow",
-        GIT_CONFIG_VALUE_0: "never",
-        GIT_CONFIG_KEY_1: "protocol.fake.allow",
-        GIT_CONFIG_VALUE_1: "never",
-      },
+/** A branch name is passed to git as a positional, and git accepts options
+ *  after positionals: `--mirror`, `--force` or `--all` in this field would
+ *  rewrite the remote. Only names git itself accepts for a branch pass.
+ *  Exported for tests. */
+export function assertSafeBranch(branch: unknown): string {
+  const value = String(branch ?? "").trim()
+  if (!value) throw new Error("branch required")
+  if (value.startsWith("-")) throw new Error("invalid branch name")
+  // git check-ref-format --branch, expressed as a pattern: no control or
+  // space characters, no "..", no "@{", no path components that begin with a
+  // dot or end with ".lock", no leading or trailing slash, no trailing dot.
+  const forbidden = /[\x00-\x20\x7f~^:?*[\\]|\.\.|@\{|\/\/|^\/|\/$|\.$|(^|\/)\.|\.lock(\/|$)/
+  if (forbidden.test(value) || value === "@") throw new Error("invalid branch name")
+  return value
+}
+
+async function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  ok: number[] = [0],
+  network: { publish: boolean } = { publish: false },
+): Promise<RunResult> {
+  const launched = await AuthoritySignal.exclusive(async () => {
+    await ProjectTrust.require(Instance.project, "repository")
+    const options = await Config.trustedSandbox()
+    const sandbox = Sandbox.wrapArgv({
+      file: command,
+      args,
+      workspace: [cwd],
+      readable: [cwd],
+      unreadable: OpenScience.kernelSensitivePaths(),
+      options,
+      escalateNetwork: network.publish,
     })
-    let out = ""
-    let err = ""
-    child.stdout.on("data", (chunk) => (out += chunk.toString()))
-    child.stderr.on("data", (chunk) => (err += chunk.toString()))
-    child.on("error", rejectP)
-    child.on("close", (code) => {
-      const result: RunResult = { code: code ?? 1, out: out.trim(), err: err.trim() }
-      if (ok.includes(result.code)) {
-        resolveP(result)
-        return
+    // A push the user clicked runs with the network and the machine's own
+    // GitHub login (gh, or a saved credential), so it never prompts or hangs.
+    const credentials: Record<string, string> = network.publish
+      ? await HostCredentials.publishEnv(sandbox.temporary, await HostCredentials.discover()).catch(() => ({}))
+      : {}
+    const wrapped = await CommandRuntime.wrap({
+      file: sandbox.file,
+      args: sandbox.args,
+    })
+    const child = (() => {
+      try {
+        return spawn(wrapped.file, wrapped.args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          cwd,
+          env: {
+            ...OpenScience.kernelEnv(process.env),
+            ...credentials,
+            ...protocolGuards(Number(credentials.GIT_CONFIG_COUNT ?? 0)),
+          },
+          detached: process.platform !== "win32",
+        })
+      } catch (error) {
+        Sandbox.cleanup(sandbox)
+        throw error
       }
-      rejectP(new Error(result.err || result.out || `${command} exited ${code}`))
+    })()
+    const stop = () =>
+      Shell.killTree(child, { exited: () => child.exitCode !== null, detached: process.platform !== "win32" })
+    const output = new Promise<RunResult>((resolve, reject) => {
+      let out = ""
+      let err = ""
+      child.stdout?.on("data", (chunk) => (out += chunk.toString()))
+      child.stderr?.on("data", (chunk) => (err += chunk.toString()))
+      child.once("error", reject)
+      child.once("close", (code) => {
+        resolve({ code: code ?? 1, out: out.trim(), err: err.trim() })
+      })
     })
+    const registered = await CommandRuntime.start(
+      {
+        projectID: Instance.project.id,
+        sessionID: "repository",
+        messageID: "repository",
+        description: "Repository operation",
+        command: [command, ...args].join(" "),
+      },
+      child,
+      stop,
+      { windowsRelease: wrapped.release },
+    ).catch(async (error) => {
+      if (child.exitCode !== null || child.signalCode !== null) return undefined
+      await stop()
+      Sandbox.cleanup(sandbox)
+      throw error
+    })
+    const safeStop = registered
+      ? async () => {
+          await CommandRuntime.stop(registered.id, registered.projectID, registered.sessionID)
+        }
+      : stop
+    return { registered, sandbox, stop: safeStop, output }
   })
+
+  const timeout = new Promise<never>((_resolve, reject) => {
+    const timer = setTimeout(() => {
+      void launched.stop().finally(() => reject(new Error(`${command} timed out`)))
+    }, 120_000)
+    timer.unref()
+    launched.output.finally(() => clearTimeout(timer)).catch(() => undefined)
+  })
+  const result = await Promise.race([launched.output, timeout]).finally(() => {
+    Sandbox.cleanup(launched.sandbox)
+    if (launched.registered) CommandRuntime.finish(launched.registered.id)
+  })
+  if (ok.includes(result.code)) return result
+  throw new Error(result.err || result.out || `${command} exited ${result.code}`)
 }
 
 const git = (args: string[], directory: string, ok?: number[]) => run("git", args, directory, ok)
+const gitPublish = (args: string[], directory: string) => run("git", args, directory, [0], { publish: true })
+
+/** Refuse ext:: and fake transports; numbered after any credential entries so
+ * both sets of GIT_CONFIG_* variables apply. */
+function protocolGuards(offset: number) {
+  return {
+    GIT_CONFIG_COUNT: String(offset + 2),
+    [`GIT_CONFIG_KEY_${offset}`]: "protocol.ext.allow",
+    [`GIT_CONFIG_VALUE_${offset}`]: "never",
+    [`GIT_CONFIG_KEY_${offset + 1}`]: "protocol.fake.allow",
+    [`GIT_CONFIG_VALUE_${offset + 1}`]: "never",
+  }
+}
 
 interface RemoteInfo {
   owner: string
@@ -175,13 +284,13 @@ async function commit(directory: string, message: unknown) {
 
 async function push(directory: string, branch: unknown) {
   if (!directory) throw new Error("directory required")
-  const current = String(branch || (await git(["branch", "--show-current"], directory).then((x) => x.out))).trim()
-  if (!current) throw new Error("branch required")
+  const current = assertSafeBranch(branch || (await git(["branch", "--show-current"], directory).then((x) => x.out)))
   const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], directory)
     .then((x) => x.out)
     .catch(() => "")
-  const args = upstream ? ["push"] : ["push", "-u", "origin", current]
-  const result = await git(args, directory)
+  // An explicit refspec after `--` leaves git nothing to read as an option.
+  const args = upstream ? ["push"] : ["push", "-u", "origin", "--", `refs/heads/${current}:refs/heads/${current}`]
+  const result = await gitPublish(args, directory)
   return { pushed: true, output: result.out || result.err }
 }
 
@@ -203,35 +312,68 @@ async function wrap<T>(fn: () => Promise<T>) {
   }
 }
 
+async function within<T>(
+  selected: Awaited<ReturnType<typeof projectSelection>>,
+  action: (directory: string) => Promise<T>,
+) {
+  if (!selected.project || !selected.directory) {
+    throw new Error("Repository operations require an opaque project selector")
+  }
+  return Instance.provide({
+    directory: selected.directory,
+    projectID: selected.project.id,
+    init: InstanceBootstrap,
+    async fn() {
+      if (Instance.project.id !== selected.project.id) {
+        throw new Project.MismatchError({ projectID: selected.project.id, directory: Instance.directory })
+      }
+      await ProjectTrust.require(Instance.project, "repository")
+      return action(Instance.directory)
+    },
+  })
+}
+
 export const RepoRoutes = lazy(() =>
   new Hono()
     .get("/status", async (c) => {
-      const directory = String(c.req.query("directory") ?? "").trim()
-      const r = await wrap(() => status(directory))
+      const selected = await projectSelection(c)
+      const r = await wrap(() => within(selected, status))
       return c.json(r.body, r.ok ? 200 : 400)
     })
     .post("/commit", async (c) => {
-      let body: { directory?: string; message?: unknown } = {}
+      let body: { directory?: string; project?: string; projectID?: string; message?: unknown } = {}
       try {
         body = await c.req.json()
       } catch {}
-      const r = await wrap(() => commit(String(body.directory ?? ""), body.message))
+      const selected = await projectSelection(c, {
+        projectID: body.projectID ?? body.project,
+        directory: body.directory,
+      })
+      const r = await wrap(() => within(selected, (directory) => commit(directory, body.message)))
       return c.json(r.body, r.ok ? 200 : 400)
     })
     .post("/push", async (c) => {
-      let body: { directory?: string; branch?: unknown } = {}
+      let body: { directory?: string; project?: string; projectID?: string; branch?: unknown } = {}
       try {
         body = await c.req.json()
       } catch {}
-      const r = await wrap(() => push(String(body.directory ?? ""), body.branch))
+      const selected = await projectSelection(c, {
+        projectID: body.projectID ?? body.project,
+        directory: body.directory,
+      })
+      const r = await wrap(() => within(selected, (directory) => push(directory, body.branch)))
       return c.json(r.body, r.ok ? 200 : 400)
     })
     .post("/remote", async (c) => {
-      let body: { directory?: string; url?: unknown } = {}
+      let body: { directory?: string; project?: string; projectID?: string; url?: unknown } = {}
       try {
         body = await c.req.json()
       } catch {}
-      const r = await wrap(() => setRemote(String(body.directory ?? ""), body.url))
+      const selected = await projectSelection(c, {
+        projectID: body.projectID ?? body.project,
+        directory: body.directory,
+      })
+      const r = await wrap(() => within(selected, (directory) => setRemote(directory, body.url)))
       return c.json(r.body, r.ok ? 200 : 400)
     }),
 )

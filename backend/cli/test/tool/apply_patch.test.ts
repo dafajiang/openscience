@@ -1,9 +1,14 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import path from "path"
+import crypto from "node:crypto"
 import * as fs from "fs/promises"
 import { ApplyPatchTool } from "../../src/tool/apply_patch"
 import { Instance } from "../../src/project/instance"
 import { tmpdir } from "../fixture/fixture"
+import { FileTrash } from "../../src/file/trash"
+import { Session } from "../../src/session"
+import { SessionFilesystem } from "../../src/session/filesystem"
+import { Storage } from "../../src/storage/storage"
 
 const baseCtx = {
   sessionID: "test",
@@ -58,6 +63,16 @@ const makeCtx = () => {
 }
 
 describe("tool.apply_patch freeform", () => {
+  test("tells the model that multi-file patches are preflighted and rolled back together", async () => {
+    const description = await Bun.file(new URL("../../src/tool/apply_patch.txt", import.meta.url)).text()
+    expect(description).toContain("Multi-file patches are supported in one call")
+    expect(description).toContain("preflights every file before writing")
+    expect(description).toContain("rolls back completed file operations")
+    expect(description).not.toContain(
+      "apply_patch verification failed: multi-file patches are not atomic; submit one file per patch",
+    )
+  })
+
   test("requires patchText", async () => {
     const { ctx } = makeCtx()
     await expect(execute({ patchText: "" }, ctx)).rejects.toThrow("patchText is required")
@@ -74,7 +89,71 @@ describe("tool.apply_patch freeform", () => {
     await expect(execute({ patchText: emptyPatch }, ctx)).rejects.toThrow("patch rejected: empty patch")
   })
 
-  test("applies add/update/delete in one patch", async () => {
+  test("reports the exact failed update hunk and its nearby context", async () => {
+    await using fixture = await tmpdir({ git: true })
+    const { ctx } = makeCtx()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        await fs.writeFile(
+          path.join(fixture.path, "paper.tex"),
+          ["\\usepackage{doi}", "", "The complete methods paragraph stays on one physical line.", ""].join("\n"),
+          "utf8",
+        )
+        const patchText = [
+          "*** Begin Patch",
+          "*** Update File: paper.tex",
+          "@@",
+          "-\\usepackage{doi}",
+          "+\\usepackage{doi}",
+          "+\\usepackage{xurl}",
+          "@@",
+          "-Sample registry fields came from DOI",
+          "+Sample registry fields came from a verified DOI",
+          "*** End Patch",
+        ].join("\n")
+
+        await expect(execute({ patchText }, ctx)).rejects.toThrow(/Failed update hunk: 2/)
+        await expect(execute({ patchText }, ctx)).rejects.toThrow(
+          /The complete methods paragraph stays on one physical line/,
+        )
+      },
+    })
+  })
+
+  test("anchors a completely stale hunk near its deep-file location instead of the file header", async () => {
+    await using fixture = await tmpdir({ git: true })
+    const { ctx } = makeCtx()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const lines = Array.from({ length: 220 }, (_, index) => `unchanged supporting line ${index + 1}`)
+        lines[172] =
+          "Sample registry records are now loaded from the canonical PANGAEA DOI with verified input checksums."
+        await fs.writeFile(path.join(fixture.path, "long-report.tex"), `${lines.join("\n")}\n`, "utf8")
+        const patchText = [
+          "*** Begin Patch",
+          "*** Update File: long-report.tex",
+          "@@",
+          "-Sample registry fields came from the PANGAEA DOI with reported input checksums.",
+          "+Sample registry fields came from the verified source DOI.",
+          "*** End Patch",
+        ].join("\n")
+
+        const failure = await execute({ patchText }, ctx).catch((error: Error) => error)
+        expect(failure).toBeInstanceOf(Error)
+        if (!(failure instanceof Error)) throw new Error("Expected a stale patch failure")
+        expect(failure.message).toContain("Failed update hunk: 1")
+        expect(failure.message).toContain("Current bounded context (lines 169-188)")
+        expect(failure.message).toContain("173: Sample registry records are now loaded")
+        expect(failure.message).not.toMatch(/(?:^|\n)1: unchanged supporting line 1(?:\n|$)/)
+      },
+    })
+  })
+
+  test("applies a fully preflighted multi-file patch in one transaction", async () => {
     await using fixture = await tmpdir({ git: true })
     const { ctx, calls } = makeCtx()
 
@@ -90,31 +169,83 @@ describe("tool.apply_patch freeform", () => {
           "*** Begin Patch\n*** Add File: nested/new.txt\n+created\n*** Delete File: delete.txt\n*** Update File: modify.txt\n@@\n-line2\n+changed\n*** End Patch"
 
         const result = await execute({ patchText }, ctx)
-
-        expect(result.title).toContain("Success. Updated the following files")
-        expect(result.output).toContain("Success. Updated the following files")
-        expect(result.metadata.diff).toContain("Index:")
-        expect(calls.length).toBe(1)
-
-        // Verify permission metadata includes files array for UI rendering
-        const permissionCall = calls[0]
-        expect(permissionCall.metadata.files).toHaveLength(3)
-        expect(permissionCall.metadata.files.map((f) => f.type).sort()).toEqual(["add", "delete", "update"])
-
-        const addFile = permissionCall.metadata.files.find((f) => f.type === "add")
-        expect(addFile).toBeDefined()
-        expect(addFile!.relativePath).toBe("nested/new.txt")
-        expect(addFile!.after).toBe("created\n")
-
-        const updateFile = permissionCall.metadata.files.find((f) => f.type === "update")
-        expect(updateFile).toBeDefined()
-        expect(updateFile!.before).toContain("line2")
-        expect(updateFile!.after).toContain("changed")
-
-        const added = await fs.readFile(path.join(fixture.path, "nested", "new.txt"), "utf-8")
-        expect(added).toBe("created\n")
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.metadata.files.map((file) => file.type)).toEqual(["add", "delete", "update"])
+        expect(await fs.readFile(path.join(fixture.path, "nested", "new.txt"), "utf-8")).toBe("created\n")
         expect(await fs.readFile(modifyPath, "utf-8")).toBe("line1\nchanged\n")
         await expect(fs.readFile(deletePath, "utf-8")).rejects.toThrow()
+        expect(result.output).toContain(`A ${path.join("nested", "new.txt")}`)
+        expect(await FileTrash.list(Instance.project.id)).toHaveLength(1)
+      },
+    })
+  })
+
+  test("rolls back earlier files when a later multi-file commit fails", async () => {
+    await using fixture = await tmpdir({ git: true })
+    const { ctx, calls } = makeCtx()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const original = path.join(fixture.path, "original.txt")
+        const later = path.join(fixture.path, "later.txt")
+        await fs.writeFile(original, "before\n", "utf8")
+        const realLink = fs.link.bind(fs)
+        const link = spyOn(fs, "link").mockImplementation(async (source, destination) => {
+          if (path.resolve(String(destination)) === later) {
+            throw Object.assign(new Error("injected later-file failure"), { code: "EIO" })
+          }
+          return realLink(source, destination)
+        })
+        try {
+          await expect(
+            execute(
+              {
+                patchText:
+                  "*** Begin Patch\n*** Update File: original.txt\n@@\n-before\n+after\n*** Add File: later.txt\n+later\n*** End Patch",
+              },
+              ctx,
+            ),
+          ).rejects.toThrow("injected later-file failure")
+        } finally {
+          link.mockRestore()
+        }
+
+        expect(calls).toHaveLength(1)
+        expect(await fs.readFile(original, "utf8")).toBe("before\n")
+        await expect(fs.readFile(later)).rejects.toThrow()
+        expect((await fs.readdir(fixture.path)).filter((name) => name.startsWith(".openscience-"))).toEqual([])
+        expect(await FileTrash.list(Instance.project.id)).toEqual([])
+      },
+    })
+  })
+
+  test("deletes one file into recoverable trash", async () => {
+    await using fixture = await tmpdir({ git: true })
+    const { ctx, calls } = makeCtx()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        try {
+          const target = path.join(fixture.path, "delete.txt")
+          await fs.writeFile(target, "obsolete\n", "utf8")
+          const result = await execute(
+            { patchText: "*** Begin Patch\n*** Delete File: delete.txt\n*** End Patch" },
+            ctx,
+          )
+
+          expect(calls).toHaveLength(1)
+          expect(calls[0]?.metadata.files).toMatchObject([{ type: "delete", before: "obsolete\n", after: "" }])
+          expect(result.metadata.trash).toHaveLength(1)
+          expect(result.output).toContain("Recoverable for 30 days: ftr_")
+          await expect(fs.readFile(target)).rejects.toThrow()
+          expect(await FileTrash.list(Instance.project.id)).toMatchObject([
+            { id: result.metadata.trash[0]?.id, originalPath: target, state: "trash" },
+          ])
+        } finally {
+          await Instance.dispose()
+        }
       },
     })
   })
@@ -141,10 +272,11 @@ describe("tool.apply_patch freeform", () => {
 
         const moveFile = permissionCall.metadata.files[0]
         expect(moveFile.type).toBe("move")
-        expect(moveFile.relativePath).toBe("renamed/dir/name.txt")
+        expect(moveFile.relativePath).toBe(path.join("renamed", "dir", "name.txt"))
         expect(moveFile.movePath).toBe(path.join(fixture.path, "renamed/dir/name.txt"))
         expect(moveFile.before).toBe("old content\n")
         expect(moveFile.after).toBe("new content\n")
+        expect(await FileTrash.list(Instance.project.id)).toHaveLength(1)
       },
     })
   })
@@ -217,23 +349,27 @@ describe("tool.apply_patch freeform", () => {
     await Instance.provide({
       directory: fixture.path,
       fn: async () => {
-        const original = path.join(fixture.path, "old", "name.txt")
-        await fs.mkdir(path.dirname(original), { recursive: true })
-        await fs.writeFile(original, "old content\n", "utf-8")
+        try {
+          const original = path.join(fixture.path, "old", "name.txt")
+          await fs.mkdir(path.dirname(original), { recursive: true })
+          await fs.writeFile(original, "old content\n", "utf-8")
 
-        const patchText =
-          "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-old content\n+new content\n*** End Patch"
+          const patchText =
+            "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-old content\n+new content\n*** End Patch"
 
-        await execute({ patchText }, ctx)
+          await execute({ patchText }, ctx)
 
-        const moved = path.join(fixture.path, "renamed", "dir", "name.txt")
-        await expect(fs.readFile(original, "utf-8")).rejects.toThrow()
-        expect(await fs.readFile(moved, "utf-8")).toBe("new content\n")
+          const moved = path.join(fixture.path, "renamed", "dir", "name.txt")
+          await expect(fs.readFile(original, "utf-8")).rejects.toThrow()
+          expect(await fs.readFile(moved, "utf-8")).toBe("new content\n")
+        } finally {
+          await Instance.dispose()
+        }
       },
     })
   })
 
-  test("moves file overwriting existing destination", async () => {
+  test("refuses to move over an existing destination", async () => {
     await using fixture = await tmpdir()
     const { ctx } = makeCtx()
 
@@ -250,15 +386,15 @@ describe("tool.apply_patch freeform", () => {
         const patchText =
           "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-from\n+new\n*** End Patch"
 
-        await execute({ patchText }, ctx)
-
-        await expect(fs.readFile(original, "utf-8")).rejects.toThrow()
-        expect(await fs.readFile(destination, "utf-8")).toBe("new\n")
+        await expect(execute({ patchText }, ctx)).rejects.toThrow("Refusing to overwrite")
+        expect(await fs.readFile(original, "utf-8")).toBe("from\n")
+        expect(await fs.readFile(destination, "utf-8")).toBe("existing\n")
+        expect(await FileTrash.list(Instance.project.id)).toEqual([])
       },
     })
   })
 
-  test("adds file overwriting existing file", async () => {
+  test("refuses to add over an existing file", async () => {
     await using fixture = await tmpdir()
     const { ctx } = makeCtx()
 
@@ -270,8 +406,110 @@ describe("tool.apply_patch freeform", () => {
 
         const patchText = "*** Begin Patch\n*** Add File: duplicate.txt\n+new content\n*** End Patch"
 
-        await execute({ patchText }, ctx)
-        expect(await fs.readFile(target, "utf-8")).toBe("new content\n")
+        await expect(execute({ patchText }, ctx)).rejects.toThrow("Refusing to overwrite")
+        expect(await fs.readFile(target, "utf-8")).toBe("old content\n")
+      },
+    })
+  })
+
+  test("refuses an add destination that appears during approval", async () => {
+    await using fixture = await tmpdir()
+    const target = path.join(fixture.path, "appeared.txt")
+    const ctx: ToolCtx = {
+      ...baseCtx,
+      ask: async () => {
+        await fs.writeFile(target, "concurrent owner\n")
+      },
+    }
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const patchText = "*** Begin Patch\n*** Add File: appeared.txt\n+agent bytes\n*** End Patch"
+        await expect(execute({ patchText }, ctx)).rejects.toThrow("Refusing to overwrite")
+        expect(await fs.readFile(target, "utf8")).toBe("concurrent owner\n")
+      },
+    })
+  })
+
+  test("refuses changed bytes after edit approval", async () => {
+    await using fixture = await tmpdir()
+    const target = path.join(fixture.path, "changed.txt")
+    await fs.writeFile(target, "approved\n")
+    const ctx: ToolCtx = {
+      ...baseCtx,
+      ask: async () => {
+        await fs.writeFile(target, "concurrent\n")
+      },
+    }
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const patchText = "*** Begin Patch\n*** Update File: changed.txt\n@@\n-approved\n+agent\n*** End Patch"
+        await expect(execute({ patchText }, ctx)).rejects.toThrow("changed after approval")
+        expect(await fs.readFile(target, "utf8")).toBe("concurrent\n")
+      },
+    })
+  })
+
+  test("does not mutate an external file after its write grant is revoked", async () => {
+    await using project = await tmpdir({ git: true })
+    await using external = await tmpdir({ init: (directory) => Bun.write(path.join(directory, "claim.txt"), "old\n") })
+    await Instance.provide({
+      directory: project.path,
+      fn: async () => {
+        const session = await Session.create({ title: "revoked patch" })
+        try {
+          const grant = await SessionFilesystem.grant({
+            sessionID: session.id,
+            path: external.path,
+            access: "write",
+            scope: "session",
+          })
+          const target = path.join(external.path, "claim.txt")
+          const ctx: ToolCtx = {
+            ...baseCtx,
+            sessionID: session.id,
+            ask: async (input) => {
+              if (input.permission === "edit") await SessionFilesystem.revoke(session.id, grant.id)
+            },
+          }
+          await expect(
+            execute(
+              {
+                patchText: `*** Begin Patch\n*** Update File: ${target}\n@@\n-old\n+new\n*** End Patch`,
+              },
+              ctx,
+            ),
+          ).rejects.toBeInstanceOf(SessionFilesystem.DeniedError)
+          expect(await Bun.file(target).text()).toBe("old\n")
+        } finally {
+          await Session.remove(session.id)
+        }
+      },
+    })
+  })
+
+  test("refuses a replacement inode even when bytes match approval", async () => {
+    await using fixture = await tmpdir()
+    const target = path.join(fixture.path, "identity.txt")
+    await fs.writeFile(target, "approved\n")
+    const ctx: ToolCtx = {
+      ...baseCtx,
+      ask: async () => {
+        const replacement = path.join(fixture.path, "replacement.txt")
+        await fs.writeFile(replacement, "approved\n")
+        await fs.rename(replacement, target)
+      },
+    }
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const patchText = "*** Begin Patch\n*** Update File: identity.txt\n@@\n-approved\n+agent\n*** End Patch"
+        await expect(execute({ patchText }, ctx)).rejects.toThrow("identity changed after approval")
+        expect(await fs.readFile(target, "utf8")).toBe("approved\n")
       },
     })
   })
@@ -349,7 +587,12 @@ describe("tool.apply_patch freeform", () => {
 
         const patchText = "*** Begin Patch\n*** Update File: modify.txt\n@@\n-missing\n+changed\n*** End Patch"
 
-        await expect(execute({ patchText }, ctx)).rejects.toThrow("apply_patch verification failed")
+        const expectedHash = crypto.createHash("sha256").update("line1\nline2\n").digest("hex")
+        await expect(execute({ patchText }, ctx)).rejects.toThrow(
+          new RegExp(
+            `apply_patch verification failed:[\\s\\S]*Re-read [\\s\\S]*modify\\.txt before retrying;[\\s\\S]*${expectedHash}[\\s\\S]*1: line1[\\s\\S]*2: line2`,
+          ),
+        )
         expect(await fs.readFile(target, "utf-8")).toBe("line1\nline2\n")
       },
     })
@@ -553,6 +796,79 @@ EOF`
         await execute({ patchText }, ctx)
         // Result has ASCII quotes because that's what the patch specifies
         expect(await fs.readFile(target, "utf-8")).toBe(`He said "hi"\nsome${emDash}dash\nend\n`)
+      },
+    })
+  })
+})
+
+describe("tool.apply_patch legacy session authority", () => {
+  test("a session without a project-root grant can delete and move project files it may overwrite", async () => {
+    await using fixture = await tmpdir({ git: true })
+    const { ctx, calls } = makeCtx()
+
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        // Project mode resolves patch paths against the project directory, as
+        // the affected desktop sessions did.
+        const session = await Session.create({ workspace: "project" })
+        // A migrated session never had a project-root grant. Revoking one is
+        // deliberately different: that history must continue to deny access.
+        await Storage.update<SessionFilesystem.State>(
+          ["session_filesystem", Instance.project.id, session.id],
+          (draft) => {
+            draft.grants = draft.grants.filter((grant) => grant.path !== Instance.directory)
+            draft.revision++
+          },
+        )
+        const legacyCtx = { ...ctx, sessionID: session.id }
+        const obsolete = path.join(fixture.path, "plans", "obsolete.md")
+        const renamed = path.join(fixture.path, "plans", "renamed.md")
+        await fs.mkdir(path.dirname(obsolete), { recursive: true })
+        await fs.writeFile(obsolete, "old plan\n", "utf-8")
+        await fs.writeFile(renamed, "keep\n", "utf-8")
+
+        const result = await execute(
+          {
+            patchText:
+              "*** Begin Patch\n*** Delete File: plans/obsolete.md\n*** Update File: plans/renamed.md\n*** Move to: plans/archive/renamed.md\n@@\n-keep\n+kept\n*** End Patch",
+          },
+          legacyCtx,
+        )
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.metadata.files.map((file) => file.type)).toEqual(["delete", "move"])
+        await expect(fs.readFile(obsolete, "utf-8")).rejects.toThrow()
+        await expect(fs.readFile(renamed, "utf-8")).rejects.toThrow()
+        expect(await fs.readFile(path.join(fixture.path, "plans", "archive", "renamed.md"), "utf-8")).toBe("kept\n")
+        expect(result.output).toContain(`D ${path.join("plans", "obsolete.md")}`)
+        expect(await FileTrash.list(Instance.project.id)).toHaveLength(2)
+      },
+    })
+  })
+
+  test("revoked project authority cannot be treated as a legacy missing grant", async () => {
+    await using fixture = await tmpdir({ git: true })
+    const { ctx } = makeCtx()
+    await Instance.provide({
+      directory: fixture.path,
+      fn: async () => {
+        const session = await Session.create({ workspace: "project" })
+        const grants = (await SessionFilesystem.list(session.id)).filter((grant) => grant.path === Instance.directory)
+        expect(grants.length).toBeGreaterThan(0)
+        for (const grant of grants) await SessionFilesystem.revoke(session.id, grant.id)
+        const target = path.join(fixture.path, "retained.txt")
+        await fs.writeFile(target, "retain\n")
+        await expect(
+          execute(
+            { patchText: "*** Begin Patch\n*** Delete File: retained.txt\n*** End Patch" },
+            {
+              ...ctx,
+              sessionID: session.id,
+            },
+          ),
+        ).rejects.toThrow()
+        expect(await fs.readFile(target, "utf8")).toBe("retain\n")
+        expect(await FileTrash.list(Instance.project.id)).toEqual([])
       },
     })
   })

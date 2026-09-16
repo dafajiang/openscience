@@ -2,173 +2,165 @@
 
 import { $ } from "bun"
 import { Script } from "@synsci/script"
+import {
+  ensureReleaseStagingTags,
+  loadReleaseArtifacts,
+  preflightRelease,
+  promoteRelease,
+  publishPackage,
+  repairStagedRelease,
+  releasePromotionNames,
+  releaseStagingTag,
+  verifyPublishedPackages,
+} from "./npm-release"
+import { assertReleaseSource, releaseRoot, setWorkspaceVersion } from "./release-workspace"
 
-const highlightsTemplate = `
-<!--
-Add highlights before publishing. Delete this section if no highlights.
+const stageOnly = process.argv.includes("--stage-only")
+if (stageOnly && Script.preview) throw new Error("Release staging requires an exact stable version")
 
-- For multiple highlights, use multiple <highlight> tags
-- Highlights with the same source attribute get grouped together
--->
+if (Script.preview) {
+  await import("./publish-preview")
+} else {
+  console.log("=== npm ownership preflight ===\n")
+  await preflightRelease()
 
-<!--
-<highlight source="SourceName (Web/Core/SDK)">
-  <h2>Feature title goes here</h2>
-  <p short="Short description used for Desktop Recap">
-    Full description of the feature or change
-  </p>
-
-  https://github.com/user-attachments/assets/uuid-for-video (you will want to drag & drop the video or picture)
-
-  <img
-    width="1912"
-    height="1164"
-    alt="image"
-    src="https://github.com/user-attachments/assets/uuid-for-image"
-  />
-</highlight>
--->
-
-`
-
-console.log("=== publishing ===\n")
-
-const pkgjsons = await Array.fromAsync(
-  new Bun.Glob("**/package.json").scan({
-    absolute: true,
-  }),
-).then((arr) => arr.filter((x) => !x.includes("node_modules") && !x.includes("dist")))
-
-for (const file of pkgjsons) {
-  let pkg = await Bun.file(file).text()
-  pkg = pkg.replaceAll(/"version": "[^"]+"/g, `"version": "${Script.version}"`)
-  console.log("updated:", file)
-  await Bun.file(file).write(pkg)
-}
-
-await $`bun install`
-await import(`../sdk/js/script/build.ts`)
-
-if (Script.release) {
-  await $`git commit -am "release: v${Script.version}"`.nothrow()
-  await $`git tag v${Script.version}`.nothrow()
-  // Tags are exempt from branch protection; push the tag on its own so the
-  // release assets and npm publishes can proceed regardless of what happens
-  // to the branch push below.
-  const tagPush = await $`git push origin refs/tags/v${Script.version} --no-verify`.nothrow()
-  if (tagPush.exitCode !== 0) {
-    console.warn(`::warning::tag push failed for v${Script.version} (already pushed?)`)
+  const source = await assertReleaseSource()
+  const artifactSource = process.env.OPENSCIENCE_ARTIFACT_SOURCE
+  if (!artifactSource || !/^[0-9a-f]{40}$/i.test(artifactSource)) {
+    throw new Error("OPENSCIENCE_ARTIFACT_SOURCE must be an immutable commit SHA")
   }
-  // Branch protection rejects direct pushes to main, and the old .nothrow()
-  // swallowed that — every release left its version-bump commit orphaned and
-  // main's package versions permanently stale. Try the direct push (works if
-  // the workflow identity is a bypass actor), otherwise open a release PR so
-  // the bumps land through the normal checks.
-  const push = await $`git push origin HEAD:main --no-verify`.nothrow()
-  if (push.exitCode !== 0) {
-    const branch = `release/v${Script.version}`
-    console.warn(`main push rejected by branch protection — opening a release PR from ${branch}`)
-    await $`git push origin HEAD:refs/heads/${branch} --force --no-verify`
-    await $`gh pr create --base main --head ${branch} --title "release: v${Script.version}" --body "Version bumps from the v${Script.version} release."`.nothrow()
-  }
-}
+  const artifactDirectory = process.env.OPENSCIENCE_NPM_ARTIFACT_DIR
+  if (!artifactDirectory) throw new Error("OPENSCIENCE_NPM_ARTIFACT_DIR is required")
+  const artifacts = await loadReleaseArtifacts({
+    directory: artifactDirectory,
+    source: artifactSource,
+    version: Script.version,
+  })
+  const byName = new Map(artifacts.map((artifact) => [artifact.name, artifact]))
+  const ordered = releasePromotionNames().map((name) => {
+    const artifact = byName.get(name)
+    if (!artifact) throw new Error(`Missing cached npm artifact for ${name}`)
+    return artifact
+  })
+  const stagingTag = releaseStagingTag(Script.version)
+  const promotionOnly = source !== artifactSource
 
-// Sections keep publishing past an earlier failure so a broken CLI publish
-// doesn't block the SDK, but any failure must fail the workflow at the end —
-// a green run previously meant nothing reached npm at all.
-const failures: string[] = []
-
-console.log("\n=== cli ===\n")
-try {
-  await import(`../../backend/cli/script/publish.ts`)
-} catch (e) {
-  console.error("CLI publish failed:", e)
-  failures.push("cli")
-}
-
-console.log("\n=== sdk ===\n")
-try {
-  await import(`../sdk/js/script/publish.ts`)
-} catch (e) {
-  console.error("SDK publish failed:", e)
-  failures.push("sdk")
-}
-
-console.log("\n=== plugin ===\n")
-try {
-  await import(`../plugin/script/publish.ts`)
-} catch (e) {
-  console.error("Plugin publish failed:", e)
-  failures.push("plugin")
-}
-
-console.log("\n=== launcher (openscience) ===\n")
-try {
-  const launcherDir = new URL("../launcher", import.meta.url).pathname
-  // Pin @synsci/openscience dependency to the version being published.
-  // Defensive: initialize `dependencies` if the launcher's package.json
-  // was authored without it — happened on the v1.1.117 publish (broken
-  // launcher step). Empty object is fine since we only need the pin.
-  const launcherPkg = await Bun.file(`${launcherDir}/package.json`).json()
-  // Keep the launcher version in lockstep with the just-released @synsci/openscience.
-  // Without this, each subsequent publish would npm-error with "cannot
-  // publish over existing version" because the launcher's package.json
-  // never gets bumped (the source value stays whatever the last manual
-  // commit set it to).
-  launcherPkg.version = Script.version
-  // Do NOT declare @synsci/openscience as a static dependency. Both packages
-  // expose a `openscience` bin and npx resolves dep-bin before parent-bin,
-  // which caused `npx openscience` to skip the launcher and jump straight
-  // into the CLI (npm caches: openscience -> @synsci/openscience/bin/openscience instead
-  // of openscience -> openscience/bin/openscience.mjs). The launcher already shells
-  // out `npm i -g @synsci/openscience@latest` at runtime when it needs the
-  // binary — that path puts openscience on PATH for the subsequent spawn
-  // without polluting node_modules/.bin in the npx temp tree.
-  delete launcherPkg.dependencies
-  await Bun.file(`${launcherDir}/package.json`).write(JSON.stringify(launcherPkg, null, 2))
-  const result = await $`cd ${launcherDir} && npm publish --access public --tag ${Script.channel}`.quiet().nothrow()
-  process.stdout.write(result.stdout.toString())
-  process.stderr.write(result.stderr.toString())
-  if (result.exitCode !== 0) {
-    const stderr = result.stderr.toString()
-    // The unscoped `synsci` package has its own npm owner list; a token
-    // whose account isn't on it gets E403. That's an ownership grant to
-    // chase (`npm owner add <token-user> synsci`), not a broken release —
-    // every other package shipped, so warn loudly instead of failing.
-    if (stderr.includes("E403") || stderr.includes("do not have permission")) {
-      // A GitHub Actions annotation, so this shows on the run summary
-      // instead of being a log line nobody reads on a green run.
-      console.warn(
-        "::warning title=launcher not published::npm token's account is not an owner of the 'synsci' package — users keep getting the previous launcher. Fix: an owner runs `npm owner add <token-user> synsci`, then re-release.",
+  if (!promotionOnly) {
+    console.log(`\n=== publishing ${artifacts.length} packages under ${stagingTag} ===\n`)
+    const batches = Array.from({ length: Math.ceil(ordered.length / 5) }, (_, index) =>
+      ordered.slice(index * 5, index * 5 + 5),
+    )
+    for (const batch of batches) {
+      await Promise.all(
+        batch.map((artifact) => publishPackage({ ...artifact, deferVerification: true, tag: stagingTag })),
       )
-    } else if (stderr.includes("cannot publish over") || stderr.includes("previously published")) {
-      // The launcher sometimes ships out-of-band between releases. That
-      // means the release-built launcher for this version will never ship,
-      // so surface it on the run summary rather than silently skipping.
-      console.warn(
-        `::warning title=launcher skipped::synsci@${Script.version} already exists on the registry (published out-of-band) — the release-built launcher was NOT published.`,
-      )
-    } else {
-      throw new Error(`npm publish exited with ${result.exitCode}`)
     }
+    if (stageOnly) await repairStagedRelease(ordered)
+  } else {
+    console.log(`\n=== promotion-only resume from ${source}; no npm package writes are allowed ===\n`)
   }
-} catch (e) {
-  console.error("Launcher publish failed:", e)
-  failures.push("launcher")
-}
 
-const dir = new URL("../..", import.meta.url).pathname
-process.chdir(dir)
+  console.log("\n=== verifying the complete npm release set ===\n")
+  await verifyPublishedPackages(ordered)
+  for (const artifact of ordered) console.log(`  verified ${artifact.name}@${artifact.version}`)
+  await ensureReleaseStagingTags(ordered, stagingTag)
 
-if (failures.length > 0) {
-  console.error(`\npublish failed for: ${failures.join(", ")}`)
-  if (Script.release) console.error("release left as draft so releases/latest doesn't move")
-  process.exit(1)
-}
+  // This path runs alongside desktop packaging with read-only GitHub access.
+  // The gated final job reruns verification before promotion; no receipt or
+  // environment flag is trusted as a substitute for checking the artifacts.
+  if (stageOnly) {
+    console.log("Npm staging complete; latest tags and the GitHub draft are unchanged")
+    process.exit(0)
+  }
 
-if (Script.release) {
-  // Undraft last. The install script resolves releases/latest, so going
-  // public before npm has the packages would leave curl installs ahead of
-  // npm installs whenever a publish fails.
-  await $`gh release edit v${Script.version} --draft=false`
+  let releaseSha = source
+  if (Script.release && !promotionOnly) {
+    await setWorkspaceVersion(Script.version)
+    const changed = await $`git diff --quiet HEAD --`.cwd(releaseRoot).nothrow()
+    if (changed.exitCode === 1) await $`git commit -am ${`release: v${Script.version}`}`.cwd(releaseRoot)
+    if (changed.exitCode > 1) throw new Error(`Could not inspect release changes (git diff exited ${changed.exitCode})`)
+    releaseSha = await $`git rev-parse HEAD`
+      .cwd(releaseRoot)
+      .text()
+      .then((value) => value.trim())
+
+    const tag = `v${Script.version}`
+    const existingTag = await $`git rev-parse --verify refs/tags/${tag}^{commit}`.cwd(releaseRoot).quiet().nothrow()
+    if (existingTag.exitCode === 0) {
+      const tagged = existingTag.stdout.toString().trim()
+      if (tagged !== releaseSha) {
+        if (tagged !== source || source !== artifactSource) {
+          throw new Error(`Refusing to move ${tag}: existing tag is ${tagged}, release source is ${source}`)
+        }
+        await $`git tag -f ${tag} ${releaseSha}`.cwd(releaseRoot)
+        await $`git push origin refs/tags/${tag} --force --no-verify`.cwd(releaseRoot)
+      }
+    } else {
+      await $`git tag ${tag} ${releaseSha}`.cwd(releaseRoot)
+      await $`git push origin refs/tags/${tag} --no-verify`.cwd(releaseRoot)
+    }
+
+    const release = (await $`gh release view ${tag} --json isDraft,targetCommitish`.cwd(releaseRoot).json()) as {
+      isDraft: boolean
+      targetCommitish: string
+    }
+    if (!release.isDraft) throw new Error(`${tag} is already public; refusing to mutate a completed release`)
+    if (![source, artifactSource, releaseSha].includes(release.targetCommitish)) {
+      throw new Error(
+        `Draft release target changed unexpectedly: ${release.targetCommitish} is not ${source}, ${artifactSource}, or ${releaseSha}`,
+      )
+    }
+    await $`gh release edit ${tag} --target ${releaseSha}`.cwd(releaseRoot)
+
+    const push = await $`git push origin HEAD:main --no-verify`.cwd(releaseRoot).nothrow()
+    if (push.exitCode !== 0) {
+      const branch = `release/v${Script.version}`
+      console.warn(`main push rejected by branch protection — opening a release PR from ${branch}`)
+      await $`git push origin HEAD:refs/heads/${branch} --force --no-verify`.cwd(releaseRoot)
+      const existing = await $`gh pr list --base main --head ${branch} --state open --json url --jq '.[0].url // ""'`
+        .cwd(releaseRoot)
+        .text()
+        .then((value) => value.trim())
+      const url = existing
+        ? existing
+        : await $`gh pr create --base main --head ${branch} --title ${`release: v${Script.version}`} --body ${`Version bumps from the v${Script.version} release.`}`
+            .cwd(releaseRoot)
+            .text()
+            .then((value) => value.trim())
+      if (!url) throw new Error(`Failed to create or resolve the release PR for ${branch}`)
+      console.log(`release PR: ${url}`)
+    }
+  } else if (Script.release) {
+    const tag = `v${Script.version}`
+    const tagged = await $`git rev-parse --verify refs/tags/${tag}^{commit}`
+      .cwd(releaseRoot)
+      .text()
+      .then((value) => value.trim())
+    if (tagged !== source) {
+      throw new Error(`Promotion-only resume expected ${tag} at ${source}, received ${tagged}`)
+    }
+    const release = (await $`gh release view ${tag} --json isDraft,targetCommitish`.cwd(releaseRoot).json()) as {
+      isDraft: boolean
+      targetCommitish: string
+    }
+    if (!release.isDraft) throw new Error(`${tag} is already public; refusing to resume a completed release`)
+    if (![source, artifactSource].includes(release.targetCommitish)) {
+      throw new Error(
+        `Draft release target changed unexpectedly: ${release.targetCommitish} is not ${source} or ${artifactSource}`,
+      )
+    }
+    await $`gh release edit ${tag} --target ${source}`.cwd(releaseRoot)
+  }
+
+  console.log("\n=== promoting npm latest tags (launcher last) ===\n")
+  await promoteRelease(ordered)
+
+  if (Script.release) {
+    const current = await $`git rev-parse HEAD`
+      .cwd(releaseRoot)
+      .text()
+      .then((value) => value.trim())
+    if (current !== releaseSha) throw new Error(`Release checkout moved from ${releaseSha} to ${current}`)
+    await $`gh release edit v${Script.version} --draft=false`.cwd(releaseRoot)
+  }
 }

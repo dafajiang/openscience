@@ -18,6 +18,7 @@ export type SelectProps<T> = Omit<ComponentProps<typeof Kobalte<T>>, "value" | "
   children?: (item: T | undefined) => JSX.Element
   triggerStyle?: JSX.CSSProperties
   triggerVariant?: "settings"
+  "aria-label"?: string
 }
 
 export function Select<T>(props: SelectProps<T> & Omit<ButtonProps, "children">) {
@@ -36,6 +37,7 @@ export function Select<T>(props: SelectProps<T> & Omit<ButtonProps, "children">)
     "children",
     "triggerStyle",
     "triggerVariant",
+    "aria-label",
   ])
 
   const state = {
@@ -130,6 +132,7 @@ export function Select<T>(props: SelectProps<T> & Omit<ButtonProps, "children">)
     >
       <Kobalte.Trigger
         disabled={props.disabled}
+        aria-label={local["aria-label"]}
         data-slot="select-select-trigger"
         as={Button}
         size={props.size}

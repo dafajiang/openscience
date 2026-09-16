@@ -5,9 +5,38 @@ import { Ripgrep } from "../file/ripgrep"
 import DESCRIPTION from "./grep.txt"
 import { Instance } from "../project/instance"
 import path from "path"
-import { assertExternalDirectory } from "./external-directory"
+import { assertExternalDirectory, sessionToolDirectory } from "./external-directory"
 
 const MAX_LINE_LENGTH = 2000
+const MAX_MATCHES = 100
+
+async function output(proc: { stdout: ReadableStream<Uint8Array>; kill(): void }, abort: AbortSignal) {
+  const reader = proc.stdout.getReader()
+  const decoder = new TextDecoder()
+  const state = { buffer: "", lines: [] as string[], stopped: false }
+  try {
+    while (state.lines.length <= MAX_MATCHES) {
+      abort.throwIfAborted()
+      const chunk = await reader.read()
+      if (chunk.done) break
+      state.buffer += decoder.decode(chunk.value, { stream: true })
+      const lines = state.buffer.split(/\r?\n/)
+      state.buffer = lines.pop() ?? ""
+      for (const line of lines) {
+        if (!line) continue
+        state.lines.push(line)
+        if (state.lines.length <= MAX_MATCHES) continue
+        state.stopped = true
+        proc.kill()
+        break
+      }
+    }
+    if (!state.stopped && state.buffer) state.lines.push(state.buffer)
+    return state
+  } finally {
+    reader.releaseLock()
+  }
+}
 
 export const GrepTool = Tool.define("grep", {
   description: DESCRIPTION,
@@ -32,16 +61,20 @@ export const GrepTool = Tool.define("grep", {
       },
     })
 
-    let searchPath = params.path ?? Instance.directory
-    searchPath = path.isAbsolute(searchPath) ? searchPath : path.resolve(Instance.directory, searchPath)
-    await assertExternalDirectory(ctx, searchPath, { kind: "directory" })
+    const directory = await sessionToolDirectory(ctx)
+    let searchPath = params.path ?? directory
+    searchPath = path.isAbsolute(searchPath) ? searchPath : path.resolve(directory, searchPath)
+    using authorized = await assertExternalDirectory(ctx, searchPath, { kind: "directory" })
+    searchPath = authorized?.path ?? searchPath
 
     const rgPath = await Ripgrep.filepath()
     const args = [
       "-nH",
       "--hidden",
-      "--follow",
       "--no-messages",
+      "--max-columns",
+      String(MAX_LINE_LENGTH),
+      "--max-columns-preview",
       "--field-match-separator=|",
       "--regexp",
       params.pattern,
@@ -49,40 +82,45 @@ export const GrepTool = Tool.define("grep", {
     if (params.include) {
       args.push("--glob", params.include)
     }
+    searchPath = (await authorized?.revalidate()) ?? searchPath
     args.push(searchPath)
 
+    ctx.abort.throwIfAborted()
     const proc = Bun.spawn([rgPath, ...args], {
       stdout: "pipe",
       stderr: "pipe",
       signal: ctx.abort,
     })
 
-    const output = await new Response(proc.stdout).text()
-    const errorOutput = await new Response(proc.stderr).text()
-    const exitCode = await proc.exited
+    const error = new Response(proc.stderr).text()
+    const collected = await output(proc, ctx.abort)
+    const [errorOutput, exitCode] = await Promise.all([error, proc.exited])
+    ctx.abort.throwIfAborted()
 
     // Exit codes: 0 = matches found, 1 = no matches, 2 = errors (but may still have matches)
     // With --no-messages, we suppress error output but still get exit code 2 for broken symlinks etc.
-    // Only fail if exit code is 2 AND no output was produced
-    if (exitCode === 1 || (exitCode === 2 && !output.trim())) {
+    // Invalid patterns and inaccessible roots are failures, not proof that no
+    // files exist. A valid content search can also find files but no matching
+    // lines; keep that distinct from a filename search.
+    if (exitCode === 2 && collected.lines.length === 0) {
+      throw new Error(`Search failed: ${errorOutput.trim() || "Some paths could not be searched."}`)
+    }
+    if (exitCode === 1) {
       return {
         title: params.pattern,
         metadata: { matches: 0, truncated: false },
-        output: "No files found",
+        output: "No matching content found",
       }
     }
 
-    if (exitCode !== 0 && exitCode !== 2) {
+    if (!collected.stopped && exitCode !== 0 && exitCode !== 2) {
       throw new Error(`ripgrep failed: ${errorOutput}`)
     }
 
     const hasErrors = exitCode === 2
-
-    // Handle both Unix (\n) and Windows (\r\n) line endings
-    const lines = output.trim().split(/\r?\n/)
     const matches = []
 
-    for (const line of lines) {
+    for (const line of collected.lines) {
       if (!line) continue
 
       const [filePath, lineNumStr, ...lineTextParts] = line.split("|")
@@ -105,15 +143,14 @@ export const GrepTool = Tool.define("grep", {
 
     matches.sort((a, b) => b.modTime - a.modTime)
 
-    const limit = 100
-    const truncated = matches.length > limit
-    const finalMatches = truncated ? matches.slice(0, limit) : matches
+    const truncated = collected.stopped || matches.length > MAX_MATCHES
+    const finalMatches = truncated ? matches.slice(0, MAX_MATCHES) : matches
 
     if (finalMatches.length === 0) {
       return {
         title: params.pattern,
         metadata: { matches: 0, truncated: false },
-        output: "No files found",
+        output: "No matching content found",
       }
     }
 

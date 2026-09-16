@@ -37,8 +37,21 @@ await createClient({
   ],
 })
 
+// @hey-api currently drops the Promise returned by ReadableStream.cancel().
+// Abort can therefore surface as an unhandled rejection after a caller has
+// already stopped consuming SSE. Keep this tiny generated-runtime repair in
+// the build so regeneration cannot reintroduce the launcher crash.
+const sseRuntime = path.join(dir, "src/v2/gen/core/serverSentEvents.gen.ts")
+const generated = await Bun.file(sseRuntime).text()
+const settledCancel = generated.replace(
+  /const abortHandler = \(\) => \{\s*try \{\s*reader\.cancel\(\);?\s*\} catch \{\s*\/\/ noop\s*\}\s*\};?/,
+  "const abortHandler = () => {\n          void reader.cancel().catch(() => undefined)\n        }",
+)
+if (settledCancel === generated) throw new Error("Generated SSE cancel repair no longer matched @hey-api output")
+await Bun.write(sseRuntime, settledCancel)
+
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`
-await $`bun tsc`
+await $`bun tsc -p tsconfig.build.json`
 await $`rm openapi.json`

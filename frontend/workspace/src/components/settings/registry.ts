@@ -4,7 +4,10 @@ import type { IconProps } from "@synsci/ui/icon"
 // ── Panel contract ──────────────────────────────────────────────────────────
 //
 // Every settings panel is a lazily-loaded SolidJS component keyed by a stable
-// `id`. Panel authors own exactly one file — `components/settings/<Panel>.tsx`
+// `id`. The shell preloads the default panel before the dialog opens, warms
+// likely destinations during idle or navigation intent, and retains panels
+// after their first visit. Panel authors own exactly one file —
+// `components/settings/<Panel>.tsx`
 // — and `export default` a `Component`. The shell (dialog-settings.tsx) renders
 // the header (back/forward + title + expand/close) and the left rail from this
 // registry; the panel component only renders its own scrollable body.
@@ -20,21 +23,27 @@ import type { IconProps } from "@synsci/ui/icon"
 // HARD RULE: no dead buttons. A panel either wires to a real backend or omits
 // the control. Placeholder panels below ship with zero interactive controls.
 
-export type SettingsSection = "capabilities" | "workspace"
+export type SettingsSection = "inference" | "capabilities" | "runtime" | "app"
 
-export type SettingsPanelId =
-  | "connectors"
-  | "specialists"
-  | "memory"
-  | "compute"
-  | "local-models"
-  | "network"
-  | "permissions"
-  | "sandbox"
-  | "credentials"
-  | "billing"
-  | "storage"
-  | "general"
+// Source contract for every reachable Settings destination. Keep this list in
+// rail order; the registry contract test verifies that no panel can be added,
+// removed, or left without the shared layout audit silently.
+export const SETTINGS_PANEL_IDS = [
+  "models",
+  "local-models",
+  "skills",
+  "scientific-tools",
+  "connectors",
+  "credentials",
+  "compute",
+  "permissions",
+  "network",
+  "sandbox",
+  "storage",
+  "general",
+] as const
+
+export type SettingsPanelId = (typeof SETTINGS_PANEL_IDS)[number]
 
 export interface SettingsPanel {
   /** Stable key used for routing/history. */
@@ -46,14 +55,40 @@ export interface SettingsPanel {
   /** Which rail group the row lives under. */
   section: SettingsSection
   /** Lazily-loaded panel body (default export of the file). */
-  component: Component
+  component: Component & { preload?: () => Promise<unknown> }
 }
 
 // Order here is the render order in the rail (top→bottom within each section).
 export const SETTINGS_PANELS: SettingsPanel[] = [
-  // ── Capabilities ──
-  // Skills moved to a dedicated center-pane tab (atlas/SkillsPage) — it's a
-  // first-class catalog now, not a settings row.
+  // ── Inference ──
+  {
+    id: "models",
+    title: "Models",
+    icon: "models",
+    section: "inference",
+    component: lazy(() => import("./Models")),
+  },
+  {
+    id: "local-models",
+    title: "Local models",
+    icon: "brain",
+    section: "inference",
+    component: lazy(() => import("./LocalModels")),
+  },
+  {
+    id: "skills",
+    title: "Skills",
+    icon: "flask",
+    section: "capabilities",
+    component: lazy(() => import("./Skills")),
+  },
+  {
+    id: "scientific-tools",
+    title: "Tools",
+    icon: "atom",
+    section: "capabilities",
+    component: lazy(() => import("./ScientificTools")),
+  },
   {
     id: "connectors",
     title: "Connectors",
@@ -62,88 +97,65 @@ export const SETTINGS_PANELS: SettingsPanel[] = [
     component: lazy(() => import("./Connectors")),
   },
   {
-    id: "specialists",
-    title: "Specialists",
-    icon: "models",
+    id: "credentials",
+    title: "Credentials",
+    icon: "providers",
     section: "capabilities",
-    component: lazy(() => import("./Specialists")),
+    component: lazy(() => import("./Credentials")),
   },
-  {
-    id: "memory",
-    title: "Memory",
-    icon: "archive",
-    section: "capabilities",
-    component: lazy(() => import("./Memory")),
-  },
+  // ── Runtime ──
   {
     id: "compute",
     title: "Compute",
-    icon: "server",
-    section: "capabilities",
+    icon: "cpu",
+    section: "runtime",
     component: lazy(() => import("./Compute")),
   },
   {
-    id: "local-models",
-    title: "Local models",
-    icon: "models",
-    section: "capabilities",
-    component: lazy(() => import("./LocalModels")),
+    id: "permissions",
+    title: "Permissions",
+    icon: "shield",
+    section: "runtime",
+    component: lazy(() => import("./Permissions")),
   },
   {
     id: "network",
     title: "Network",
-    icon: "share",
-    section: "capabilities",
+    icon: "server",
+    section: "runtime",
     component: lazy(() => import("./Network")),
-  },
-  // ── Workspace ──
-  {
-    id: "permissions",
-    title: "Permissions",
-    icon: "check",
-    section: "workspace",
-    component: lazy(() => import("./Permissions")),
   },
   {
     id: "sandbox",
     title: "Sandbox",
-    icon: "console",
-    section: "workspace",
+    icon: "code",
+    section: "runtime",
     component: lazy(() => import("./Sandbox")),
   },
-  {
-    id: "credentials",
-    title: "Credentials",
-    icon: "providers",
-    section: "workspace",
-    component: lazy(() => import("./Credentials")),
-  },
-  // Wallet + Spend + Usage merged into one Billing panel (they each rendered a
-  // duplicate balance card). Balance · Spend routing · Usage · Ledger.
-  {
-    id: "billing",
-    title: "Billing",
-    icon: "sliders",
-    section: "workspace",
-    component: lazy(() => import("./Billing")),
-  },
-  { id: "storage", title: "Storage", icon: "folder", section: "workspace", component: lazy(() => import("./Storage")) },
+  // ── App ──
+  { id: "storage", title: "Storage", icon: "folder", section: "app", component: lazy(() => import("./Storage")) },
   {
     id: "general",
     title: "General",
-    icon: "settings-gear",
-    section: "workspace",
+    icon: "sliders",
+    section: "app",
     component: lazy(() => import("./General")),
   },
 ]
 
 export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
+  { id: "inference", label: "Inference" },
   { id: "capabilities", label: "Capabilities" },
-  { id: "workspace", label: "Workspace" },
+  { id: "runtime", label: "Runtime" },
+  { id: "app", label: "App" },
 ]
 
 export function findPanel(id: SettingsPanelId): SettingsPanel {
   return SETTINGS_PANELS.find((p) => p.id === id) ?? SETTINGS_PANELS[0]
 }
 
-export const DEFAULT_PANEL: SettingsPanelId = "connectors"
+export async function preloadPanel(id: SettingsPanelId): Promise<void> {
+  await findPanel(id).component.preload?.()
+}
+
+export const DEFAULT_PANEL: SettingsPanelId = "models"

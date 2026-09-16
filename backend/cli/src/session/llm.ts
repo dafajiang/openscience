@@ -10,18 +10,25 @@ import {
   type ToolSet,
   tool,
   jsonSchema,
+  type ToolCallRepairFunction,
 } from "ai"
-import { clone, mergeDeep, pipe } from "remeda"
+import { safeParseJSON } from "@ai-sdk/provider-utils"
+import { clone, mergeDeep } from "remeda"
 import { ProviderTransform } from "@/provider/transform"
-import { Config } from "@/config/config"
 import { Instance } from "@/project/instance"
 import type { Agent } from "@/agent/agent"
 import type { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { SystemPrompt } from "./system"
 import { Flag } from "@/flag/flag"
-import { PermissionNext } from "@/permission/next"
 import { Auth } from "@/auth"
+import { SessionHarness } from "./harness"
+import { SessionTraceStore } from "./trace-store"
+import { ToolVisibility } from "@/tool/visibility"
+import { InvalidCall } from "@/tool/invalid-call"
+import { resolveAccessRoute } from "./access-route"
+import { providerErrorMetadata } from "./provider-error"
+import { Toolset } from "./toolset"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
@@ -38,46 +45,93 @@ export namespace LLM {
     messages: ModelMessage[]
     small?: boolean
     tools: Record<string, Tool>
+    /** Offer the tools (they are part of the cached prefix) but forbid calling
+     * them, for a request that must answer in text. */
+    toolChoice?: "none"
     retries?: number
+    trace?: { messageID: string; attempt: number }
+    route?: string
+    onReasoningEffortResolved?: (effort: string | undefined) => void | Promise<void>
+    /** Response headers arrived for a provider stream request; the body may
+     * still be a keepalive-only prefix, so this is not first output. */
+    onResponse?: () => void
   }
 
   export type StreamOutput = StreamTextResult<ToolSet, unknown>
 
+  // Share the exact header selection with context preflight. An agent with a
+  // prompt of its own replaces the model-family header. Codex sends the header
+  // through `instructions`, separately from the assembled conversation
+  // context, so the header never appears twice on that route.
+  export function prompts(input: Pick<StreamInput, "agent" | "model">, codex = false) {
+    const header = SystemPrompt.provider(input.model)
+    if (!codex) return { system: input.agent.prompt ? [input.agent.prompt] : header, instructions: undefined }
+    // A primary agent's own prompt is its header and travels in the
+    // instructions slot; a worker's contract stays in context beneath the
+    // family header so the header never appears twice.
+    if (input.agent.prompt && input.agent.mode !== "subagent") return { system: [], instructions: input.agent.prompt }
+    return { system: input.agent.prompt ? [input.agent.prompt] : [], instructions: header.join("\n") }
+  }
+
+  export async function repairToolCall(failed: Parameters<ToolCallRepairFunction<ToolSet>>[0], tools: ToolSet) {
+    const source = InvalidCall.tool(failed.toolCall.toolName)
+    const name = tools[failed.toolCall.toolName] ? failed.toolCall.toolName : tools[source] ? source : undefined
+    if (name) {
+      const parsed = await safeParseJSON({
+        text: failed.toolCall.input,
+        schema: tools[name].inputSchema,
+      })
+      if (parsed.success) {
+        return {
+          ...failed.toolCall,
+          toolName: name,
+        }
+      }
+    }
+    const reason = name ? "invalid_input" : "unknown_tool"
+    return {
+      ...failed.toolCall,
+      input: JSON.stringify(InvalidCall.payload(name ?? source, reason)),
+      toolName: "invalid",
+    }
+  }
+
   export async function stream(input: StreamInput) {
-    const l = log
-      .clone()
-      .tag("providerID", input.model.providerID)
-      .tag("modelID", input.model.id)
-      .tag("sessionID", input.sessionID)
-      .tag("small", (input.small ?? false).toString())
-      .tag("agent", input.agent.name)
-      .tag("mode", input.agent.mode)
+    const tier = input.small
+      ? { model: undefined, options: {}, headers: {} }
+      : ProviderTransform.tier(input.model, input.user.tier)
+    const routed = tier.model ? await Provider.getModel(input.model.providerID, tier.model) : input.model
+    const traceRoute = input.route ?? (await resolveAccessRoute(routed.providerID, routed.id))
+    // A per-stream copy: the shared "llm" logger is never tagged, so a title
+    // stream and a research stream running at once cannot relabel each other.
+    const l = log.child({
+      providerID: input.model.providerID,
+      modelID: input.model.id,
+      sessionID: input.sessionID,
+      small: (input.small ?? false).toString(),
+      agent: input.agent.name,
+      mode: input.agent.mode,
+    })
     l.info("stream", {
       modelID: input.model.id,
       providerID: input.model.providerID,
     })
-    const [language, cfg, provider, auth] = await Promise.all([
-      Provider.getLanguage(input.model),
-      Config.get(),
+    const [language, provider, auth] = await Promise.all([
+      Provider.getLanguage(routed),
       Provider.getProvider(input.model.providerID),
       Auth.get(input.model.providerID),
     ])
-    const isCodex = provider.id === "openai" && auth?.type === "oauth"
+    const isCodex = isCodexSubscriptionModel(input.model, auth)
+    const prompt = prompts(input, isCodex)
 
     const system = []
     system.push(
       [
-        // use agent prompt otherwise provider prompt
-        // For Codex sessions, skip SystemPrompt.provider() since it's sent via options.instructions
-        ...(input.agent.prompt ? [input.agent.prompt] : isCodex ? [] : SystemPrompt.provider(input.model)),
+        ...prompt.system,
         // any custom prompt passed into this call
         ...input.system,
         // any custom prompt from last user message
         ...(input.user.system ? [input.user.system] : []),
-        // plan mode instructions (if enabled)
-        ...(await SystemPrompt.planModeInstructions()),
-        // slash-skill invocation contract
-        ...SystemPrompt.slashSkillDirective(),
       ]
         .filter((x) => x)
         .join("\n"),
@@ -100,8 +154,8 @@ export namespace LLM {
       system.push(header, rest.join("\n"))
     }
 
-    const variant =
-      !input.small && input.model.variants && input.user.variant ? input.model.variants[input.user.variant] : {}
+    const chosen = input.user.variant
+    const variant = !input.small && input.model.variants && chosen ? input.model.variants[chosen] : {}
     const base = input.small
       ? ProviderTransform.smallOptions(input.model)
       : ProviderTransform.options({
@@ -109,14 +163,15 @@ export namespace LLM {
           sessionID: input.sessionID,
           providerOptions: provider.options,
         })
-    const options: Record<string, any> = pipe(
-      base,
-      mergeDeep(input.model.options),
-      mergeDeep(input.agent.options),
-      mergeDeep(variant),
+    // Keeping five deeply inferred Remeda pipe stages here can exceed
+    // TypeScript's instantiation limit as provider option unions grow. The
+    // runtime operation is a straightforward left-to-right deep merge.
+    const options = [input.model.options, tier.options, input.agent.options, variant].reduce<Record<string, any>>(
+      (result, layer) => mergeDeep(result, layer ?? {}) as Record<string, any>,
+      base as Record<string, any>,
     )
     if (isCodex) {
-      options.instructions = SystemPrompt.instructions()
+      options.instructions = prompt.instructions
     }
 
     const params = await Plugin.trigger(
@@ -152,6 +207,8 @@ export namespace LLM {
       },
     )
 
+    await input.onReasoningEffortResolved?.(resolvedReasoningEffort(params.options))
+
     const maxOutputTokens = isCodex
       ? undefined
       : ProviderTransform.maxOutputTokens(
@@ -161,7 +218,7 @@ export namespace LLM {
           OUTPUT_TOKEN_MAX,
         )
 
-    const tools = await resolveTools(input)
+    const tools = await modelTools(input)
 
     // LiteLLM and some Anthropic proxies require the tools parameter to be present
     // when message history contains tool calls, even if no tools are being used.
@@ -183,43 +240,77 @@ export namespace LLM {
       })
     }
 
-    return streamText({
-      onError(error) {
-        l.error("stream error", {
-          error,
+    const trace = input.trace
+    const activeTools = Toolset.active(tools)
+    // A change in the offered tools is announced by the loop as a durable
+    // message in the transcript, never as a system line for one request: a
+    // line that appears on the step of the change and vanishes on the next
+    // rewrote the cached system prompt twice per skill load.
+    const harness = trace
+      ? SessionHarness.snapshot({
+          agent: input.agent,
+          provider: routed.providerID,
+          model: routed.id,
+          system,
+          instructions: typeof params.options.instructions === "string" ? params.options.instructions : undefined,
+          tools,
         })
+          .then((snapshot) =>
+            SessionTraceStore.recordHarness({
+              sessionID: input.sessionID,
+              messageID: trace.messageID,
+              parentMessageID: input.user.id,
+              attempt: trace.attempt,
+              snapshot,
+            }),
+          )
+          .catch((error) => l.warn("failed to record harness fingerprint", { error }))
+      : undefined
+
+    const providerMessages: ModelMessage[] = [
+      ...(isCodex
+        ? [
+            {
+              role: "user" as const,
+              content: system.join("\n\n"),
+            },
+          ]
+        : system.map((x): ModelMessage => ({
+            role: "system",
+            content: x,
+          }))),
+      ...input.messages,
+    ]
+    const result = streamText({
+      onError(error) {
+        l.error("stream error", providerErrorMetadata(error))
       },
       async experimental_repairToolCall(failed) {
-        const lower = failed.toolCall.toolName.toLowerCase()
-        if (lower !== failed.toolCall.toolName && tools[lower]) {
+        const repaired = await repairToolCall(failed, tools)
+        if (repaired.toolName !== "invalid") {
           l.info("repairing tool call", {
             tool: failed.toolCall.toolName,
-            repaired: lower,
+            repaired: repaired.toolName,
           })
-          return {
-            ...failed.toolCall,
-            toolName: lower,
-          }
+          return repaired
         }
-        return {
-          ...failed.toolCall,
-          input: JSON.stringify({
-            tool: failed.toolCall.toolName,
-            error: failed.error.message,
-          }),
-          toolName: "invalid",
-        }
+        l.warn("replacing invalid tool call", {
+          tool: InvalidCall.tool(failed.toolCall.toolName),
+          failure: JSON.parse(repaired.input).failure,
+        })
+        return repaired
       },
       temperature: params.temperature,
       topP: params.topP,
       topK: params.topK,
       providerOptions: ProviderTransform.providerOptions(input.model, params.options),
-      activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+      activeTools,
       tools,
+      ...(input.toolChoice ? { toolChoice: input.toolChoice } : {}),
       maxOutputTokens,
       abortSignal: input.abort,
       headers: {
-        ...(input.model.providerID.startsWith("synsci")
+        ...(routed.providerID === "openrouter" && traceRoute === "managed"
           ? {
               "x-openscience-project": Instance.project.id,
               "x-openscience-session": input.sessionID,
@@ -232,25 +323,11 @@ export namespace LLM {
               }
             : undefined),
         ...input.model.headers,
+        ...tier.headers,
         ...headers,
       },
       maxRetries: input.retries ?? 0,
-      messages: [
-        ...(isCodex
-          ? [
-              {
-                role: "user",
-                content: system.join("\n\n"),
-              } as ModelMessage,
-            ]
-          : system.map(
-              (x): ModelMessage => ({
-                role: "system",
-                content: x,
-              }),
-            )),
-        ...input.messages,
-      ],
+      messages: providerMessages,
       model: wrapLanguageModel({
         model: language,
         middleware: [
@@ -268,26 +345,56 @@ export namespace LLM {
               }
               return args.params
             },
+            async wrapStream(args) {
+              // doStream settles when the response headers arrive, before any
+              // body chunk is read: the exact "waiting for first token" edge.
+              const result = await args.doStream()
+              input.onResponse?.()
+              return result
+            },
           },
         ],
       }),
       experimental_telemetry: {
-        isEnabled: cfg.experimental?.openTelemetry,
-        metadata: {
-          userId: cfg.username ?? "unknown",
-          sessionId: input.sessionID,
-        },
+        isEnabled: false,
+        recordInputs: false,
+        recordOutputs: false,
       },
     })
+    await harness
+    return result
+  }
+
+  export async function modelTools(input: Pick<StreamInput, "tools" | "agent" | "model" | "user">) {
+    if (!input.model.capabilities.toolcall) return {}
+    return resolveTools(input)
+  }
+
+  /** Read only named controls from the final provider options. Numeric token
+   * budgets deliberately stay unlabeled: inferring low/high from a budget
+   * would make telemetry provider- and model-dependent rather than truthful. */
+  export function resolvedReasoningEffort(options: Record<string, any>): string | undefined {
+    const value = (input: unknown) => (typeof input === "string" && input.length > 0 ? input : undefined)
+    const object = (input: unknown) =>
+      input !== null && typeof input === "object" && !Array.isArray(input)
+        ? (input as Record<string, unknown>)
+        : undefined
+    const reasoning = object(options.reasoning)
+    const reasoningConfig = object(options.reasoningConfig)
+    const thinkingConfig = object(options.thinkingConfig)
+    return (
+      value(options.reasoningEffort) ??
+      value(options.effort) ??
+      value(reasoning?.effort) ??
+      value(reasoningConfig?.maxReasoningEffort) ??
+      value(thinkingConfig?.thinkingLevel)
+    )
   }
 
   async function resolveTools(input: Pick<StreamInput, "tools" | "agent" | "user">) {
-    const wildcardDisable = input.user.tools?.["*"] === false
-    const disabled = PermissionNext.disabled(Object.keys(input.tools), input.agent.permission)
     for (const tool of Object.keys(input.tools)) {
-      if (wildcardDisable || input.user.tools?.[tool] === false || disabled.has(tool)) {
+      if (!ToolVisibility.enabled(tool, { permission: input.agent.permission, tools: input.user.tools }))
         delete input.tools[tool]
-      }
     }
     return input.tools
   }
@@ -302,5 +409,12 @@ export namespace LLM {
       }
     }
     return false
+  }
+
+  export function isCodexSubscriptionModel(
+    model: Pick<Provider.Model, "providerID">,
+    auth?: Pick<Auth.Info, "type">,
+  ): boolean {
+    return model.providerID === "openai-codex" && auth?.type === "oauth"
   }
 }

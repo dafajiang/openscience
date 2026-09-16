@@ -1,3 +1,21 @@
+---
+name: scholar-evaluation
+description: Evaluate scholarly work with structured criteria for rigor, methodology, evidence, writing, and publication readiness.
+category: research
+tags:
+  - peer-review
+  - evaluation
+  - scholarly-writing
+metadata:
+  upstream: K-Dense-AI/scientific-agent-skills
+  upstream-url: https://github.com/K-Dense-AI/scientific-agent-skills
+  upstream-path: scientific-skills/scholar-evaluation
+  upstream-license: MIT
+  upstream-relationship: derived
+  skill-author: K-Dense Inc.
+  adapted-by: Synthetic Sciences
+---
+
 # Scholar Evaluation
 
 ## Overview
@@ -30,7 +48,7 @@ If your document does not already contain schematics or diagrams:
 
 **How to generate schematics:**
 ```bash
-python scripts/generate_schematic.py "your diagram description" -o figures/output.png
+python skills/visualization/scientific-schematics/scripts/generate_schematic.py "your diagram description" -o figures/output.png
 ```
 
 The AI will automatically:

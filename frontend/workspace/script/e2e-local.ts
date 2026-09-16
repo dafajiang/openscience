@@ -2,6 +2,8 @@ import fs from "node:fs/promises"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
+import { fakeModelConfig, fakeModelID, startFakeModelServer } from "./e2e-fake-model"
+import { E2E_MODE_ENV, forwardedPlaywrightArgs, playwrightCommand } from "./e2e-mode"
 
 async function freePort() {
   return await new Promise<number>((resolve, reject) => {
@@ -42,19 +44,46 @@ async function waitForHealth(url: string, authHeader: string) {
   throw new Error(`Timed out waiting for server health: ${url}${last}`)
 }
 
+async function boundedCleanup(label: string, cleanup: () => void | Promise<void>, timeoutMs = 10_000, fatal = false) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      Promise.resolve().then(cleanup),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} cleanup timed out after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } catch (error) {
+    if (fatal) throw error
+    console.warn(`[e2e cleanup] ${label}:`, error)
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 const appDir = process.cwd()
 const repoDir = path.resolve(appDir, "../..")
 const openscienceDir = path.join(repoDir, "backend", "cli")
 
-const extraArgs = (() => {
-  const args = process.argv.slice(2)
-  if (args[0] === "--") return args.slice(1)
-  return args
-})()
+const extraArgs = forwardedPlaywrightArgs(process.argv.slice(2))
 
-const [serverPort, webPort] = await Promise.all([freePort(), freePort()])
+const ports = async (values: number[] = []): Promise<[number, number, number]> => {
+  if (values.length === 3) return values as [number, number, number]
+  const port = await freePort()
+  return ports(values.includes(port) ? values : [...values, port])
+}
+const [serverPort, webPort, modelPort] = await ports()
+const fakeModelServer = startFakeModelServer(modelPort)
 
 const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "openscience-e2e-"))
+const browsers = (() => {
+  if (process.env.PLAYWRIGHT_BROWSERS_PATH) return process.env.PLAYWRIGHT_BROWSERS_PATH
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Caches", "ms-playwright")
+  if (process.platform === "win32") {
+    return path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "ms-playwright")
+  }
+  return path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), "ms-playwright")
+})()
 
 // Pin Basic-Auth creds so the in-process server + the Playwright-hosted
 // frontend (via VITE_OPENSCIENCE_SERVER_PASSWORD) agree. Without this, flag.ts
@@ -69,6 +98,7 @@ const serverEnv = {
   OPENSCIENCE_DISABLE_SHARE: "true",
   OPENSCIENCE_DISABLE_LSP_DOWNLOAD: "true",
   OPENSCIENCE_DISABLE_DEFAULT_PLUGINS: "true",
+  OPENSCIENCE_DISABLE_PROJECT_CONFIG: "true",
   OPENSCIENCE_EXPERIMENTAL_DISABLE_FILEWATCHER: "true",
   OPENSCIENCE_TEST_HOME: path.join(sandbox, "home"),
   XDG_DATA_HOME: path.join(sandbox, "share"),
@@ -78,24 +108,83 @@ const serverEnv = {
   OPENSCIENCE_E2E_PROJECT_DIR: repoDir,
   OPENSCIENCE_E2E_SESSION_TITLE: "E2E Session",
   OPENSCIENCE_E2E_MESSAGE: "Seeded for UI e2e",
-  OPENSCIENCE_E2E_MODEL: "synsci/gpt-5-nano",
+  OPENSCIENCE_E2E_MODEL: fakeModelID,
+  OPENSCIENCE_E2E_FAKE_MODEL: "1",
+  OPENSCIENCE_CONFIG_CONTENT: JSON.stringify({
+    ...fakeModelConfig(`http://127.0.0.1:${modelPort}/v1`),
+    // The isolated browser suite does not exercise repository snapshots. The
+    // eager scheduler otherwise launches `git gc` against the developer's
+    // checkout, races parallel tests, and can recreate the temporary XDG tree
+    // after teardown has removed it.
+    snapshot: false,
+  }),
   OPENSCIENCE_CLIENT: "app",
   OPENSCIENCE_SERVER_USERNAME: e2eServerUsername,
   OPENSCIENCE_SERVER_PASSWORD: e2eServerPassword,
 } satisfies Record<string, string>
 
+// The isolated browser harness must never inherit real provider credentials
+// from the developer or CI host. Besides leaking state into model lists, an
+// inherited key can turn a deterministic UI action into a billable request.
+const providerCredentialEnvKeys = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "GOOGLE_API_KEY",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "GOOGLE_GENERATIVE_AI_BASE_URL",
+  "GEMINI_API_KEY",
+  "GEMINI_BASE_URL",
+  "AZURE_OPENAI_API_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_PROFILE",
+  "AWS_REGION",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "OPENROUTER_API_KEY",
+  "OPENROUTER_BASE_URL",
+  "GROQ_API_KEY",
+  "MISTRAL_API_KEY",
+  "PERPLEXITY_API_KEY",
+  "TOGETHER_API_KEY",
+  "XAI_API_KEY",
+  "META_MODEL_API_KEY",
+  "META_MODEL_BASE_URL",
+  "DEEPSEEK_API_KEY",
+  "FIREWORKS_API_KEY",
+  "CEREBRAS_API_KEY",
+  "SAMBANOVA_API_KEY",
+  "NVIDIA_API_KEY",
+  "NGC_API_KEY",
+  "MODAL_TOKEN_ID",
+  "MODAL_TOKEN_SECRET",
+  "FIRECRAWL_API_KEY",
+] as const
+
+for (const key of providerCredentialEnvKeys) {
+  delete serverEnv[key]
+}
+
 const runnerEnv = {
   ...serverEnv,
+  [E2E_MODE_ENV]: "isolated",
+  // App state belongs in the disposable XDG sandbox, but Playwright browsers
+  // are host tooling. Keep their persistent cache or every isolated run looks
+  // for a browser in a new empty directory.
+  PLAYWRIGHT_BROWSERS_PATH: browsers,
   PLAYWRIGHT_SERVER_HOST: "127.0.0.1",
   PLAYWRIGHT_SERVER_PORT: String(serverPort),
   VITE_OPENSCIENCE_SERVER_HOST: "127.0.0.1",
   VITE_OPENSCIENCE_SERVER_PORT: String(serverPort),
   VITE_OPENSCIENCE_SERVER_USERNAME: e2eServerUsername,
   VITE_OPENSCIENCE_SERVER_PASSWORD: e2eServerPassword,
+  // Playwright workers run under Node even though the harness is launched by
+  // Bun. Preserve the exact Bun executable for trusted fixture seed helpers.
+  OPENSCIENCE_E2E_RUNTIME: process.execPath,
   PLAYWRIGHT_PORT: String(webPort),
 } satisfies Record<string, string>
 
-const seed = Bun.spawn(["bun", "script/seed-e2e.ts"], {
+const seed = Bun.spawn([process.execPath, "script/seed-e2e.ts"], {
   cwd: openscienceDir,
   env: serverEnv,
   stdout: "inherit",
@@ -104,10 +193,16 @@ const seed = Bun.spawn(["bun", "script/seed-e2e.ts"], {
 
 const seedExit = await seed.exited
 if (seedExit !== 0) {
+  fakeModelServer.stop(true)
+  await fs.rm(sandbox, { recursive: true, force: true })
   process.exit(seedExit)
 }
 
 Object.assign(process.env, serverEnv)
+// The backend runs in this process, so sanitizing only `serverEnv` is not
+// enough: Object.assign does not remove credentials already present in the
+// parent shell. Clear them before importing any backend/provider modules.
+for (const key of providerCredentialEnvKeys) delete process.env[key]
 process.env.AGENT = "1"
 process.env.OPENSCIENCE = "1"
 
@@ -129,6 +224,10 @@ console.log(`openscience server listening on http://127.0.0.1:${serverPort}`)
 // webServer config) guarantees the Vite-served frontend bundle picks up
 // the matching Basic-Auth credentials. Cleaned up in the finally block.
 const envLocalPath = path.join(appDir, ".env.local")
+const envLocalBefore = await fs.readFile(envLocalPath).catch((error) => {
+  if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+  throw error
+})
 const envLocalBody = [
   `VITE_OPENSCIENCE_SERVER_HOST=127.0.0.1`,
   `VITE_OPENSCIENCE_SERVER_PORT=${serverPort}`,
@@ -143,7 +242,7 @@ const result = await (async () => {
     const healthAuth = `Basic ${Buffer.from(`${e2eServerUsername}:${e2eServerPassword}`).toString("base64")}`
     await waitForHealth(`http://127.0.0.1:${serverPort}/global/health`, healthAuth)
 
-    const runner = Bun.spawn(["bun", "test:e2e", ...extraArgs], {
+    const runner = Bun.spawn(playwrightCommand(extraArgs), {
       cwd: appDir,
       env: runnerEnv,
       stdout: "inherit",
@@ -154,9 +253,21 @@ const result = await (async () => {
   } catch (error) {
     return { error }
   } finally {
-    await inst.Instance.disposeAll()
-    await server.stop()
-    await fs.rm(envLocalPath, { force: true })
+    fakeModelServer.stop(true)
+    await boundedCleanup("backend server", () => server.stop(true), 5_000)
+    await boundedCleanup("project instances", () => inst.Instance.disposeAll())
+    await Promise.all([
+      boundedCleanup(
+        ".env.local",
+        () =>
+          envLocalBefore === undefined
+            ? fs.rm(envLocalPath, { force: true })
+            : fs.writeFile(envLocalPath, envLocalBefore),
+        10_000,
+        true,
+      ),
+      boundedCleanup("sandbox", () => fs.rm(sandbox, { recursive: true, force: true })),
+    ])
   }
 })()
 

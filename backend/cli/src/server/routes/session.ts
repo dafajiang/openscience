@@ -1,8 +1,10 @@
 import { Hono } from "hono"
+import { HTTPException } from "hono/http-exception"
 import { stream } from "hono/streaming"
 import { describeRoute, validator, resolver } from "hono-openapi"
 import z from "zod"
 import { Session } from "../../session"
+import { Provider } from "../../provider/provider"
 import { MessageV2 } from "../../session/message-v2"
 import { SessionPrompt } from "../../session/prompt"
 import { SessionCompaction } from "../../session/compaction"
@@ -15,7 +17,11 @@ import { Snapshot } from "@/snapshot"
 import { Log } from "../../util/log"
 import { PermissionNext } from "@/permission/next"
 import { errors } from "../error"
-import { lazy } from "../../util/lazy"
+import { lazy } from "@synsci/util/lazy"
+import { SessionFilesystem } from "../../session/filesystem"
+import { SessionTrace } from "../../session/trace"
+import { RuntimeEvents } from "../../runtime/events"
+import { SessionLoopState } from "../../session/loop-state"
 
 const log = Log.create({ service: "server" })
 
@@ -153,6 +159,146 @@ export const SessionRoutes = lazy(() =>
       },
     )
     .get(
+      "/:sessionID/trace",
+      describeRoute({
+        summary: "Get local harness trace",
+        tags: ["Session"],
+        description:
+          "Build one local, account-independent trace with effective harness manifests, composition transitions, attribution invariants, deterministic trajectory fingerprints, inference, tools, child agents, compute, artifacts, failures, costs, and timing. Hidden reasoning, prompt content, and copied tool outputs are excluded.",
+        operationId: "session.trace",
+        responses: {
+          200: {
+            description: "Local observable session trace",
+            content: {
+              "application/json": {
+                schema: resolver(SessionTrace.Info),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", z.object({ sessionID: Session.get.schema })),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        await Session.assertDirectory(sessionID)
+        return c.json(await SessionTrace.build(sessionID))
+      },
+    )
+    .get(
+      "/:sessionID/filesystem",
+      describeRoute({
+        summary: "List filesystem grants",
+        description:
+          "List durable read-only and read-write filesystem grants for the session, project, and installation.",
+        operationId: "session.filesystem.list",
+        responses: {
+          200: {
+            description: "Versioned filesystem grant state",
+            content: { "application/json": { schema: resolver(SessionFilesystem.Snapshot) } },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", z.object({ sessionID: Session.get.schema })),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        await Session.assertDirectory(sessionID)
+        const snapshot = await SessionFilesystem.snapshot(sessionID)
+        // Only a Files-pane/API listing owns native source watchers. Internal
+        // policy snapshots are intentionally side-effect free.
+        void SessionFilesystem.watch(sessionID, snapshot).catch(() => {})
+        return c.json(snapshot)
+      },
+    )
+    .post(
+      "/:sessionID/filesystem",
+      describeRoute({
+        summary: "Grant filesystem access",
+        description:
+          "Grant read-only or read-write access to a canonical filesystem path for one use, the session, every project session, or every session in this installation.",
+        operationId: "session.filesystem.grant",
+        responses: {
+          200: {
+            description: "Created filesystem grant",
+            content: { "application/json": { schema: resolver(SessionFilesystem.Grant) } },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", z.object({ sessionID: Session.get.schema })),
+      validator(
+        "json",
+        z.object({
+          path: z.string().trim().min(1),
+          access: SessionFilesystem.Access,
+          scope: SessionFilesystem.Scope.default("session"),
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        await Session.assertDirectory(sessionID)
+        const grant = await SessionFilesystem.grant({
+          sessionID,
+          ...c.req.valid("json"),
+          source: "api",
+        })
+        return c.json(grant)
+      },
+    )
+    .put(
+      "/:sessionID/filesystem/working-root",
+      describeRoute({
+        summary: "Choose the session's working directory",
+        description:
+          "Pin relative tool paths to a connected read/write folder, to session scratch, or return to automatic (the single connected folder when there is one).",
+        operationId: "session.filesystem.workingRoot",
+        responses: {
+          200: {
+            description: "Versioned filesystem grant state",
+            content: { "application/json": { schema: resolver(SessionFilesystem.Snapshot) } },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator("param", z.object({ sessionID: Session.get.schema })),
+      validator("json", z.object({ workingRoot: SessionFilesystem.WorkingRoot.nullable() })),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        await Session.assertDirectory(sessionID)
+        return c.json(await SessionFilesystem.setWorkingRoot(sessionID, c.req.valid("json").workingRoot))
+      },
+    )
+    .delete(
+      "/:sessionID/filesystem/:grantID",
+      describeRoute({
+        summary: "Revoke filesystem access",
+        description:
+          "Revoke a filesystem grant across its whole scope and stop affected kernels so stale mounts cannot survive.",
+        operationId: "session.filesystem.revoke",
+        responses: {
+          200: {
+            description: "Revoked filesystem grant",
+            content: { "application/json": { schema: resolver(SessionFilesystem.Grant) } },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: Session.get.schema,
+          grantID: z.string().startsWith("fsg_"),
+        }),
+      ),
+      async (c) => {
+        const params = c.req.valid("param")
+        await Session.assertDirectory(params.sessionID)
+        const grant = await SessionFilesystem.revoke(params.sessionID, params.grantID)
+        return c.json(grant)
+      },
+    )
+    .get(
       "/:sessionID/todo",
       describeRoute({
         summary: "Get session todos",
@@ -189,7 +335,7 @@ export const SessionRoutes = lazy(() =>
         description: "Create a new OpenScience session for interacting with AI assistants and managing conversations.",
         operationId: "session.create",
         responses: {
-          ...errors(400),
+          ...errors(400, 409),
           200: {
             description: "Successfully created session",
             content: {
@@ -268,6 +414,7 @@ export const SessionRoutes = lazy(() =>
           time: z
             .object({
               archived: z.number().optional(),
+              pinned: z.number().optional(),
             })
             .optional(),
         }),
@@ -283,6 +430,9 @@ export const SessionRoutes = lazy(() =>
               session.title = updates.title
             }
             if (updates.time?.archived !== undefined) session.time.archived = updates.time.archived
+            if (updates.time?.pinned !== undefined) {
+              session.time.pinned = updates.time.pinned || undefined
+            }
           },
           { touch: false },
         )
@@ -379,7 +529,23 @@ export const SessionRoutes = lazy(() =>
         }),
       ),
       async (c) => {
-        SessionPrompt.cancel(c.req.valid("param").sessionID)
+        const sessionID = c.req.valid("param").sessionID
+        await Session.assertDirectory(sessionID)
+        const source = c.req.header("x-openscience-abort-source") === "runner_timeout" ? "runner_timeout" : "user"
+        const controller = SessionPrompt.activeController(sessionID)
+        try {
+          const result = await RuntimeEvents.requestCancel({ sessionID, source })
+          if (!controller && result.status === "requested") {
+            await RuntimeEvents.cancel({ sessionID, runID: result.runID, source })
+          }
+        } catch (error) {
+          log.error("failed to record runtime cancellation", { sessionID, source, error })
+        } finally {
+          // Keep the runtime active while abort-aware tools and the assistant
+          // message settle. Their events must commit before RuntimeEvents.fail
+          // turns the durable cancellation request into the terminal event.
+          if (controller) SessionPrompt.cancel(sessionID, controller)
+        }
         return c.json(true)
       },
     )
@@ -552,6 +718,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const params = c.req.valid("param")
+        await Session.assertDirectory(params.sessionID)
         const message = await MessageV2.get({
           sessionID: params.sessionID,
           messageID: params.messageID,
@@ -586,6 +753,12 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const params = c.req.valid("param")
+        const message = await MessageV2.get({ sessionID: params.sessionID, messageID: params.messageID })
+        const reason = SessionLoopState.validatePartDelete({
+          message: message.info,
+          part: message.parts.find((part) => part.id === params.partID),
+        })
+        if (reason) throw new HTTPException(400, { message: reason })
         await Session.removePart({
           sessionID: params.sessionID,
           messageID: params.messageID,
@@ -628,6 +801,13 @@ export const SessionRoutes = lazy(() =>
             `Part mismatch: body.id='${body.id}' vs partID='${params.partID}', body.messageID='${body.messageID}' vs messageID='${params.messageID}', body.sessionID='${body.sessionID}' vs sessionID='${params.sessionID}'`,
           )
         }
+        const message = await MessageV2.get({ sessionID: params.sessionID, messageID: params.messageID })
+        const reason = SessionLoopState.validatePartUpdate({
+          message: message.info,
+          previous: message.parts.find((part) => part.id === params.partID),
+          next: body,
+        })
+        if (reason) throw new HTTPException(400, { message: reason })
         const part = await Session.updatePart(body)
         return c.json(part)
       },
@@ -663,12 +843,18 @@ export const SessionRoutes = lazy(() =>
       ),
       validator("json", SessionPrompt.PromptInput.omit({ sessionID: true })),
       async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const body = c.req.valid("json")
+        // The headers go out before the turn runs because a research turn can
+        // outlast a client's header timeout; once they are committed, an error
+        // can only end the body. Resolve what the caller most often gets wrong
+        // first, so an unknown session or model still answers 404/400.
+        await Session.get(sessionID)
+        if (body.model) await Provider.getModel(body.model.providerID, body.model.modelID)
         c.status(200)
         c.header("Content-Type", "application/json")
         return stream(c, async (stream) => {
-          const sessionID = c.req.valid("param").sessionID
-          const body = c.req.valid("json")
-          const msg = await SessionPrompt.prompt({ ...body, sessionID })
+          const msg = await SessionPrompt.submit({ ...body, sessionID })
           stream.write(JSON.stringify(msg))
         })
       },
@@ -702,7 +888,7 @@ export const SessionRoutes = lazy(() =>
           const body = c.req.valid("json")
           // fire-and-forget: session-level failures are published as session.error
           // events inside prompt(); catch here so nothing becomes an unhandled rejection
-          SessionPrompt.prompt({ ...body, sessionID }).catch((error) => {
+          SessionPrompt.submit({ ...body, sessionID }).catch((error) => {
             log.error("prompt_async failed", { sessionID, error })
           })
         })
@@ -785,10 +971,10 @@ export const SessionRoutes = lazy(() =>
         operationId: "session.revert",
         responses: {
           200: {
-            description: "Updated session",
+            description: "Completed undo transaction",
             content: {
               "application/json": {
-                schema: resolver(Session.Info),
+                schema: resolver(SessionRevert.RevertResult),
               },
             },
           },
@@ -805,11 +991,18 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         const sessionID = c.req.valid("param").sessionID
         log.info("revert", c.req.valid("json"))
-        const session = await SessionRevert.revert({
-          sessionID,
-          ...c.req.valid("json"),
-        })
-        return c.json(session)
+        try {
+          const result = await SessionRevert.revert({
+            sessionID,
+            ...c.req.valid("json"),
+          })
+          return c.json(result)
+        } catch (error) {
+          if (error instanceof SessionRevert.UnavailableError || error instanceof SessionRevert.TransactionError) {
+            throw new HTTPException(400, { message: error.message })
+          }
+          throw error
+        }
       },
     )
     .post(
@@ -838,8 +1031,15 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const sessionID = c.req.valid("param").sessionID
-        const session = await SessionRevert.unrevert({ sessionID })
-        return c.json(session)
+        try {
+          const session = await SessionRevert.unrevert({ sessionID })
+          return c.json(session)
+        } catch (error) {
+          if (error instanceof SessionRevert.UnavailableError || error instanceof SessionRevert.TransactionError) {
+            throw new HTTPException(400, { message: error.message })
+          }
+          throw error
+        }
       },
     )
     .post(
@@ -871,6 +1071,7 @@ export const SessionRoutes = lazy(() =>
       validator("json", z.object({ response: PermissionNext.Reply })),
       async (c) => {
         const params = c.req.valid("param")
+        await Session.assertDirectory(params.sessionID)
         PermissionNext.reply({
           requestID: params.permissionID,
           reply: c.req.valid("json").response,

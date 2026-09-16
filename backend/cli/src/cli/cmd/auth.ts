@@ -8,17 +8,151 @@ import path from "path"
 import os from "os"
 import { Config } from "../../config/config"
 import { Global } from "../../global"
-import { managedApiBase } from "../../endpoints"
 import { Plugin } from "../../plugin"
 import { Instance } from "../../project/instance"
-import { OpenScience } from "../../openscience"
-import { Log } from "../../util/log"
 import { runLocalModelSetup } from "./local"
 import type { Hooks } from "@synsci/plugin"
-
-const log = Log.create({ service: "cmd.logout" })
+import z from "zod"
+import { WellKnownAuthCommand } from "../../auth/wellknown-command"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
+
+const WellKnownAuth = z
+  .object({
+    auth: z
+      .object({
+        command: z
+          .array(
+            z
+              .string()
+              .min(1)
+              .max(4096)
+              .refine((value) => !value.includes("\0"), "argv cannot contain NUL"),
+          )
+          .min(1)
+          .max(32),
+        env: z
+          .string()
+          .min(1)
+          .max(128)
+          .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "invalid environment variable name"),
+      })
+      .strict(),
+  })
+  .passthrough()
+
+export type WellKnownAuth = z.infer<typeof WellKnownAuth>
+
+export class WellKnownAuthApprovalRequired extends Error {
+  constructor() {
+    super("A command from an unsigned well-known endpoint requires interactive approval")
+    this.name = "WellKnownAuthApprovalRequired"
+  }
+}
+
+class WellKnownAuthDeclined extends Error {
+  constructor() {
+    super("The well-known auth command was not approved")
+    this.name = "WellKnownAuthDeclined"
+  }
+}
+
+const WELLKNOWN_MAX_BYTES = 64 * 1024
+const WELLKNOWN_FETCH_TIMEOUT_MS = 10_000
+
+async function boundedResponse(response: Response, maxBytes = WELLKNOWN_MAX_BYTES): Promise<string> {
+  const declared = Number(response.headers.get("content-length"))
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`Well-known auth document exceeds ${maxBytes} bytes`)
+  }
+  if (!response.body) return ""
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  while (true) {
+    const next = await reader.read()
+    if (next.done) break
+    size += next.value.byteLength
+    if (size > maxBytes) {
+      await reader.cancel().catch(() => undefined)
+      throw new Error(`Well-known auth document exceeds ${maxBytes} bytes`)
+    }
+    chunks.push(next.value)
+  }
+  const body = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    body.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return new TextDecoder().decode(body)
+}
+
+/** Fetch and validate only data. This function never executes anything from
+ * the response; the separate approval boundary below is mandatory. */
+export async function fetchWellKnownAuth(
+  endpoint: string,
+  options: { fetcher?: typeof fetch; timeoutMs?: number; maxBytes?: number } = {},
+): Promise<WellKnownAuth> {
+  const base = new URL(endpoint)
+  if (base.protocol !== "http:" && base.protocol !== "https:") throw new Error("Endpoint must use HTTP or HTTPS")
+  if (base.username || base.password) throw new Error("Endpoint URLs must not contain credentials")
+  if (base.search || base.hash) throw new Error("Endpoint URLs must not contain a query or fragment")
+  const url = `${base.toString().replace(/\/+$/, "")}/.well-known/openscience`
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? WELLKNOWN_FETCH_TIMEOUT_MS)
+  try {
+    const response = await (options.fetcher ?? fetch)(url, {
+      signal: controller.signal,
+      redirect: "error",
+      headers: { accept: "application/json" },
+    })
+    if (!response.ok) throw new Error(`Well-known auth endpoint returned HTTP ${response.status}`)
+    const text = await boundedResponse(response, options.maxBytes)
+    let value: unknown
+    try {
+      value = JSON.parse(text)
+    } catch {
+      throw new Error("Well-known auth endpoint returned invalid JSON")
+    }
+    return WellKnownAuth.parse(value)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Require a fresh local decision for the exact argv. Non-interactive callers
+ * fail closed: piping input or running in CI is never treated as consent. */
+async function approveWellKnownAuthCommand(
+  command: string[],
+  options: {
+    interactive?: boolean
+    confirm?: (message: string) => Promise<unknown>
+  } = {},
+): Promise<void> {
+  if (!(options.interactive ?? !!process.stdin.isTTY)) throw new WellKnownAuthApprovalRequired()
+  const message = `Run this command from the unsigned endpoint?\n${JSON.stringify(command)}`
+  const approved = await (options.confirm
+    ? options.confirm(message)
+    : prompts.confirm({ message, initialValue: false }))
+  if (prompts.isCancel(approved) || approved !== true) throw new WellKnownAuthDeclined()
+}
+
+/** The only composition that turns a well-known auth document into a local
+ * command. Tests inject the runner to prove refusal happens before execution. */
+export async function runApprovedWellKnownAuth(
+  wellknown: WellKnownAuth,
+  options: {
+    interactive?: boolean
+    confirm?: (message: string) => Promise<unknown>
+    onApproved?: () => void | Promise<void>
+    run?: (input: WellKnownAuthCommand.RunOptions) => Promise<string>
+  } = {},
+): Promise<string> {
+  await approveWellKnownAuthCommand(wellknown.auth.command, options)
+  await options.onApproved?.()
+  return (options.run ?? WellKnownAuthCommand.run)({ argv: wellknown.auth.command })
+}
 
 /**
  * Handle plugin-based authentication flow.
@@ -212,7 +346,7 @@ export const KeysCommand = cmd({
   async handler() {},
 })
 
-export const AuthListCommand = cmd({
+const AuthListCommand = cmd({
   command: "list",
   aliases: ["ls"],
   describe: "list providers",
@@ -276,6 +410,10 @@ export function classifyKeyTarget(arg?: string): { endpointUrl?: string; presele
   return preselect ? { preselect } : {}
 }
 
+export function isRetiredHostedProvider(provider: string | undefined): boolean {
+  return provider === "synsci" || provider?.startsWith("synsci-") === true
+}
+
 export const AuthLoginCommand = cmd({
   command: ["add [url]", "login [url]"],
   describe: "add a provider API key (BYOK)",
@@ -301,25 +439,38 @@ export const AuthLoginCommand = cmd({
         if (args.url && !endpointUrl && !preselect) {
           prompts.log.warn(`"${args.url}" is neither a URL nor a valid provider id — choose a provider below.`)
         }
+        if (isRetiredHostedProvider(preselect)) {
+          prompts.log.error(
+            "The retired hosted provider is no longer available. Use OpenRouter for credit-backed models.",
+          )
+          prompts.outro("Done")
+          return
+        }
 
         if (endpointUrl) {
-          const wellknown = await fetch(`${endpointUrl}/.well-known/openscience`).then((x) => x.json() as any)
-          prompts.log.info(`Running \`${wellknown.auth.command.join(" ")}\``)
-          const proc = Bun.spawn({
-            cmd: wellknown.auth.command,
-            stdout: "pipe",
-          })
-          const exit = await proc.exited
-          if (exit !== 0) {
-            prompts.log.error("Failed")
+          const wellknown = await fetchWellKnownAuth(endpointUrl)
+          let token: string
+          try {
+            token = await runApprovedWellKnownAuth(wellknown, {
+              onApproved: () => prompts.log.info(`Running approved command ${JSON.stringify(wellknown.auth.command)}`),
+            })
+          } catch (error) {
+            if (error instanceof WellKnownAuthApprovalRequired) {
+              prompts.log.error(
+                "The endpoint requested a local command, but this shell cannot show an approval prompt.",
+              )
+            } else if (error instanceof WellKnownAuthDeclined) {
+              prompts.log.info("Command not run")
+            } else {
+              throw error
+            }
             prompts.outro("Done")
             return
           }
-          const token = await new Response(proc.stdout).text()
           await Auth.set(endpointUrl, {
             type: "wellknown",
             key: wellknown.auth.env,
-            token: token.trim(),
+            token,
           })
           prompts.log.success("Logged into " + endpointUrl)
           prompts.outro("Done")
@@ -335,6 +486,7 @@ export const AuthLoginCommand = cmd({
         const providers = await ModelsDev.get().then((x) => {
           const filtered: Record<string, (typeof x)[string]> = {}
           for (const [key, value] of Object.entries(x)) {
+            if (isRetiredHostedProvider(key)) continue
             if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) {
               filtered[key] = value
             }
@@ -343,7 +495,6 @@ export const AuthLoginCommand = cmd({
         })
 
         const priority: Record<string, number> = {
-          synsci: 0,
           anthropic: 1,
           "github-copilot": 2,
           openai: 3,
@@ -358,7 +509,6 @@ export const AuthLoginCommand = cmd({
           "local",
           "other",
           "amazon-bedrock",
-          "synsci",
           "vercel",
           "cloudflare",
           "cloudflare-ai-gateway",
@@ -401,8 +551,7 @@ export const AuthLoginCommand = cmd({
                   label: x.name,
                   value: x.id,
                   hint: {
-                    synsci: "Atlas — recommended",
-                    anthropic: "Claude Max or API key",
+                    anthropic: "API key (sk-ant-…)",
                     openai: "API key (to sign in with Codex/ChatGPT, use the option above)",
                   }[x.id],
                 })),
@@ -485,17 +634,13 @@ export const AuthLoginCommand = cmd({
           )
         }
 
-        if (provider === "synsci") {
-          prompts.log.info("Create an API key at https://app.syntheticsciences.ai/cli")
-        }
-
         if (provider === "vercel") {
           prompts.log.info("You can create an api key at https://vercel.link/ai-gateway-token")
         }
 
         if (["cloudflare", "cloudflare-ai-gateway"].includes(provider)) {
           prompts.log.info(
-            "Cloudflare AI Gateway can be configured with CLOUDFLARE_GATEWAY_ID, CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_API_TOKEN environment variables. Read more: https://syntheticsciences.ai/docs/providers/#cloudflare-ai-gateway",
+            "Cloudflare AI Gateway can be configured with CLOUDFLARE_GATEWAY_ID, CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_API_TOKEN environment variables.",
           )
         }
 
@@ -515,35 +660,10 @@ export const AuthLoginCommand = cmd({
   },
 })
 
-/** Probe Atlas backend for whether the user's Codex OAuth is registered.
- *  Returns null when no Atlas session exists (caller treats it as unknown).
- *  Returns true|false when the backend gave a definitive answer.
- *
- *  The CLI's local Auth.get("openai-codex") and the Atlas backend can
- *  diverge — disconnecting Codex from the web UI doesn't notify the CLI.
- *  We check both before showing the "Already signed in" prompt so the
- *  flow stays robust under that drift. */
-async function backendHasCodex(): Promise<boolean | null> {
-  const session = await OpenScience.getSession?.()
-  const thkToken = session?.api_key
-  if (!thkToken) return null
-  const atlasBase = managedApiBase()
-  try {
-    const res = await fetch(`${atlasBase}/api/keys/openai-codex/status`, {
-      headers: { Authorization: `Bearer ${thkToken}` },
-    })
-    if (!res.ok) return null
-    const body = (await res.json()) as { connected?: boolean }
-    return !!body.connected
-  } catch {
-    return null
-  }
-}
-
 /** Run the Codex (ChatGPT subscription) OAuth flow. Shared by `keys signin` and
  *  the ChatGPT branch of `keys add` so both reach the exact same flow. Returns
  *  true when the flow ran, false when the codex auth plugin is unavailable. */
-async function runCodexAuthFlow(): Promise<boolean> {
+export async function runCodexAuthFlow(): Promise<boolean> {
   const plugin = await Plugin.list().then((x) => x.find((p) => p.auth?.provider === "openai-codex"))
   if (!plugin || !plugin.auth) {
     prompts.log.error("Codex auth plugin not available")
@@ -555,7 +675,7 @@ async function runCodexAuthFlow(): Promise<boolean> {
   return true
 }
 
-export const AuthCodexCommand = cmd({
+const AuthCodexCommand = cmd({
   command: ["signin", "codex"],
   describe: "sign in with ChatGPT / Codex (Plus/Pro/Business subscription)",
   async handler() {
@@ -567,31 +687,13 @@ export const AuthCodexCommand = cmd({
 
         const existing = await Auth.get("openai-codex")
         if (existing?.type === "oauth") {
-          // Local has tokens. Check the backend before assuming "already
-          // signed in" — the user may have disconnected from the web UI
-          // (which only clears the backend, not local CLI state).
-          const backend = await backendHasCodex()
-
-          if (backend === false) {
-            // Backend says disconnected (user clicked Disconnect on the
-            // web). Honor that: wipe the stale local credential and fall
-            // through to a fresh OAuth flow. The user expects logging out
-            // from the web to clear their CLI session too.
-            await Auth.remove("openai-codex")
-            prompts.log.info("Codex was disconnected on the web — starting a fresh login.")
-            // fall through to the OAuth flow below
-          } else {
-            // backend === true (or null/unknown — treat as connected).
-            // Ask if the user wants a fresh OAuth despite already being
-            // signed in.
-            const again = await prompts.confirm({
-              message: "Already signed in to Codex. Sign in again?",
-              initialValue: false,
-            })
-            if (prompts.isCancel(again) || !again) {
-              prompts.outro("Done")
-              return
-            }
+          const again = await prompts.confirm({
+            message: "Already signed in to Codex on this device. Sign in again?",
+            initialValue: false,
+          })
+          if (prompts.isCancel(again) || !again) {
+            prompts.outro("Done")
+            return
           }
         }
         const handled = await runCodexAuthFlow()
@@ -600,24 +702,6 @@ export const AuthCodexCommand = cmd({
     })
   },
 })
-
-/** Best-effort server-side disconnect of the Codex credential, mirroring
- *  pushTokensToBackend's POST. Runs BEFORE the local removal so the thk_ key can
- *  still authenticate the call. Never throws — the local Auth.remove is what
- *  actually signs the CLI out. */
-async function disconnectCodexBackend(): Promise<void> {
-  const session = await OpenScience.getSession?.()
-  const thkToken = session?.api_key
-  if (!thkToken) return
-  try {
-    await fetch(`${managedApiBase()}/api/keys/openai-codex`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${thkToken}` },
-    })
-  } catch {
-    /* best-effort — local removal below is the source of truth */
-  }
-}
 
 /** `openscience connect [codex]` — sign in with a ChatGPT (Codex) subscription.
  *  The connect/disconnect verb pair is Codex's; Atlas uses login/logout. */
@@ -644,8 +728,7 @@ export const ConnectCommand = cmd({
   },
 })
 
-/** `openscience disconnect [codex]` — sign out of ChatGPT (Codex): clears the
- *  local OAuth credential and best-effort revokes it server-side. */
+/** `openscience disconnect [codex]` — remove the local ChatGPT credential. */
 export const DisconnectCommand = cmd({
   command: "disconnect [service]",
   describe: "disconnect your ChatGPT subscription (Codex)",
@@ -664,16 +747,12 @@ export const DisconnectCommand = cmd({
         prompts.intro("Disconnect ChatGPT (Codex)")
 
         const existing = await Auth.get("openai-codex")
-        const backend = await backendHasCodex()
-        if (!existing && backend !== true) {
+        if (!existing) {
           prompts.log.warn("ChatGPT (Codex) isn't connected.")
           prompts.outro("Done")
           return
         }
 
-        // Revoke server-side while the thk_ key can still authenticate, then
-        // drop the local credential (the part that actually signs the CLI out).
-        await disconnectCodexBackend()
         await Auth.remove("openai-codex")
         prompts.log.success("Disconnected ChatGPT (Codex)")
         prompts.outro("Done")
@@ -682,7 +761,7 @@ export const DisconnectCommand = cmd({
   },
 })
 
-export const AuthLogoutCommand = cmd({
+const AuthLogoutCommand = cmd({
   command: ["remove", "rm", "logout"],
   describe: "remove a saved provider key",
   async handler() {
@@ -703,34 +782,6 @@ export const AuthLogoutCommand = cmd({
     })
     if (prompts.isCancel(providerID)) throw new UI.CancelledError()
     await Auth.remove(providerID)
-    // Removing Codex must also revoke it on the Atlas backend and re-sync so
-    // the provider list drops openai-codex/* immediately — otherwise the CLI
-    // and backend drift (local removed, backend still connected).
-    if (providerID === "openai-codex") {
-      await revokeCodexOnBackend()
-      await OpenScience.syncServices?.().catch(() => {})
-    }
     prompts.outro("Logout successful")
   },
 })
-
-async function revokeCodexOnBackend(): Promise<void> {
-  const atlasBase = managedApiBase()
-  const session = await OpenScience.getSession?.()
-  const thkToken = session?.api_key
-  if (!thkToken) {
-    log.warn("no atlas session; skipping backend codex revoke")
-    return
-  }
-  try {
-    const res = await fetch(`${atlasBase}/api/keys/openai-codex`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${thkToken}` },
-    })
-    if (!res.ok && res.status !== 404) {
-      log.warn("backend codex revoke failed", { status: res.status })
-    }
-  } catch (e) {
-    log.warn("backend codex revoke errored", { error: String(e) })
-  }
-}

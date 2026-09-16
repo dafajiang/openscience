@@ -8,6 +8,13 @@ import * as Formatter from "./formatter"
 import { Config } from "../config/config"
 import { mergeDeep } from "remeda"
 import { Instance } from "../project/instance"
+import { OpenScience } from "@/openscience"
+import { ProjectTrust } from "@/project/trust"
+import { AuthoritySignal } from "@/project/authority-signal"
+import { Sandbox } from "@/sandbox/sandbox"
+import { CommandRuntime } from "@/science/command/registry"
+import { Shell } from "@/shell/shell"
+import { spawn } from "node:child_process"
 
 export namespace Format {
   const log = Log.create({ service: "format" })
@@ -25,7 +32,7 @@ export namespace Format {
 
   const state = Instance.state(async () => {
     const enabled: Record<string, boolean> = {}
-    const cfg = await Config.get()
+    const cfg = await Config.getExecution()
 
     const formatters: Record<string, Formatter.Info> = {}
     if (cfg.formatter === false) {
@@ -65,11 +72,14 @@ export namespace Format {
 
   async function isEnabled(item: Formatter.Info) {
     const s = await state()
-    let status = s.enabled[item.name]
-    if (status === undefined) {
-      status = await item.enabled()
-      s.enabled[item.name] = status
-    }
+    const cached = s.enabled[item.name]
+    if (cached !== undefined) return cached
+    const status = await item.enabled().catch((error) => {
+      if (ProjectTrust.DeniedError.isInstance(error)) return undefined
+      throw error
+    })
+    if (status === undefined) return false
+    s.enabled[item.name] = status
     return status
   }
 
@@ -84,6 +94,69 @@ export namespace Format {
       result.push(item)
     }
     return result
+  }
+
+  async function run(item: Formatter.Info, file: string): Promise<number> {
+    const command = item.command.map((value) => value.replace("$FILE", file))
+    const launched = await AuthoritySignal.exclusive(async () => {
+      // Global binaries can still execute project-owned config, plugins, or
+      // hooks merely by starting in the project root. Binary location is not a
+      // safe trust boundary, so every formatter spawn requires project trust.
+      await ProjectTrust.require(Instance.project, "project_formatter")
+      const options = await Config.trustedSandbox()
+      const sandbox = Sandbox.wrapArgv({
+        file: command[0]!,
+        args: command.slice(1),
+        workspace: [Instance.directory, Instance.worktree],
+        readable: [Instance.directory, Instance.worktree],
+        unreadable: OpenScience.kernelSensitivePaths(),
+        options,
+      })
+      const wrapped = await CommandRuntime.wrap({
+        file: sandbox.file,
+        args: sandbox.args,
+      })
+      const child = (() => {
+        try {
+          return spawn(wrapped.file, wrapped.args, {
+            cwd: Instance.directory,
+            env: { ...OpenScience.kernelEnv(process.env), ...item.environment },
+            stdio: "ignore",
+            detached: process.platform !== "win32",
+          })
+        } catch (error) {
+          Sandbox.cleanup(sandbox)
+          throw error
+        }
+      })()
+      const exited = new Promise<number>((resolve, reject) => {
+        child.once("error", reject)
+        child.once("close", (code) => resolve(code ?? 1))
+      })
+      const stop = () =>
+        Shell.killTree(child, { exited: () => child.exitCode !== null, detached: process.platform !== "win32" })
+      const registered = await CommandRuntime.start(
+        {
+          projectID: Instance.project.id,
+          sessionID: "formatter",
+          messageID: "formatter",
+          description: `Format ${path.basename(file)}`,
+          command: command.join(" "),
+        },
+        child,
+        stop,
+        { windowsRelease: wrapped.release },
+      ).catch(async (error) => {
+        if (child.exitCode === null && child.signalCode === null) await stop()
+        Sandbox.cleanup(sandbox)
+        throw error
+      })
+      return { exited, registered, sandbox }
+    })
+    return launched.exited.finally(() => {
+      CommandRuntime.finish(launched.registered.id)
+      Sandbox.cleanup(launched.sandbox)
+    })
   }
 
   export async function status() {
@@ -110,14 +183,7 @@ export namespace Format {
       for (const item of await getFormatter(ext)) {
         log.info("running", { command: item.command })
         try {
-          const proc = Bun.spawn({
-            cmd: item.command.map((x) => x.replace("$FILE", file)),
-            cwd: Instance.directory,
-            env: { ...process.env, ...item.environment },
-            stdout: "ignore",
-            stderr: "ignore",
-          })
-          const exit = await proc.exited
+          const exit = await run(item, file)
           if (exit !== 0)
             log.error("failed", {
               command: item.command,

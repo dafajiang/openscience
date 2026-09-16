@@ -30,15 +30,13 @@ async function openInEditor(initial: string): Promise<string> {
   return out
 }
 
-type SkillGroup = "preexisting" | "learned" | "installed"
+type SkillGroup = "default" | "local" | "installed"
 
-function classifySkillLocation(loc: string): { group: SkillGroup; namespace?: string } {
-  const installed = loc.match(/[\\/]installed-skills[\\/]([^\\/]+)[\\/]/)
+function classifySkill(skill: Skill.Info): { group: SkillGroup; namespace?: string } {
+  const installed = skill.location.match(/[\\/]installed-skills[\\/]([^\\/]+)[\\/]/)
   if (installed) return { group: "installed", namespace: installed[1] }
-  if (loc.includes("/learned-skills/") || loc.includes("\\learned-skills\\")) {
-    return { group: "learned" }
-  }
-  return { group: "preexisting" }
+  if (skill.origin === "default") return { group: "default" }
+  return { group: "local" }
 }
 
 export const SkillCommand = cmd({
@@ -66,19 +64,11 @@ const SkillAddCommand = cmd({
   command: "add <url>",
   describe: "install all skills from a public git repository",
   builder: (yargs: Argv) => {
-    return yargs
-      .positional("url", {
-        describe: "git URL or gh: shorthand (e.g. gh:anthropics/superpowers)",
-        type: "string",
-        demandOption: true,
-      })
-      .option("skip-classifier", {
-        describe:
-          "skip the server-side LLM safety review and the cloud upload " +
-          "side-effect (local-only install, at your own risk)",
-        type: "boolean",
-        default: false,
-      })
+    return yargs.positional("url", {
+      describe: "git URL or gh: shorthand (e.g. gh:anthropics/superpowers)",
+      type: "string",
+      demandOption: true,
+    })
   },
   handler: async (args) => {
     const progress = Progress.interactive()
@@ -86,7 +76,6 @@ const SkillAddCommand = cmd({
       const result = await Install.add(args.url as string, {
         confirm: true,
         progress,
-        skipClassifier: args["skip-classifier"] as boolean,
       })
       if (result.installed.length === 0 && result.rejected.length > 0) {
         UI.error(`Nothing installed. ${result.rejected.length} skill(s) rejected:`)
@@ -153,7 +142,7 @@ const SkillEditCommand = cmd({
       directory: process.cwd(),
       async fn() {
         const name = args.name as string
-        const info = await Skill.get(name)
+        const info = await Skill.get(name, { includeDisabled: true })
         if (!info || !(info.location ?? "").includes("/user-skills/")) {
           UI.error(`No user skill named "${name}". Create one with: openscience skill new ${name}`)
           process.exit(1)
@@ -192,7 +181,7 @@ const SkillValidateCommand = cmd({
         const target = (args.target as string).trim()
         const file = await (async () => {
           if (target.endsWith(".md") || target.includes("/") || target.includes("\\")) return target
-          const info = await Skill.get(target)
+          const info = await Skill.get(target, { includeDisabled: true })
           if (!info) {
             UI.error(`no skill named "${target}"`)
             process.exit(1)
@@ -260,65 +249,55 @@ const SkillListCommand = cmd({
   describe: "list available skills",
   builder: (yargs: Argv) =>
     yargs.option("all", {
-      describe: "include bundled OpenScience skills in the listing",
+      describe: "include default OpenScience skills in the listing",
       type: "boolean",
       default: false,
     }),
   handler: async (args) => {
     // Skill.state() needs project-instance context so it can walk the
-    // .claude/.openscience config dirs alongside the global cache + learned +
-    // installed dirs. Mirror what ModelsCommand does.
+    // .claude/.openscience config dirs alongside the global and installed
+    // skill directories. Mirror what ModelsCommand does.
     await Instance.provide({
       directory: process.cwd(),
       async fn() {
-        const all = await Skill.all()
+        const all = await Skill.all({ includeDisabled: true })
         const showAll = args.all as boolean
-        const bundled: Skill.Info[] = []
-        const learned: Skill.Info[] = []
+        const defaults: Skill.Info[] = []
+        const local: Skill.Info[] = []
         const installed: Record<string, Skill.Info[]> = {}
 
         for (const s of all) {
-          const cls = classifySkillLocation(s.location ?? "")
+          const cls = classifySkill(s)
           if (cls.group === "installed") {
             const ns = cls.namespace ?? "_"
             ;(installed[ns] ??= []).push(s)
-          } else if (cls.group === "learned") {
-            learned.push(s)
+          } else if (cls.group === "default") {
+            defaults.push(s)
           } else {
-            bundled.push(s)
+            local.push(s)
           }
         }
 
         const totalInstalled = Object.values(installed).reduce((a, l) => a + l.length, 0)
-        const totalLearned = learned.length
-        const totalBundled = bundled.length
+        const totalDefault = defaults.length
 
-        UI.println(`OpenScience bundled skills: ${totalBundled}`)
-        UI.println(`learned skills: ${totalLearned}`)
+        UI.println(`OpenScience default skills: ${totalDefault}`)
+        UI.println(`project and personal skills: ${local.length}`)
         UI.println(`installed skills: ${totalInstalled}`)
         UI.println("")
 
-        if (totalBundled === 0) {
-          UI.println(
-            "Bundled OpenScience skills did not load. Run `openscience login` and `openscience sync`, then try again.",
-          )
-          UI.println("Offline fallback only shows skills already cached on this machine.")
-          UI.println("")
-        } else if (totalBundled < 100) {
-          UI.println(
-            "Only a small bundled skill set is visible; this usually means the full OpenScience skill index was not fetched.",
-          )
-          UI.println("Run `openscience sync` or try again once online/authenticated.")
+        if (totalDefault === 0) {
+          UI.println("Default OpenScience skills did not load. Reinstall this OpenScience release and try again.")
           UI.println("")
         } else if (!showAll) {
-          UI.println("Use `openscience skill list --all` to show bundled OpenScience skills.")
+          UI.println("Use `openscience skill list --all` to show default OpenScience skills.")
           UI.println("")
         }
 
-        if (showAll && totalBundled > 0) {
-          UI.println(`bundled skills (${totalBundled})`)
+        if (showAll && totalDefault > 0) {
+          UI.println(`default skills (${totalDefault})`)
           const groups = Map.groupBy(
-            bundled.sort((a, b) => a.name.localeCompare(b.name)),
+            defaults.sort((a, b) => a.name.localeCompare(b.name)),
             (s) => s.category ?? "uncategorized",
           )
           for (const [category, list] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
@@ -328,17 +307,15 @@ const SkillListCommand = cmd({
           UI.println("")
         }
 
-        if (totalLearned === 0 && totalInstalled === 0) {
-          UI.println("Install third-party skills with: openscience skill add <git-url>")
-          return
+        if (local.length > 0) {
+          UI.println(`project and personal skills (${local.length})`)
+          for (const s of local.sort((a, b) => a.name.localeCompare(b.name))) UI.println(`  ${s.name}`)
+          UI.println("")
         }
 
-        if (totalLearned > 0) {
-          UI.println(`learned skills (${totalLearned})`)
-          for (const s of learned.sort((a, b) => a.name.localeCompare(b.name))) {
-            UI.println(`  ${s.name}`)
-          }
-          UI.println("")
+        if (totalInstalled === 0) {
+          UI.println("Install third-party skills with: openscience skill add <git-url>")
+          return
         }
 
         if (totalInstalled > 0) {
@@ -463,6 +440,6 @@ const SkillRemoveCommand = cmd({
   },
   handler: async (args) => {
     const result = await Install.remove(args.target as string)
-    UI.println(`Archived ${result.archived} skill(s).`)
+    UI.println(`Removed ${result.archived} skill(s).`)
   },
 })

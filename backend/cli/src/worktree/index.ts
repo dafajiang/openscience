@@ -8,10 +8,11 @@ import { Instance } from "../project/instance"
 import { InstanceBootstrap } from "../project/bootstrap"
 import { Project } from "../project/project"
 import { Storage } from "../storage/storage"
-import { fn } from "../util/fn"
+import { fn } from "@synsci/util/fn"
 import { Log } from "../util/log"
 import { BusEvent } from "@/bus/bus-event"
 import { GlobalBus } from "@/bus/global"
+import { ProjectTrust } from "../project/trust"
 
 export namespace Worktree {
   const log = Log.create({ service: "worktree" })
@@ -261,13 +262,16 @@ export namespace Worktree {
     return false
   }
 
-  async function runStartScripts(directory: string, input: { projectID: string; extra?: string }) {
+  export async function runStartScripts(directory: string, input: { projectID: string; extra?: string }) {
     const project = await Storage.read<Project.Info>(["project", input.projectID]).catch(() => undefined)
     const startup = project?.commands?.start?.trim() ?? ""
+    const extra = input.extra?.trim() ?? ""
+    if ((startup || extra) && project) {
+      await ProjectTrust.require(project, "startup_script")
+    }
     const ok = await runStartScript(directory, startup, "project")
     if (!ok) return false
 
-    const extra = input.extra ?? ""
     await runStartScript(directory, extra, "worktree")
     return true
   }

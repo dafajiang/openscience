@@ -1,4 +1,5 @@
 import type { Argv } from "yargs"
+import { Auth } from "../../auth"
 import { Instance } from "../../project/instance"
 import { Provider } from "../../provider/provider"
 import { ModelsDev } from "../../provider/models"
@@ -9,23 +10,33 @@ import { EOL } from "os"
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: "Anthropic",
   openai: "OpenAI",
-  "openai-codex": "OpenAI Codex",
+  "openai-codex": "OpenAI (Codex subscription)",
   google: "Google",
   gemini: "Google Gemini",
+  xai: "xAI",
+  meta: "Meta Model API",
   openrouter: "OpenRouter",
+  togetherai: "Together AI",
+  together: "Together AI",
+  groq: "Groq",
+  "fireworks-ai": "Fireworks AI",
+  fireworks: "Fireworks AI",
+  mistral: "Mistral",
+  deepseek: "DeepSeek",
+  cerebras: "Cerebras",
+  perplexity: "Perplexity",
 }
 
-/** Classify a provider as BYOK, openscience-managed, OAuth, or unknown.
+/** Classify the user-owned route behind a provider.
  *
  *  Detection rules:
  *  - openai-codex routes via OAuth (Sign in with ChatGPT), neither.
- *  - key starts with "thk_" → managed (the proxy thumbprint Atlas hands
- *    out on /api/cli/sync when the user has no BYOK key set).
- *  - options.baseURL points at Atlas (/api/llm/proxy/) → managed.
+ *  - a managed provider using an Atlas key and proxy is the selected Ace workspace.
+ *  - Atlas keys and proxy URLs outside that managed route are rejected by the provider layer.
  *  - anything else with a key → BYOK.
  */
 function routingLabel(providerID: string, provider: Provider.Info): string {
-  if (providerID === "openai-codex") return "Signed in with Codex"
+  if (providerID === "openai-codex") return "ChatGPT subscription"
   // Read the EFFECTIVE credential, not just provider.key: a custom loader stores
   // its key under options.apiKey (e.g. openrouter), and a multi-env provider
   // (google's GEMINI_API_KEY + GOOGLE_GENERATIVE_AI_API_KEY) leaves provider.key
@@ -34,8 +45,10 @@ function routingLabel(providerID: string, provider: Provider.Info): string {
   // demo sentinel is not a real credential.
   const effective = Provider.effectiveKey(provider)
   const baseURL = (provider.options?.baseURL as string | undefined) ?? ""
-  if ((effective ?? "").toLowerCase().startsWith("thk_")) return "managed"
-  if (baseURL.includes("/api/llm/proxy/")) return "managed"
+  if (provider.source === "managed" && Auth.isAtlasApiKey(effective) && baseURL.includes("/api/llm/proxy/")) {
+    return "Ace workspace"
+  }
+  if (Auth.isAtlasApiKey(effective) || baseURL.includes("/api/llm/proxy/")) return "retired credential"
   // A config-registered local endpoint stores its key under options.apiKey (not
   // provider.key), so it would otherwise read as "unconfigured".
   if (Provider.isLocalBaseURL(baseURL)) return "local"
@@ -125,13 +138,7 @@ export const ModelsCommand = cmd({
           return
         }
 
-        const providerIDs = Object.keys(providers).sort((a, b) => {
-          const aIsManaged = a.startsWith("synsci")
-          const bIsManaged = b.startsWith("synsci")
-          if (aIsManaged && !bIsManaged) return -1
-          if (!aIsManaged && bIsManaged) return 1
-          return a.localeCompare(b)
-        })
+        const providerIDs = Object.keys(providers).sort((a, b) => a.localeCompare(b))
 
         const printer = args.flat ? printFlat : printGrouped
         for (const providerID of providerIDs) {

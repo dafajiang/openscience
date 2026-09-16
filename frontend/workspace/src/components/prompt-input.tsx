@@ -10,6 +10,7 @@ import {
   Switch,
   Match,
   createMemo,
+  createResource,
   createSignal,
 } from "solid-js"
 import { createStore, produce } from "solid-js/store"
@@ -24,6 +25,7 @@ import {
   usePrompt,
   ImageAttachmentPart,
   AgentPart,
+  ConversationAttachmentPart,
   FileAttachmentPart,
 } from "@/context/prompt"
 import { useLayout } from "@/context/layout"
@@ -34,41 +36,86 @@ import { useComments } from "@/context/comments"
 import { FileIcon } from "@synsci/ui/file-icon"
 import { Button } from "@synsci/ui/button"
 import { Icon } from "@synsci/ui/icon"
-import { ProviderIcon } from "@synsci/ui/provider-icon"
-import type { IconName } from "@synsci/ui/icons/provider"
-import { Tooltip, TooltipKeybind } from "@synsci/ui/tooltip"
+import { Tooltip } from "@synsci/ui/tooltip"
 import { IconButton } from "@synsci/ui/icon-button"
-import { Select } from "@synsci/ui/select"
 import { getDirectory, getFilename, getFilenameTruncated } from "@synsci/util/path"
 import { useDialog } from "@synsci/ui/context/dialog"
 import { ImagePreview } from "@synsci/ui/image-preview"
-import { ModelSelectorPopover } from "@/components/dialog-select-model"
-import { DialogSelectModelUnpaid } from "@/components/dialog-select-model-unpaid"
-import { useProviders } from "@/hooks/use-providers"
 import { useCommand } from "@/context/command"
 import { Persist, persisted } from "@/utils/persist"
 import { Identifier } from "@/utils/id"
 import { Worktree as WorktreeState } from "@/utils/worktree"
-import { SessionContextUsage } from "@/components/session-context-usage"
-import { usePermission } from "@/context/permission"
 import { useLanguage } from "@/context/language"
 import { useGlobalSync } from "@/context/global-sync"
 import { usePlatform } from "@/context/platform"
 import { createOpenScienceClient, type Message, type Part } from "@synsci/sdk/v2/client"
 import { Binary } from "@synsci/util/binary"
 import { showToast } from "@synsci/ui/toast"
-import { base64Encode } from "@synsci/util/encode"
-
-const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
-const ACCEPTED_TEXT_TYPES = ["text/markdown", "text/plain"]
-const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf", ...ACCEPTED_TEXT_TYPES]
-// Browsers frequently report file.type === "" for .md (and sometimes .txt), so the
-// mime allow-list alone would drop them. Resolve by extension as a fallback.
-const TEXT_EXTENSIONS: Record<string, string> = { md: "text/markdown", markdown: "text/markdown", txt: "text/plain" }
-const fileExtension = (name: string) => name.slice(name.lastIndexOf(".") + 1).toLowerCase()
-const resolveMime = (file: File) => file.type || TEXT_EXTENSIONS[fileExtension(file.name)] || ""
-const isAcceptedFile = (file: File) =>
-  ACCEPTED_FILE_TYPES.includes(file.type) || Boolean(TEXT_EXTENSIONS[fileExtension(file.name)])
+import { uiStore } from "@/atlas/store/ui"
+import { confirmDialog } from "@/atlas/dialogs"
+import { projectHref, projectPathname } from "@/utils/project-route"
+import { createMediaQuery } from "@solid-primitives/media"
+import { ModelSettingsPopover } from "./model-settings-popover"
+import {
+  loadedSkillNamesThisTurn,
+  recordRecentSkill,
+  skillAction,
+  skillCatalogSnapshot,
+  skillPreferences,
+  SKILL_PREFERENCES_EVENT,
+} from "@/atlas/skill-permissions"
+import { DialogSettings } from "./dialog-settings"
+import { WorkingFolderChip, type WorkingRootChoice } from "./working-folder"
+import "./prompt-input.css"
+import {
+  ATTACHMENT_ACCEPT,
+  MAX_ATTACHMENT_BYTES,
+  attachmentFormat,
+  attachmentMime,
+  attachmentSize,
+} from "./prompt-attachment"
+import {
+  CAPABILITY_PREFERENCES_EVENT,
+  delegatedSpecialist,
+  delegationSettings,
+  DELEGATION_AUTONOMY,
+  DELEGATION_LEVELS,
+  type CapabilityPreferences,
+  type DelegationAutonomy,
+  type DelegationLevel,
+  type DelegationSettings,
+  publishCapabilityPreferences,
+} from "./prompt-capabilities"
+import { canRestoreFailedSubmission } from "./prompt-submission"
+import { getNodeLength, isPillNode, setCursorPosition } from "./prompt-editor-cursor"
+import { applyHighlight, clearHighlight, slashTokenRanges } from "./prompt-highlight"
+import { submitComposerPrompt, type ComposerPromptInput } from "./prompt-runtime"
+import { requestFailure, requestStatus } from "@/utils/request-error"
+import {
+  slashBlurb,
+  slashGroup,
+  slashIcon,
+  slashMode,
+  slashMatches,
+  slashOptionId,
+  slashActionSkill,
+  slashEdit,
+  slashTokenAt,
+  SLASH_NATIVE,
+  SLASH_SESSION,
+  SLASH_QUERY_LIMIT,
+  sortSlash,
+  sortSlashGroups,
+  type SlashCommand,
+  type SlashMode,
+} from "./prompt-slash"
+import {
+  DEFAULT_RESEARCH_ACCESS_MODE,
+  RESEARCH_ACCESS_OPTIONS,
+  researchAccessLabel as accessLabel,
+  researchAccessMode,
+  type ResearchAccessMode,
+} from "./research-access"
 
 type PendingPrompt = {
   abort: AbortController
@@ -85,41 +132,68 @@ interface PromptInputProps {
   onSubmit?: () => void
 }
 
-const EXAMPLES = [
-  "prompt.example.1",
-  "prompt.example.2",
-  "prompt.example.3",
-  "prompt.example.4",
-  "prompt.example.5",
-  "prompt.example.6",
-  "prompt.example.7",
-  "prompt.example.8",
-  "prompt.example.9",
-  "prompt.example.10",
-  "prompt.example.11",
-  "prompt.example.12",
-  "prompt.example.13",
-  "prompt.example.14",
-  "prompt.example.15",
-  "prompt.example.16",
-  "prompt.example.17",
-  "prompt.example.18",
-  "prompt.example.19",
-  "prompt.example.20",
-  "prompt.example.21",
-  "prompt.example.22",
-  "prompt.example.23",
-  "prompt.example.24",
-  "prompt.example.25",
-] as const
+interface ResearchAccessSnapshot {
+  root: string
+  mode: ResearchAccessMode
+  requestedMode: ResearchAccessMode
+  managed: boolean
+  sandboxStatus: { available: boolean; reason?: string }
+}
 
-interface SlashCommand {
-  id: string
-  trigger: string
-  title: string
-  description?: string
-  keybind?: string
-  type: "builtin" | "custom" | "skill"
+type ResearchSliderOption = { value: string; label: string }
+
+const ResearchSlider: Component<{
+  label: string
+  value: string
+  options: ResearchSliderOption[]
+  disabled?: boolean
+  onSelect: (value: string) => void
+}> = (props) => {
+  const move = (event: KeyboardEvent) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return
+    const target = event.target
+    const scope = event.currentTarget
+    if (!(target instanceof HTMLButtonElement)) return
+    if (!(scope instanceof HTMLElement)) return
+    const options = Array.from(scope.querySelectorAll<HTMLButtonElement>('[role="radio"]'))
+    const current = options.indexOf(target)
+    if (current < 0) return
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? options.length - 1
+          : event.key === "ArrowRight"
+            ? (current + 1) % options.length
+            : (current - 1 + options.length) % options.length
+    event.preventDefault()
+    options[next]?.focus()
+    options[next]?.click()
+  }
+
+  return (
+    <div class="workspace-composer__research-setting workspace-composer__research-slider">
+      <span class="workspace-composer__research-setting-label workspace-composer__research-slider-label">
+        {props.label}
+      </span>
+      <div role="radiogroup" aria-label={props.label} onKeyDown={move}>
+        <For each={props.options}>
+          {(option) => (
+            <button
+              type="button"
+              role="radio"
+              aria-checked={props.value === option.value}
+              tabindex={props.value === option.value ? 0 : -1}
+              disabled={props.disabled}
+              onClick={() => props.onSelect(option.value)}
+            >
+              {option.label}
+            </button>
+          )}
+        </For>
+      </div>
+    </div>
+  )
 }
 
 export const PromptInput: Component<PromptInputProps> = (props) => {
@@ -136,14 +210,169 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const comments = useComments()
   const params = useParams()
   const dialog = useDialog()
-  const providers = useProviders()
   const command = useCommand()
-  const permission = usePermission()
   const language = useLanguage()
   let editorRef!: HTMLDivElement
   let fileInputRef!: HTMLInputElement
   let scrollRef!: HTMLDivElement
   let slashPopoverRef!: HTMLDivElement
+  let researchToolsRef: HTMLDetailsElement | undefined
+  const settings = async <T,>(path: string, init?: RequestInit) => {
+    const response = await sdk.request(path, init)
+    const text = await response.text()
+    if (!response.ok) throw new Error(text || `${response.status} ${response.statusText}`)
+    return JSON.parse(text) as T
+  }
+  const [capabilitiesResource, capabilityActions] = createResource(() =>
+    settings<CapabilityPreferences>("/settings/preferences"),
+  )
+  // Reading an errored resource throws into the app's only error boundary,
+  // so one failed preferences request took the whole workspace down. The
+  // composer runs with defaults until the preferences arrive.
+  const capabilities = () => (capabilitiesResource.error ? undefined : capabilitiesResource.latest)
+  onMount(() => {
+    const update = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return
+      capabilityActions.mutate(event.detail as CapabilityPreferences)
+    }
+    globalThis.addEventListener(CAPABILITY_PREFERENCES_EVENT, update)
+    onCleanup(() => globalThis.removeEventListener(CAPABILITY_PREFERENCES_EVENT, update))
+  })
+  const saveCapabilities = (patch: Partial<CapabilityPreferences>) => {
+    const previous = capabilities()
+    if (!previous) return
+    const next = { ...previous, ...patch }
+    capabilityActions.mutate(next)
+    void settings<CapabilityPreferences>("/settings/preferences", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    })
+      .then((value) => {
+        capabilityActions.mutate(value)
+        publishCapabilityPreferences(value)
+      })
+      .catch((error) => {
+        capabilityActions.mutate(previous)
+        showToast({
+          title: "Couldn't update research preferences",
+          description: error instanceof Error ? error.message : String(error),
+        })
+      })
+  }
+  const delegation = createMemo(() => delegationSettings(capabilities()))
+  const narrow = createMediaQuery("(max-width: 719px)")
+  const configuredConnectorCount = createMemo(
+    () =>
+      Object.values(globalSync.data.config.mcp ?? {}).filter(
+        (value) => !!value && typeof value === "object" && "type" in value,
+      ).length,
+  )
+  const saveDelegation = (patch: { level?: DelegationLevel; autonomy?: DelegationAutonomy }) => {
+    const current = delegation()
+    const next = {
+      level: patch.level ?? current.level,
+      workerModel: current.workerModel,
+      autonomy: patch.autonomy ?? current.autonomy,
+    }
+    saveCapabilities({
+      delegation_enabled: next.level !== "off",
+      delegation_level: next.level,
+      delegation_worker_model: next.workerModel ?? null,
+      delegation_autonomy: next.autonomy,
+    })
+  }
+  const projectAccess = async (projectID: string, init?: RequestInit) => {
+    const response = await sdk.request(`/project/${encodeURIComponent(projectID)}/access`, init)
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "")
+      throw new Error(detail || `${response.status} ${response.statusText}`)
+    }
+    return (await response.json()) as ResearchAccessSnapshot
+  }
+  const loadResearchAccess = async (projectID: string): Promise<ResearchAccessSnapshot> => {
+    return projectAccess(projectID)
+  }
+  const [researchAccess, researchAccessControls] = createResource(
+    () => sdk.projectID || false,
+    async (projectID) => ({ projectID, value: await loadResearchAccess(projectID) }),
+  )
+  const [researchAccessSaving, setResearchAccessSaving] = createSignal(false)
+  // Where a not-yet-created session will work; the chip sends it with create.
+  const [pendingWorkingRoot, setPendingWorkingRoot] = createSignal<WorkingRootChoice>(undefined)
+  const currentResearchAccess = () => {
+    if (researchAccess.error) return
+    const current = researchAccess.latest
+    if (!current || current.projectID !== sdk.projectID) return
+    return current.value
+  }
+  const selectedResearchAccess = createMemo(() => {
+    const current = currentResearchAccess()
+    return current ? researchAccessMode(current) : DEFAULT_RESEARCH_ACCESS_MODE
+  })
+  const researchAccessLabel = createMemo(() => accessLabel(selectedResearchAccess()))
+
+  const applyResearchAccess = async (mode: ResearchAccessMode, target: HTMLButtonElement) => {
+    target.focus()
+    const projectID = sdk.projectID
+    const initial = currentResearchAccess()
+    if (!projectID || !initial || researchAccessSaving()) return
+    if (researchAccessMode(initial) === mode) return
+    if (mode === "full") {
+      const confirmed = await confirmDialog(dialog, {
+        title: "Enable Full access?",
+        message:
+          "Full access disables the execution sandbox and routine action prompts. Managed policy, credential, and paid-compute boundaries still apply.",
+        confirmLabel: "Enable Full access",
+        danger: true,
+      })
+      if (!confirmed) return
+    }
+
+    setResearchAccessSaving(true)
+    try {
+      const confirmed = await projectAccess(projectID, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode, ...(mode === "ask" ? {} : { root: initial.root }) }),
+      })
+      researchAccessControls.mutate({ projectID, value: confirmed })
+      const effective = researchAccessMode(confirmed)
+      if (effective !== mode) {
+        showToast({
+          title: "Access is limited by managed settings",
+          description: `The effective mode remains ${accessLabel(effective)}.`,
+        })
+        return
+      }
+      showToast({ variant: "success", title: `${accessLabel(effective)} enabled` })
+    } catch (error) {
+      showToast({
+        title: "Couldn't update action approval",
+        description: error instanceof Error ? error.message : String(error),
+      })
+      void researchAccessControls.refetch()
+    } finally {
+      setResearchAccessSaving(false)
+    }
+  }
+
+  const refreshResearchAccess = () => {
+    if (!sdk.projectID || researchAccessSaving()) return
+    void researchAccessControls.refetch()
+  }
+  const trustSubscription = sdk.event.on("project.trust.changed", (event) => {
+    if (event.properties.status.projectID !== sdk.projectID) return
+    refreshResearchAccess()
+  })
+  const accessSubscription = sdk.event.on("project.access.changed", (event) => {
+    if (event.properties.status.projectID !== sdk.projectID) return
+    refreshResearchAccess()
+  })
+  const instanceSubscription = sdk.event.on("server.instance.disposed", refreshResearchAccess)
+  onCleanup(trustSubscription)
+  onCleanup(accessSubscription)
+  onCleanup(instanceSubscription)
 
   const mirror = { input: false }
 
@@ -179,6 +408,63 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
   const sessionKey = createMemo(() => `${params.dir}${params.id ? "/" + params.id : ""}`)
   const tabs = createMemo(() => layout.tabs(sessionKey))
+
+  const attach = () => {
+    queueMicrotask(() => fileInputRef.click())
+  }
+
+  const resetResearchTools = () => {
+    for (const choice of researchToolsRef?.querySelectorAll<HTMLDetailsElement>(
+      ".workspace-composer__research-choice[open]",
+    ) ?? []) {
+      choice.open = false
+    }
+  }
+
+  const closeResearchTools = () => {
+    resetResearchTools()
+    if (researchToolsRef) researchToolsRef.open = false
+  }
+
+  const toggleResearchChoice = (event: Event) => {
+    const choice = event.currentTarget
+    if (!(choice instanceof HTMLDetailsElement) || !choice.open) return
+    for (const item of researchToolsRef?.querySelectorAll<HTMLDetailsElement>(
+      ".workspace-composer__research-choice[open]",
+    ) ?? []) {
+      if (item !== choice) item.open = false
+    }
+  }
+
+  const navigateResearchChoices = (event: KeyboardEvent) => {
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return
+    const target = event.target
+    const scope = event.currentTarget
+    if (!(target instanceof HTMLButtonElement) || target.getAttribute("role") !== "radio") return
+    if (!(scope instanceof HTMLElement)) return
+    const choices = Array.from(scope.querySelectorAll<HTMLButtonElement>('[role="radio"]'))
+    const index = choices.indexOf(target)
+    if (index < 0 || choices.length === 0) return
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? choices.length - 1
+          : event.key === "ArrowDown" || event.key === "ArrowRight"
+            ? (index + 1) % choices.length
+            : (index <= 0 ? choices.length : index) - 1
+    const choice = choices[next]
+    if (!choice) return
+    event.preventDefault()
+    choice.focus()
+    choice.click()
+  }
+
+  const dismissResearchTools = (event: PointerEvent) => {
+    if (!researchToolsRef?.open) return
+    if (event.target instanceof Node && researchToolsRef.contains(event.target)) return
+    closeResearchTools()
+  }
 
   const commentInReview = (path: string) => {
     const sessionID = params.id
@@ -241,26 +527,59 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   )
 
   const [store, setStore] = createStore<{
-    popover: "at" | "slash" | null
+    popover: "at" | "conversation" | "slash" | null
     historyIndex: number
     savedPrompt: Prompt | null
-    placeholder: number
     dragging: boolean
     mode: "normal" | "shell"
+    intent: SlashMode | null
+    slashInline: boolean
     applyingHistory: boolean
+    bootstrapID?: string
+    bootstrapDirectory?: string
   }>({
     popover: null,
     historyIndex: -1,
     savedPrompt: null,
-    placeholder: Math.floor(Math.random() * EXAMPLES.length),
     dragging: false,
     mode: "normal",
+    intent: null,
+    slashInline: false,
     applyingHistory: false,
+    bootstrapID: undefined,
+    bootstrapDirectory: undefined,
+  })
+
+  const [submitting, setSubmitting] = createSignal(false)
+
+  const placeholder = createMemo(() => {
+    if (submitting()) return "Sending…"
+    if (store.mode === "shell") return language.t("prompt.placeholder.shell")
+    // Enter adds to the running turn; only the button and Esc stop it, so a
+    // message typed mid-turn is never lost to an accidental abort.
+    if (working() && !store.intent && commentCount() === 0) return language.t("prompt.placeholder.working")
+    if (store.intent === "plan") return "Describe your task to generate a plan…"
+    if (store.intent === "goal") return "Describe your goal and the measurable outcome…"
+    if (commentCount() > 1) return language.t("prompt.placeholder.summarizeComments")
+    if (commentCount() === 1) return language.t("prompt.placeholder.summarizeComment")
+    return language.t("prompt.placeholder.normal")
   })
 
   const MAX_HISTORY = 100
+  // History exists to recall text, not to re-send screenshots: image parts
+  // are persisted without their data (a single attachment can be 20 MB and
+  // the store holds 100 entries). Entries written before this are stripped
+  // when they load.
+  const stripImages = (entry: Prompt): Prompt =>
+    entry.map((part) => (part.type === "image" ? { ...part, dataUrl: "" } : part))
+  const stripHistory = (value: unknown) => {
+    if (!value || typeof value !== "object") return value
+    const entries = (value as { entries?: unknown }).entries
+    if (!Array.isArray(entries)) return value
+    return { ...value, entries: entries.map((entry) => (Array.isArray(entry) ? stripImages(entry as Prompt) : entry)) }
+  }
   const [history, setHistory] = persisted(
-    Persist.global("prompt-history", ["prompt-history.v1"]),
+    { ...Persist.global("prompt-history", ["prompt-history.v1"]), migrate: stripHistory },
     createStore<{
       entries: Prompt[]
     }>({
@@ -268,7 +587,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }),
   )
   const [shellHistory, setShellHistory] = persisted(
-    Persist.global("prompt-history-shell", ["prompt-history-shell.v1"]),
+    { ...Persist.global("prompt-history-shell", ["prompt-history-shell.v1"]), migrate: stripHistory },
     createStore<{
       entries: Prompt[]
     }>({
@@ -281,6 +600,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (part.type === "text") return { ...part }
       if (part.type === "image") return { ...part }
       if (part.type === "agent") return { ...part }
+      if (part.type === "conversation") return { ...part }
       return {
         ...part,
         selection: part.selection ? { ...part.selection } : undefined,
@@ -290,7 +610,15 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const promptLength = (prompt: Prompt) =>
     prompt.reduce((len, part) => len + ("content" in part ? part.content.length : 0), 0)
 
-  const applyHistoryPrompt = (p: Prompt, position: "start" | "end") => {
+  // Persisted history carries image parts without their data; those cannot
+  // be re-sent, so restore only the parts that still have content.
+  const restorable = (p: Prompt): Prompt => {
+    const parts = p.filter((part) => part.type !== "image" || !!part.dataUrl)
+    return parts.length ? parts : DEFAULT_PROMPT
+  }
+
+  const applyHistoryPrompt = (entry: Prompt, position: "start" | "end") => {
+    const p = restorable(entry)
     const length = position === "start" ? 0 : promptLength(p)
     setStore("applyingHistory", true)
     prompt.set(p, length)
@@ -321,36 +649,56 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
   const isFocused = createFocusSignal(() => editorRef)
 
-  createEffect(() => {
-    params.id
-    if (params.id) return
-    const interval = setInterval(() => {
-      setStore("placeholder", (prev) => (prev + 1) % EXAMPLES.length)
-    }, 6500)
-    onCleanup(() => clearInterval(interval))
-  })
-
   const [composing, setComposing] = createSignal(false)
   const isImeComposing = (event: KeyboardEvent) => event.isComposing || composing() || event.keyCode === 229
 
-  const addImageAttachment = async (file: File) => {
-    if (!isAcceptedFile(file)) return
-    const mime = resolveMime(file)
-
-    const reader = new FileReader()
-    reader.onload = () => {
-      const dataUrl = reader.result as string
-      const attachment: ImageAttachmentPart = {
-        type: "image",
-        id: crypto.randomUUID(),
-        filename: file.name,
-        mime,
-        dataUrl,
-      }
-      const cursorPosition = prompt.cursor() ?? getCursorPosition(editorRef)
-      prompt.set([...prompt.current(), attachment], cursorPosition)
+  const addAttachment = async (file: File) => {
+    const mime = attachmentMime(file)
+    if (!mime) {
+      showToast({
+        variant: "error",
+        title: "File not attached",
+        description: `${file.name} is not a supported image, PDF, text, code, or scientific data file.`,
+      })
+      return
     }
-    reader.readAsDataURL(file)
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      showToast({
+        variant: "error",
+        title: "File not attached",
+        description: `${file.name} is ${attachmentSize(file.size)}; attachments are limited to ${attachmentSize(MAX_ATTACHMENT_BYTES)}.`,
+      })
+      return
+    }
+
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error ?? new Error("file read failed"))
+      reader.readAsDataURL(file)
+    }).then(
+      (value) => value,
+      (error: unknown) => {
+        showToast({
+          variant: "error",
+          title: "File not attached",
+          description: error instanceof Error ? error.message : String(error),
+        })
+        return undefined
+      },
+    )
+    if (!dataUrl) return
+
+    const attachment: ImageAttachmentPart = {
+      type: "image",
+      id: crypto.randomUUID(),
+      filename: file.name,
+      mime,
+      dataUrl,
+      size: file.size,
+    }
+    const cursorPosition = prompt.cursor() ?? getCursorPosition(editorRef)
+    prompt.set([...prompt.current(), attachment], cursorPosition)
   }
 
   const removeImageAttachment = (id: string) => {
@@ -369,13 +717,13 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
     const items = Array.from(clipboardData.items)
     const fileItems = items.filter((item) => item.kind === "file")
-    const imageItems = fileItems.filter((item) => ACCEPTED_FILE_TYPES.includes(item.type))
+    const files = fileItems.flatMap((item) => {
+      const file = item.getAsFile()
+      return file && attachmentMime(file) ? [file] : []
+    })
 
-    if (imageItems.length > 0) {
-      for (const item of imageItems) {
-        const file = item.getAsFile()
-        if (file) await addImageAttachment(file)
-      }
+    if (files.length > 0) {
+      for (const file of files) await addAttachment(file)
       return
     }
 
@@ -421,9 +769,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (!dropped) return
 
     for (const file of Array.from(dropped)) {
-      if (isAcceptedFile(file)) {
-        await addImageAttachment(file)
-      }
+      await addAttachment(file)
     }
   }
 
@@ -431,11 +777,14 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     document.addEventListener("dragover", handleGlobalDragOver)
     document.addEventListener("dragleave", handleGlobalDragLeave)
     document.addEventListener("drop", handleGlobalDrop)
+    document.addEventListener("pointerdown", dismissResearchTools)
+    if (!params.id || params.id === "new") queueMicrotask(() => editorRef.focus())
   })
   onCleanup(() => {
     document.removeEventListener("dragover", handleGlobalDragOver)
     document.removeEventListener("dragleave", handleGlobalDragLeave)
     document.removeEventListener("drop", handleGlobalDrop)
+    document.removeEventListener("pointerdown", dismissResearchTools)
   })
 
   createEffect(() => {
@@ -449,14 +798,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   })
 
   type AtOption =
-    | { type: "agent"; name: string; display: string }
-    | { type: "file"; path: string; display: string; recent?: boolean }
+    { type: "agent"; name: string; display: string } | { type: "file"; path: string; display: string; recent?: boolean }
 
-  const agentList = createMemo(() =>
-    sync.data.agent
-      .filter((agent) => !agent.hidden && agent.mode !== "primary")
-      .map((agent): AtOption => ({ type: "agent", name: agent.name, display: agent.name })),
-  )
+  // Research is the only user-facing agent. Existing transcripts can still
+  // render legacy agent parts, but the composer advertises capabilities and
+  // files rather than exposing an internal-worker picker.
+  const agentList = createMemo<AtOption[]>(() => [])
 
   const handleAtSelect = (option: AtOption | undefined) => {
     if (!option) return
@@ -508,81 +855,309 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onSelect: handleAtSelect,
   })
 
+  type ConversationOption = {
+    sourceSessionID: string
+    label: string
+    throughMessageID?: string
+    updated: number
+  }
+
+  const conversationOptions = createMemo<ConversationOption[]>(() =>
+    sync.data.session
+      .filter((session) => !session.parentID && session.id !== params.id && !session.time?.archived)
+      .map((session) => ({
+        sourceSessionID: session.id,
+        label: session.title?.trim() || "Untitled conversation",
+        throughMessageID: sync.data.message[session.id]?.at(-1)?.id,
+        updated: session.time?.updated ?? session.time?.created ?? 0,
+      }))
+      .toSorted((a, b) => b.updated - a.updated || a.label.localeCompare(b.label)),
+  )
+
+  const handleConversationSelect = (option: ConversationOption | undefined) => {
+    if (!option) return
+    addPart({
+      type: "conversation",
+      sourceSessionID: option.sourceSessionID,
+      throughMessageID: option.throughMessageID,
+      label: option.label,
+      content: `#${option.label}`,
+      start: 0,
+      end: 0,
+    })
+  }
+
+  const {
+    flat: conversationFlat,
+    active: conversationActive,
+    setActive: setConversationActive,
+    onInput: conversationOnInput,
+    onKeyDown: conversationOnKeyDown,
+  } = useFilteredList<ConversationOption>({
+    items: async () => conversationOptions(),
+    key: (option) => option?.sourceSessionID,
+    filterKeys: ["label"],
+    sortBy: (a, b) => b.updated - a.updated || a.label.localeCompare(b.label),
+    onSelect: handleConversationSelect,
+  })
+
+  const skillStorage = typeof localStorage === "undefined" ? undefined : localStorage
+  const [skillPreferenceRevision, setSkillPreferenceRevision] = createSignal(0)
+  onMount(() => {
+    const refresh = () => setSkillPreferenceRevision((value) => value + 1)
+    globalThis.addEventListener(SKILL_PREFERENCES_EVENT, refresh)
+    globalThis.addEventListener("storage", refresh)
+    onCleanup(() => {
+      globalThis.removeEventListener(SKILL_PREFERENCES_EVENT, refresh)
+      globalThis.removeEventListener("storage", refresh)
+    })
+  })
+  const currentSkillPreferences = createMemo(() => {
+    skillPreferenceRevision()
+    return skillPreferences(skillStorage)
+  })
+  const loadedSkills = createMemo(() => {
+    const sessionID = params.id
+    if (!sessionID || sessionID === "new") return []
+    return loadedSkillNamesThisTurn(sync.data.message[sessionID] ?? [], sync.data.part)
+  })
+  const skillSnapshot = createMemo(() => {
+    const preferences = currentSkillPreferences()
+    return skillCatalogSnapshot(sync.data.skill ?? [], {
+      permission: sync.data.config.permission,
+      pinned: preferences.pinned,
+      recent: preferences.recent,
+      loadedThisTurn: loadedSkills(),
+    })
+  })
+
   const slashCommands = createMemo<SlashCommand[]>(() => {
-    const builtin = command.options
-      .filter((opt) => !opt.disabled && !opt.id.startsWith("suggested.") && opt.slash)
-      .map((opt) => ({
-        id: opt.id,
-        trigger: opt.slash!,
-        title: opt.title,
-        description: opt.description,
-        keybind: opt.keybind,
-        type: "builtin" as const,
+    const usage: Record<string, string> = {
+      compact: "/compact [focus]",
+      plan: "/plan [objective]",
+      goal: "/goal [objective]",
+    }
+    const catalog = new Map(sync.data.command.map((item) => [item.name, item]))
+    const permitted = (name: string) => skillAction(sync.data.config.permission, name) !== "deny"
+    const local = command.options
+      .filter((item) => item.slash && !item.disabled && (item.slash !== "stop" || working()))
+      .map((item) => ({
+        id: item.id,
+        actionID: item.id,
+        trigger: item.slash!,
+        title: item.title,
+        description: item.description,
+        usage: `/${item.slash}`,
+        keybind: item.keybind,
+        source: "builtin" as const,
+        category: "session" as const,
+        type: "action" as const,
+      }))
+    const localTriggers = new Set(local.map((item) => item.trigger))
+    const builtin = SLASH_NATIVE.filter((name) => !localTriggers.has(name) && permitted(name)).map((name) => {
+      const item = catalog.get(name)
+      return {
+        id: `command.${name}`,
+        trigger: name,
+        title: name,
+        description: item?.description,
+        usage: usage[name],
+        source: "builtin" as const,
+        category: (name === "compact" ? "session" : "research") as "session" | "research",
+        type: slashMode({ trigger: name }) ? ("mode" as const) : ("action" as const),
+      }
+    })
+    // The rarer built-ins ride along as session actions. `stop` only makes
+    // sense while a turn is running, and a local action owns its trigger.
+    const session = SLASH_SESSION.filter(
+      (name) => name !== "stop" && !localTriggers.has(name) && catalog.has(name) && permitted(name),
+    ).map((name) => {
+      const item = catalog.get(name)!
+      return {
+        id: `command.${name}`,
+        trigger: name,
+        title: name,
+        description: item.description,
+        usage: item.usage,
+        source: "builtin" as const,
+        category: (item.category ?? "session") as SlashCommand["category"],
+        type: "action" as const,
+      }
+    })
+    const project = sync.data.command
+      .filter((item) => item.source !== "builtin" && !localTriggers.has(item.name) && permitted(item.name))
+      .map((item) => ({
+        id: `command.${item.name}`,
+        trigger: item.name,
+        title: item.name,
+        description: item.description,
+        usage: item.usage,
+        source: (item.source === "mcp" ? "mcp" : "project") as SlashCommand["source"],
+        category: (item.category ?? "project") as SlashCommand["category"],
+        type: "action" as const,
       }))
 
-    const custom = sync.data.command
-      // `menu` commands are executable action commands (e.g. /compact) that must RUN
-      // on select, not prefill text. They're surfaced by their owning context as a
-      // builtin `command.options` entry (with a matching `slash`) and dropped here so
-      // they don't ALSO appear as a prefill-only custom entry. A menu command is
-      // therefore visible only where that builtin is registered — e.g. /compact only
-      // once a session exists (session.tsx registers it under params.id); it is
-      // intentionally absent in the new-session composer, where there's nothing to
-      // compact and a prefilled "/compact " would not execute anyway.
-      .filter((cmd) => !(cmd as { menu?: boolean }).menu)
-      .map((cmd) => ({
-        id: `custom.${cmd.name}`,
-        trigger: cmd.name,
-        title: cmd.name,
-        description: cmd.description,
-        type: "custom" as const,
-      }))
+    const reserved = new Set<string>([
+      ...builtin.map((item) => item.trigger),
+      ...local.map((item) => item.trigger),
+      ...session.map((item) => item.trigger),
+      ...project.map((item) => item.trigger),
+    ])
 
-    // Surface installed skills as slash entries. Selecting one prefills a
-    // "Use the <name> skill: " prompt that the agent matches against its
-    // built-in skill tool — lazy invocation, no new pipeline.
-    // Hide skills tagged `entry: false` (internal helpers).
-    const skills = (sync.data.skill ?? [])
-      .filter((s) => (s as { entry?: boolean }).entry !== false)
+    // Every permitted, user-facing skill is a slash entry. Selecting one
+    // prefills `/<name> ` and the agent's skill tool takes it from there. A
+    // real command owns its trigger when names collide.
+    const loaded = new Set(skillSnapshot().loadedThisTurn.map((skill) => skill.name))
+    const pinned = new Set(skillSnapshot().pinned.map((skill) => skill.name))
+    const recent = new Set(skillSnapshot().recent.map((skill) => skill.name))
+    // `stop` is also shipped as a skill so the agent can honour it; the menu
+    // only offers it while a turn is running.
+    const skills = skillSnapshot()
+      .allowed.filter((skill) => !reserved.has(skill.name) && (skill.name !== "stop" || working()))
       .map((s) => ({
         id: `skill.${s.name}`,
         trigger: s.name,
         title: s.name,
-        description: s.description?.slice(0, 120) ?? "",
-        type: "skill" as const,
+        description: slashBlurb(s.summary || s.description),
+        usage: `/${s.name} [request]`,
+        searchText: [s.description, ...(s.tags ?? [])].filter(Boolean).join(" "),
+        source: "skill" as const,
+        category: "skill" as const,
+        type: slashActionSkill(s.name) ? ("action" as const) : ("skill" as const),
+        skillCategory: s.category,
+        skillTags: s.tags,
+        skillState: (loaded.has(s.name)
+          ? "loaded"
+          : pinned.has(s.name)
+            ? "pinned"
+            : recent.has(s.name)
+              ? "recent"
+              : s.recommended
+                ? "recommended"
+                : undefined) as SlashCommand["skillState"],
       }))
 
-    return [...custom, ...skills, ...builtin]
+    return [...builtin, ...local, ...session, ...project, ...skills].map((item) => ({
+      ...item,
+      description: slashBlurb(item.description),
+    }))
   })
+
+  const slashItems = (query: string) => {
+    const items = store.slashInline
+      ? slashCommands().filter((item) => item.type === "skill" || item.type === "mode")
+      : slashCommands()
+    return slashMatches(items, query, SLASH_QUERY_LIMIT)
+  }
+
+  // A selected skill or command stays plain text in the prompt but reads as a
+  // token: every known `/trigger` in any composer on the page is painted
+  // through one document-level highlight, recomputed after each prompt change.
+  const SLASH_HIGHLIGHT = "composer-slash"
+  const paintSlashTokens = () => {
+    const triggers = new Set(slashCommands().map((item) => item.trigger))
+    const editors = document.querySelectorAll<HTMLElement>('[data-component="prompt-input"]')
+    const ranges = Array.from(editors).flatMap((editor) => slashTokenRanges(editor, triggers))
+    applyHighlight(SLASH_HIGHLIGHT, ranges)
+  }
+  createEffect(
+    on([() => prompt.current(), slashCommands], () => {
+      requestAnimationFrame(paintSlashTokens)
+    }),
+  )
+  onCleanup(() => clearHighlight(SLASH_HIGHLIGHT))
+
+  const setIntent = (intent: SlashMode | null) => {
+    setStore("intent", intent)
+    setStore("mode", "normal")
+    setStore("popover", null)
+    requestAnimationFrame(() => editorRef.focus({ preventScroll: true }))
+  }
+
+  const enterIntent = (intent: SlashMode) => {
+    editorRef.textContent = ""
+    prompt.set([{ type: "text", content: "", start: 0, end: 0 }], 0)
+    setIntent(intent)
+  }
+
+  const replaceSlash = (value: string, restoreFocus = true) => {
+    const selection = window.getSelection()
+    const cursor = getCursorPosition(editorRef)
+    const text = prompt
+      .current()
+      .map((part) => ("content" in part ? part.content : ""))
+      .join("")
+    const edit = slashEdit(text, cursor, value)
+    if (!selection || selection.rangeCount === 0 || !edit) return false
+
+    const range = selection.getRangeAt(0)
+    setRangeEdge(range, "start", edit.start)
+    setRangeEdge(range, "end", edit.end)
+    range.deleteContents()
+
+    if (edit.value) {
+      const node = document.createTextNode(edit.value)
+      range.insertNode(node)
+      range.setStart(node, edit.value.length)
+    }
+
+    range.collapse(true)
+    selection.removeAllRanges()
+    selection.addRange(range)
+    handleInput()
+    if (restoreFocus) requestAnimationFrame(() => editorRef.focus({ preventScroll: true }))
+    return true
+  }
+
+  const insertEditorText = (cursor: number, value: string) => {
+    editorRef.focus({ preventScroll: true })
+    setCursorPosition(editorRef, cursor)
+    const selection = window.getSelection()
+    if (!selection || selection.rangeCount === 0) return cursor
+
+    const range = selection.getRangeAt(0)
+    const node = document.createTextNode(value)
+    range.deleteContents()
+    range.insertNode(node)
+    range.setStart(node, value.length)
+    range.collapse(true)
+    selection.removeAllRanges()
+    selection.addRange(range)
+    handleInput()
+    return cursor + value.length
+  }
 
   const handleSlashSelect = (cmd: SlashCommand | undefined) => {
     if (!cmd) return
     setStore("popover", null)
 
-    if (cmd.type === "custom" || cmd.type === "skill") {
-      // Both surfaces prefill the literal slash command. The agent reads
-      // `/<name>` as a request to invoke the named skill / command.
-      const text = `/${cmd.trigger} `
-      editorRef.textContent = text
-      prompt.set([{ type: "text", content: text, start: 0, end: text.length }], text.length)
-      requestAnimationFrame(() => {
-        editorRef.focus()
-        const range = document.createRange()
-        const sel = window.getSelection()
-        range.selectNodeContents(editorRef)
-        range.collapse(false)
-        sel?.removeAllRanges()
-        sel?.addRange(range)
-      })
+    if (cmd.source === "skill") recordRecentSkill(cmd.trigger, skillStorage)
+
+    const intent = slashMode(cmd)
+    if (intent) {
+      if (!replaceSlash("")) return
+      setIntent(intent)
+      return
+    }
+
+    if (cmd.type === "skill") {
+      replaceSlash(`/${cmd.trigger} `)
+      return
+    }
+
+    if (cmd.actionID) {
+      if (!replaceSlash("")) return
+      command.trigger(cmd.actionID, "slash")
       return
     }
 
     editorRef.textContent = ""
     prompt.set([{ type: "text", content: "", start: 0, end: 0 }], 0)
-    command.trigger(cmd.id, "slash")
+    void handleSubmit(new Event("submit"), cmd.trigger)
   }
 
   const {
+    grouped: slashGrouped,
     flat: slashFlat,
     active: slashActive,
     setActive: setSlashActive,
@@ -590,18 +1165,59 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onKeyDown: slashOnKeyDown,
     refetch: slashRefetch,
   } = useFilteredList<SlashCommand>({
-    items: slashCommands,
+    items: slashItems,
     key: (x) => x?.id,
-    filterKeys: ["trigger", "title", "description"],
+    filterKeys: ["trigger", "title", "description", "usage", "searchText"],
+    groupBy: slashGroup,
+    sortBy: sortSlash,
+    sortGroupsBy: sortSlashGroups,
     onSelect: handleSlashSelect,
   })
 
-  const createPill = (part: FileAttachmentPart | AgentPart) => {
+  // A bare `/` lists the whole library. Rows mount in slices so opening the
+  // menu stays cheap; the slice grows as the user scrolls or arrows past it.
+  const SLASH_SLICE = 48
+  const [slashRendered, setSlashRendered] = createSignal(SLASH_SLICE)
+  const slashVisible = createMemo(() => {
+    let remaining = slashRendered()
+    const result: Array<{ category: string; items: SlashCommand[] }> = []
+    for (const group of slashGrouped.latest ?? []) {
+      if (remaining <= 0) break
+      const items = group.items.slice(0, remaining)
+      result.push({ category: group.category, items })
+      remaining -= items.length
+    }
+    return result
+  })
+  const revealSlash = () => setSlashRendered((current) => Math.min(slashFlat().length, current + SLASH_SLICE))
+
+  // Keyboard navigation may land on a row that is not mounted yet.
+  createEffect(() => {
+    const activeId = slashActive()
+    if (!activeId) return
+    const index = slashFlat().findIndex((item) => item.id === activeId)
+    if (index >= slashRendered()) setSlashRendered(index + SLASH_SLICE)
+  })
+  createEffect(
+    on(
+      () => slashGrouped.latest,
+      () => setSlashRendered(SLASH_SLICE),
+      { defer: true },
+    ),
+  )
+
+  const createPill = (part: FileAttachmentPart | AgentPart | ConversationAttachmentPart) => {
     const pill = document.createElement("span")
     pill.textContent = part.content
     pill.setAttribute("data-type", part.type)
     if (part.type === "file") pill.setAttribute("data-path", part.path)
     if (part.type === "agent") pill.setAttribute("data-name", part.name)
+    if (part.type === "conversation") {
+      pill.textContent = `#${part.label}`
+      pill.setAttribute("data-session-id", part.sourceSessionID)
+      pill.setAttribute("data-label", part.label)
+      if (part.throughMessageID) pill.setAttribute("data-through-message-id", part.throughMessageID)
+    }
     pill.setAttribute("contenteditable", "false")
     pill.style.userSelect = "text"
     pill.style.cursor = "default"
@@ -627,6 +1243,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const el = node as HTMLElement
       if (el.dataset.type === "file") return true
       if (el.dataset.type === "agent") return true
+      if (el.dataset.type === "conversation") return true
       return el.tagName === "BR"
     })
 
@@ -637,30 +1254,33 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         editorRef.appendChild(createTextFragment(part.content))
         continue
       }
-      if (part.type === "file" || part.type === "agent") {
+      if (part.type === "file" || part.type === "agent" || part.type === "conversation") {
         editorRef.appendChild(createPill(part))
       }
     }
   }
 
   createEffect(
-    on(
-      () => sync.data.command,
-      () => slashRefetch(),
-      { defer: true },
-    ),
+    on([() => sync.data.command, () => sync.data.skill, () => sync.data.config.permission], () => slashRefetch(), {
+      defer: true,
+    }),
   )
 
-  // Auto-scroll active command into view when navigating with keyboard
-  createEffect(() => {
+  const scrollSlashActive = () => {
     const activeId = slashActive()
     if (!activeId || !slashPopoverRef) return
-
-    requestAnimationFrame(() => {
-      const element = slashPopoverRef.querySelector(`[data-slash-id="${activeId}"]`)
-      element?.scrollIntoView({ block: "nearest", behavior: "smooth" })
-    })
-  })
+    const element = slashPopoverRef.querySelector<HTMLElement>(`[data-slash-id="${activeId}"]`)
+    if (!element) return
+    const viewport = slashPopoverRef.getBoundingClientRect()
+    const top = viewport.top + slashPopoverRef.clientTop
+    const bottom = top + slashPopoverRef.clientHeight
+    const row = element.getBoundingClientRect()
+    if (row.top < top) {
+      slashPopoverRef.scrollTop -= top - row.top
+      return
+    }
+    if (row.bottom > bottom) slashPopoverRef.scrollTop += row.bottom - bottom
+  }
 
   const selectPopoverActive = () => {
     if (store.popover === "at") {
@@ -669,6 +1289,15 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const active = atActive()
       const item = items.find((entry) => atKey(entry) === active) ?? items[0]
       handleAtSelect(item)
+      return
+    }
+
+    if (store.popover === "conversation") {
+      const items = conversationFlat()
+      if (items.length === 0) return
+      const active = conversationActive()
+      const item = items.find((entry) => entry.sourceSessionID === active) ?? items[0]
+      handleConversationSelect(item)
       return
     }
 
@@ -760,6 +1389,20 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       position += content.length
     }
 
+    const pushConversation = (conversation: HTMLElement) => {
+      const content = conversation.textContent ?? ""
+      parts.push({
+        type: "conversation",
+        sourceSessionID: conversation.dataset.sessionId!,
+        throughMessageID: conversation.dataset.throughMessageId,
+        label: conversation.dataset.label || content.replace(/^#/, "") || "Conversation",
+        content,
+        start: position,
+        end: position + content.length,
+      })
+      position += content.length
+    }
+
     const visit = (node: Node) => {
       if (node.nodeType === Node.TEXT_NODE) {
         buffer += node.textContent ?? ""
@@ -776,6 +1419,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (el.dataset.type === "agent") {
         flushText()
         pushAgent(el)
+        return
+      }
+      if (el.dataset.type === "conversation") {
+        flushText()
+        pushConversation(el)
         return
       }
       if (el.tagName === "BR") {
@@ -827,19 +1475,28 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
 
     const shellMode = store.mode === "shell"
+    const slashMatch = shellMode ? undefined : slashTokenAt(rawText, cursorPosition)
 
     if (!shellMode) {
       const atMatch = rawText.substring(0, cursorPosition).match(/@(\S*)$/)
-      const slashMatch = rawText.match(/^\/(\S*)$/)
+      const conversationMatch = rawText.substring(0, cursorPosition).match(/#([^\s#]*)$/)
 
       if (atMatch) {
         atOnInput(atMatch[1])
         setStore("popover", "at")
+      } else if (conversationMatch) {
+        conversationOnInput(conversationMatch[1])
+        setStore("popover", "conversation")
       } else if (slashMatch) {
-        slashOnInput(slashMatch[1])
+        setStore("slashInline", slashMatch.inline)
+        slashOnInput(slashMatch.query)
         setStore("popover", "slash")
+        requestAnimationFrame(() => {
+          if (slashPopoverRef) slashPopoverRef.scrollTop = 0
+        })
       } else {
         setStore("popover", null)
+        setStore("slashInline", false)
       }
     } else {
       setStore("popover", null)
@@ -862,9 +1519,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     for (const node of nodes) {
       const length = getNodeLength(node)
       const isText = node.nodeType === Node.TEXT_NODE
-      const isPill =
-        node.nodeType === Node.ELEMENT_NODE &&
-        ((node as HTMLElement).dataset.type === "file" || (node as HTMLElement).dataset.type === "agent")
+      const isPill = isPillNode(node)
       const isBreak = node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "BR"
 
       if (isText && remaining <= length) {
@@ -894,14 +1549,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const rawText = currentPrompt.map((p) => ("content" in p ? p.content : "")).join("")
     const textBeforeCursor = rawText.substring(0, cursorPosition)
     const atMatch = textBeforeCursor.match(/@(\S*)$/)
+    const conversationMatch = textBeforeCursor.match(/#([^\s#]*)$/)
 
-    if (part.type === "file" || part.type === "agent") {
+    if (part.type === "file" || part.type === "agent" || part.type === "conversation") {
       const pill = createPill(part)
       const gap = document.createTextNode(" ")
       const range = selection.getRangeAt(0)
 
-      if (atMatch) {
-        const start = atMatch.index ?? cursorPosition - atMatch[0].length
+      const match = part.type === "conversation" ? conversationMatch : atMatch
+      if (match) {
+        const start = match.index ?? cursorPosition - match[0].length
         setRangeEdge(range, "start", start)
         setRangeEdge(range, "end", cursorPosition)
       }
@@ -964,10 +1621,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       .map((p) => ("content" in p ? p.content : ""))
       .join("")
       .trim()
-    const hasImages = prompt.some((part) => part.type === "image")
-    if (!text && !hasImages) return
+    // Image data is stripped from history, so an image-only submission would
+    // restore as an empty, unsendable entry; only text-bearing prompts are kept.
+    if (!text) return
 
-    const entry = clonePromptParts(prompt)
+    const entry = stripImages(clonePromptParts(prompt))
     const currentHistory = mode === "shell" ? shellHistory : history
     const setCurrentHistory = mode === "shell" ? setShellHistory : setHistory
     const lastEntry = currentHistory.entries[0]
@@ -1041,6 +1699,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const cursorPosition = getCursorPosition(editorRef)
       if (cursorPosition === 0) {
         setStore("mode", "shell")
+        setStore("intent", null)
         setStore("popover", null)
         event.preventDefault()
         return
@@ -1072,6 +1731,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       return
     }
 
+    // Arrow, Tab, and Enter belong to the OS input-method candidate window
+    // while composing. Never let the slash list consume them.
+    if (store.popover && isImeComposing(event)) return
+
     const ctrl = event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey
 
     if (store.popover) {
@@ -1088,8 +1751,14 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           event.preventDefault()
           return
         }
+        if (store.popover === "conversation") {
+          conversationOnKeyDown(event)
+          event.preventDefault()
+          return
+        }
         if (store.popover === "slash") {
           slashOnKeyDown(event)
+          requestAnimationFrame(scrollSlashActive)
         }
         event.preventDefault()
         return
@@ -1156,16 +1825,95 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
   }
 
-  const handleSubmit = async (event: Event) => {
+  const handleSubmit = async (event: Event, action?: string) => {
     event.preventDefault()
 
-    const currentPrompt = prompt.current()
-    const text = currentPrompt.map((part) => ("content" in part ? part.content : "")).join("")
-    const images = imageAttachments().slice()
-    const mode = store.mode
+    // A first prompt may need to create its session (and sometimes a
+    // worktree) before it has a real session ID. Keep that bootstrap single-
+    // flight while the composer is showing its immediate acknowledgement.
+    if (submitting()) return
 
-    if (text.trim().length === 0 && images.length === 0) {
-      if (working()) abort()
+    const currentPrompt = prompt.current()
+    const text = action ? `/${action}` : currentPrompt.map((part) => ("content" in part ? part.content : "")).join("")
+    const images = action ? [] : imageAttachments().slice()
+    const mode = action ? "normal" : store.mode
+    const intent = action ? null : store.intent
+
+    const typedIntent = !intent && images.length === 0 ? text.trim().match(/^\/(plan|goal)$/)?.[1] : undefined
+    if (typedIntent === "plan" || typedIntent === "goal") {
+      enterIntent(typedIntent)
+      return
+    }
+
+    if (text.trim().length === 0 && images.length === 0) return
+
+    const errorMessage = (err: unknown) => requestFailure(err, "Request").description
+
+    const clearInput = () => {
+      prompt.reset()
+      setStore("mode", "normal")
+      setStore("popover", null)
+    }
+
+    const restoreInput = () => {
+      prompt.set(currentPrompt, promptLength(currentPrompt))
+      setStore("mode", mode)
+      setStore("popover", null)
+      requestAnimationFrame(() => {
+        editorRef.focus()
+        setCursorPosition(editorRef, promptLength(currentPrompt))
+        queueScroll()
+      })
+    }
+
+    const restoreInputAfterFailure = () => {
+      if (!canRestoreFailedSubmission(prompt.current(), store.mode)) return false
+      restoreInput()
+      return true
+    }
+
+    // Acknowledge Enter before the first network boundary. Persisting up to
+    // 100 history entries can synchronously serialize several megabytes, so
+    // keep that work off the input event's critical path.
+    const acknowledgeSubmit = () => {
+      setSubmitting(true)
+      clearInput()
+      if (!action) window.setTimeout(() => addToHistory(currentPrompt, mode), 0)
+      setStore("historyIndex", -1)
+      setStore("savedPrompt", null)
+    }
+
+    const researchEffort = "normal" as const
+    const delegationConfig = delegation()
+    const delegationEnabled = delegationConfig.level !== "off"
+    const [head, ...tail] = text.split(" ")
+    const name = text.startsWith("/") ? head.slice(1) : undefined
+    const command = name ? sync.data.command.find((item) => item.name === name) : undefined
+    const native = command?.source === "builtin" && command.menu
+    const active = info()
+    if (native && active && mode === "normal" && images.length === 0) {
+      acknowledgeSubmit()
+      props.onSubmit?.()
+      const request = {
+        sessionID: active.id,
+        command: command.name,
+        arguments: tail.join(" "),
+        effort: researchEffort,
+        delegation: delegationEnabled,
+        delegationSettings: delegationConfig,
+      } satisfies Parameters<typeof sdk.client.session.command>[0] & {
+        effort: "normal"
+        delegation: boolean
+        delegationSettings: DelegationSettings
+      }
+      sdk.client.session.command(request).catch((err) => {
+        showToast({
+          title: language.t("prompt.toast.commandSendFailed.title"),
+          description: errorMessage(err),
+        })
+        restoreInputAfterFailure()
+      })
+      setSubmitting(false)
       return
     }
 
@@ -1179,21 +1927,24 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       return
     }
 
-    const errorMessage = (err: unknown) => {
-      if (err && typeof err === "object" && "data" in err) {
-        const data = (err as { data?: { message?: string } }).data
-        if (data?.message) return data.message
-      }
-      if (err instanceof Error) return err.message
-      return language.t("common.requestFailed")
+    const model = {
+      modelID: currentModel.id,
+      providerID: currentModel.provider.id,
+    }
+    const agent = currentAgent.name
+    const variant = local.model.variant.prompt()
+    const tier = local.model.tier.prompt()
+    const contextLimit = local.model.context.prompt()
+
+    const restoreBootstrap = () => {
+      setSubmitting(false)
+      restoreInput()
     }
 
-    addToHistory(currentPrompt, mode)
-    setStore("historyIndex", -1)
-    setStore("savedPrompt", null)
+    acknowledgeSubmit()
 
     const projectDirectory = sdk.directory
-    const isNewSession = !params.id
+    const isNewSession = !params.id || params.id === "new"
     const worktreeSelection = props.newSessionWorktree ?? "main"
 
     let sessionDirectory = projectDirectory
@@ -1217,6 +1968,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             title: language.t("prompt.toast.worktreeCreateFailed.title"),
             description: language.t("common.requestFailed"),
           })
+          restoreBootstrap()
           return
         }
         WorktreeState.pending(createdWorktree.directory)
@@ -1232,9 +1984,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           baseUrl: sdk.url,
           fetch: platform.fetch,
           directory: sessionDirectory,
+          projectID: sdk.projectID,
           throwOnError: true,
         })
-        globalSync.child(sessionDirectory)
+        globalSync.child(sessionDirectory, { projectID: sdk.projectID })
       }
 
       props.onNewSessionWorktreeReset?.()
@@ -1242,48 +1995,48 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
     let session = info()
     if (!session && isNewSession) {
+      const candidate =
+        store.bootstrapID && store.bootstrapDirectory === sessionDirectory
+          ? store.bootstrapID
+          : Identifier.descending("session")
+      setStore({ bootstrapID: candidate, bootstrapDirectory: sessionDirectory })
+      const workingRoot = pendingWorkingRoot()
       session = await client.session
-        .create()
+        .create({ id: candidate, ...(workingRoot ? { workingRoot } : {}) })
         .then((x) => x.data ?? undefined)
-        .catch((err) => {
+        .catch(async (err) => {
+          const recovery = await client.session
+            .get({ sessionID: candidate })
+            .then((x) => ({ recovered: x.data ?? undefined, error: undefined as unknown }))
+            .catch((error) => ({ recovered: undefined, error }))
+          const recovered = recovery.recovered
+          if (recovered) return recovered
+          const failure = requestFailure(err, "Create session", {
+            ambiguousCreate: !recovery.error || requestStatus(recovery.error) !== 404,
+            candidate,
+          })
           showToast({
-            title: language.t("prompt.toast.sessionCreateFailed.title"),
-            description: errorMessage(err),
+            title: failure.title,
+            description: failure.description,
           })
           return undefined
         })
-      if (session) navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
+      if (session) {
+        setStore({ bootstrapID: undefined, bootstrapDirectory: undefined })
+        const project = sync.project
+        const href = project
+          ? projectHref(project, sessionDirectory, session.id)
+          : projectPathname(sdk.scope, session.id)
+        navigate(href)
+      }
     }
-    if (!session) return
-
+    if (!session) {
+      restoreBootstrap()
+      return
+    }
     props.onSubmit?.()
 
-    const model = {
-      modelID: currentModel.id,
-      providerID: currentModel.provider.id,
-    }
-    const agent = currentAgent.name
-    const variant = local.model.variant.current()
-
-    const clearInput = () => {
-      prompt.reset()
-      setStore("mode", "normal")
-      setStore("popover", null)
-    }
-
-    const restoreInput = () => {
-      prompt.set(currentPrompt, promptLength(currentPrompt))
-      setStore("mode", mode)
-      setStore("popover", null)
-      requestAnimationFrame(() => {
-        editorRef.focus()
-        setCursorPosition(editorRef, promptLength(currentPrompt))
-        queueScroll()
-      })
-    }
-
     if (mode === "shell") {
-      clearInput()
       client.session
         .shell({
           sessionID: session.id,
@@ -1292,44 +2045,110 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           command: text,
         })
         .catch((err) => {
+          const failure = requestFailure(err, "Send shell command")
           showToast({
-            title: language.t("prompt.toast.shellSendFailed.title"),
-            description: errorMessage(err),
+            title: failure.title,
+            description: failure.description,
           })
-          restoreInput()
+          restoreInputAfterFailure()
         })
+      setSubmitting(false)
+      return
+    }
+
+    if (intent) {
+      const request = {
+        sessionID: session.id,
+        command: intent,
+        arguments: text,
+        agent,
+        model: `${model.providerID}/${model.modelID}`,
+        effort: researchEffort,
+        delegation: delegationEnabled,
+        delegationSettings: delegationConfig,
+        variant,
+        tier,
+        context: contextLimit,
+        parts: images.map((attachment) => ({
+          id: Identifier.ascending("part"),
+          type: "file" as const,
+          mime: attachment.mime,
+          url: attachment.dataUrl,
+          filename: attachment.filename,
+        })),
+      } satisfies Parameters<typeof client.session.command>[0] & {
+        effort: "normal"
+        delegation: boolean
+        delegationSettings: DelegationSettings
+      }
+      client.session.command(request).catch((err) => {
+        const failure = requestFailure(err, `Start ${intent} mode`)
+        showToast({
+          title: failure.title,
+          description: failure.description,
+        })
+        restoreInputAfterFailure()
+      })
+      setSubmitting(false)
       return
     }
 
     if (text.startsWith("/")) {
       const [cmdName, ...args] = text.split(" ")
       const commandName = cmdName.slice(1)
-      const customCommand = sync.data.command.find((c) => c.name === commandName)
+      // Catalogs load after first paint; an early slash command must not become
+      // ordinary prompt text just because that background request is pending.
+      const commands =
+        sessionDirectory === projectDirectory && sync.data.command.some((command) => command.name === commandName)
+          ? sync.data.command
+          : await client.command
+              .list()
+              .then((response) => response.data)
+              .catch((error) => {
+                const failure = requestFailure(error, "Load commands")
+                showToast({ title: failure.title, description: failure.description })
+                return undefined
+              })
+      if (!commands) {
+        setSubmitting(false)
+        restoreInputAfterFailure()
+        return
+      }
+      const customCommand = commands.find((command) => command.name === commandName)
       if (customCommand) {
-        clearInput()
-        client.session
-          .command({
-            sessionID: session.id,
-            command: commandName,
-            arguments: args.join(" "),
-            agent,
-            model: `${model.providerID}/${model.modelID}`,
-            variant,
-            parts: images.map((attachment) => ({
-              id: Identifier.ascending("part"),
-              type: "file" as const,
-              mime: attachment.mime,
-              url: attachment.dataUrl,
-              filename: attachment.filename,
-            })),
+        const request = {
+          sessionID: session.id,
+          command: commandName,
+          arguments: args.join(" "),
+          agent,
+          model: `${model.providerID}/${model.modelID}`,
+          effort: researchEffort,
+          delegation: delegationEnabled,
+          delegationSettings: delegationConfig,
+          variant,
+          tier,
+          context: contextLimit,
+          parts: images.map((attachment) => ({
+            id: Identifier.ascending("part"),
+            type: "file" as const,
+            mime: attachment.mime,
+            url: attachment.dataUrl,
+            filename: attachment.filename,
+          })),
+        } satisfies Parameters<typeof client.session.command>[0] & {
+          effort: "normal"
+          delegation: boolean
+          delegationSettings: DelegationSettings
+        }
+        client.session.command(request).catch((err) => {
+          const failure = requestFailure(err, "Send command")
+          showToast({
+            title: failure.title,
+            description: failure.description,
           })
-          .catch((err) => {
-            showToast({
-              title: language.t("prompt.toast.commandSendFailed.title"),
-              description: errorMessage(err),
-            })
-            restoreInput()
-          })
+          restoreInputAfterFailure()
+        })
+        setSubmitting(false)
         return
       }
     }
@@ -1339,6 +2158,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
     const fileAttachments = currentPrompt.filter((part) => part.type === "file") as FileAttachmentPart[]
     const agentAttachments = currentPrompt.filter((part) => part.type === "agent") as AgentPart[]
+    const conversationAttachments = currentPrompt.filter(
+      (part) => part.type === "conversation",
+    ) as ConversationAttachmentPart[]
 
     const fileAttachmentParts = fileAttachments.map((attachment) => {
       const absolute = toAbsolutePath(attachment.path)
@@ -1373,6 +2195,28 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         end: attachment.end,
       },
     }))
+    const conversationAttachmentParts = conversationAttachments.map((attachment) => ({
+      id: Identifier.ascending("part"),
+      type: "conversation" as const,
+      sourceSessionID: attachment.sourceSessionID,
+      throughMessageID: attachment.throughMessageID,
+      label: attachment.label,
+    }))
+    const specialist = delegatedSpecialist(
+      capabilities()?.delegation_enabled ?? true,
+      capabilities()?.delegation_specialist ?? null,
+      agentAttachments.map((attachment) => attachment.name),
+    )
+    const delegationParts = specialist
+      ? [
+          {
+            id: Identifier.ascending("part"),
+            type: "agent" as const,
+            name: specialist,
+            source: { value: `@${specialist}`, start: 0, end: 0 },
+          },
+        ]
+      : []
 
     const usedUrls = new Set(fileAttachmentParts.map((part) => part.url))
 
@@ -1449,7 +2293,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       filename: attachment.filename,
     }))
 
-    const messageID = Identifier.ascending("message")
+    const known = sessionDirectory === projectDirectory ? sync.data : globalSync.child(sessionDirectory)[0]
+    const messageID = Identifier.after("message", known.message[session.id]?.at(-1)?.id)
     const textPart = {
       id: Identifier.ascending("part"),
       type: "text" as const,
@@ -1458,10 +2303,13 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const requestParts = [
       textPart,
       ...fileAttachmentParts,
+      ...conversationAttachmentParts,
       ...contextParts,
+      ...delegationParts,
       ...agentAttachmentParts,
       ...imageAttachmentParts,
     ]
+    const sendParts = requestParts as unknown as ComposerPromptInput["parts"]
 
     const optimisticParts = requestParts.map((part) => ({
       ...part,
@@ -1546,8 +2394,27 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       prompt.context.remove(item.key)
     }
 
-    clearInput()
     addOptimisticMessage()
+    setSubmitting(false)
+
+    const restoreSubmission = () => {
+      if (sessionDirectory === projectDirectory) {
+        sync.set("session_status", session.id, { type: "idle" })
+      }
+      removeOptimisticMessage()
+      for (const item of commentItems) {
+        prompt.context.add({
+          type: "file",
+          path: item.path,
+          selection: item.selection,
+          comment: item.comment,
+          commentID: item.commentID,
+          commentOrigin: item.commentOrigin,
+          preview: item.preview,
+        })
+      }
+      restoreInputAfterFailure()
+    }
 
     const waitForWorktree = async () => {
       const worktree = WorktreeState.get(sessionDirectory)
@@ -1559,26 +2426,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
       const controller = new AbortController()
 
-      const cleanup = () => {
-        if (sessionDirectory === projectDirectory) {
-          sync.set("session_status", session.id, { type: "idle" })
-        }
-        removeOptimisticMessage()
-        for (const item of commentItems) {
-          prompt.context.add({
-            type: "file",
-            path: item.path,
-            selection: item.selection,
-            comment: item.comment,
-            commentID: item.commentID,
-            commentOrigin: item.commentOrigin,
-            preview: item.preview,
-          })
-        }
-        restoreInput()
-      }
-
-      pending.set(session.id, { abort: controller, cleanup })
+      pending.set(session.id, { abort: controller, cleanup: restoreSubmission })
 
       const abort = new Promise<Awaited<ReturnType<typeof WorktreeState.wait>>>((resolve) => {
         if (controller.signal.aborted) {
@@ -1615,40 +2463,58 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const send = async () => {
       const ok = await waitForWorktree()
       if (!ok) return
-      await client.session.prompt({
+      const request: ComposerPromptInput = {
         sessionID: session.id,
         agent,
         model,
         messageID,
-        parts: requestParts,
+        parts: sendParts,
+        effort: researchEffort,
+        delegation: delegationEnabled,
+        delegationSettings: delegationConfig,
         variant,
-      })
+        tier,
+        context: contextLimit,
+      }
+      const controller = new AbortController()
+      pending.set(session.id, { abort: controller, cleanup: restoreSubmission })
+      if (sessionDirectory === projectDirectory) {
+        sync.set("session_status", session.id, { type: "busy" })
+      }
+      const submitted = () => {
+        if (pending.get(session.id)?.abort === controller) pending.delete(session.id)
+      }
+      // Stop owns capability negotiation locally; once submission begins the
+      // session's server cancellation path owns the running request.
+      await submitComposerPrompt(client, request, controller.signal, submitted)
+        .catch((error) => {
+          if (!controller.signal.aborted) throw error
+        })
+        .finally(submitted)
     }
 
     void send().catch((err) => {
       pending.delete(session.id)
-      if (sessionDirectory === projectDirectory) {
-        sync.set("session_status", session.id, { type: "idle" })
-      }
-      showToast({
-        title: language.t("prompt.toast.promptSendFailed.title"),
-        description: errorMessage(err),
-      })
-      removeOptimisticMessage()
-      for (const item of commentItems) {
-        prompt.context.add({
-          type: "file",
-          path: item.path,
-          selection: item.selection,
-          comment: item.comment,
-          commentID: item.commentID,
-          commentOrigin: item.commentOrigin,
-          preview: item.preview,
-        })
-      }
-      restoreInput()
+      const failure = requestFailure(err, "Send prompt")
+      showToast({ title: failure.title, description: failure.description })
+      restoreSubmission()
     })
   }
+
+  createEffect(() => {
+    const text = uiStore.prefill()
+    if (!text || !editorRef) return
+    const send = uiStore.prefillSend()
+    editorRef.textContent = text
+    prompt.set([{ type: "text", content: text, start: 0, end: text.length }], text.length)
+    uiStore.setPrefill(undefined)
+    requestAnimationFrame(() => {
+      editorRef.focus()
+      setCursorPosition(editorRef, text.length)
+      queueScroll()
+      if (send) void handleSubmit(new Event("submit"))
+    })
+  })
 
   return (
     <div class="relative size-full flex flex-col gap-3">
@@ -1657,9 +2523,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           ref={(el) => {
             if (store.popover === "slash") slashPopoverRef = el
           }}
-          class="absolute inset-x-0 -top-3 -translate-y-full origin-bottom-left max-h-80 min-h-10
-                 overflow-auto no-scrollbar flex flex-col p-2 rounded-lg
-                 border border-border-base bg-surface-raised-stronger-non-alpha shadow-md"
+          class="workspace-composer__suggestions absolute inset-x-0 -top-3 -translate-y-full origin-bottom-left
+                 min-h-10 overflow-auto no-scrollbar flex flex-col"
+          id={store.popover === "slash" ? "composer-slash-listbox" : undefined}
+          role={store.popover === "slash" ? "listbox" : undefined}
+          aria-label={store.popover === "slash" ? "Commands and skills" : undefined}
           onMouseDown={(e) => e.preventDefault()}
         >
           <Switch>
@@ -1672,7 +2540,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                   {(item) => (
                     <button
                       classList={{
-                        "w-full flex items-center gap-x-2 rounded-md px-2 py-0.5": true,
+                        "workspace-composer__suggestion w-full flex items-center gap-x-2": true,
                         "bg-surface-raised-base-hover": atActive() === atKey(item),
                       }}
                       onClick={() => handleAtSelect(item)}
@@ -1712,66 +2580,131 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                 </For>
               </Show>
             </Match>
-            <Match when={store.popover === "slash"}>
+            <Match when={store.popover === "conversation"}>
               <Show
-                when={slashFlat().length > 0}
-                fallback={<div class="text-text-weak px-2 py-1">{language.t("prompt.popover.emptyCommands")}</div>}
+                when={conversationFlat().length > 0}
+                fallback={
+                  <div class="workspace-composer__suggestion-empty">No other conversations in this project</div>
+                }
               >
-                <For each={slashFlat()}>
-                  {(cmd) => (
+                <div class="workspace-composer__suggestion-heading">Conversations</div>
+                <For each={conversationFlat().slice(0, 12)}>
+                  {(item) => (
                     <button
-                      data-slash-id={cmd.id}
+                      type="button"
                       classList={{
-                        "w-full flex items-center justify-between gap-4 rounded-md px-2 py-1": true,
-                        "bg-surface-raised-base-hover": slashActive() === cmd.id,
+                        "workspace-composer__suggestion workspace-composer__conversation-row": true,
+                        "bg-surface-raised-base-hover": conversationActive() === item.sourceSessionID,
                       }}
-                      onClick={() => handleSlashSelect(cmd)}
-                      onMouseEnter={() => setSlashActive(cmd.id)}
+                      onClick={() => handleConversationSelect(item)}
+                      onMouseEnter={() => setConversationActive(item.sourceSessionID)}
                     >
-                      <div class="flex items-center gap-2 min-w-0">
-                        <span class="text-14-regular text-text-strong whitespace-nowrap">/{cmd.trigger}</span>
-                        <Show when={cmd.description}>
-                          <span class="text-14-regular text-text-weak truncate">{cmd.description}</span>
-                        </Show>
-                      </div>
-                      <div class="flex items-center gap-2 shrink-0">
-                        <Show when={cmd.type === "custom"}>
-                          <span class="text-11-regular text-text-weaker px-1.5 py-0.5 bg-surface-base rounded">
-                            {language.t("prompt.slash.badge.custom")}
-                          </span>
-                        </Show>
-                        <Show when={command.keybind(cmd.id)}>
-                          <span class="text-12-regular text-text-weaker">{command.keybind(cmd.id)}</span>
-                        </Show>
-                      </div>
+                      <span class="workspace-composer__conversation-mark" aria-hidden="true">
+                        #
+                      </span>
+                      <span>
+                        <strong>{item.label}</strong>
+                        <small>Reference a snapshot of this conversation</small>
+                      </span>
                     </button>
                   )}
                 </For>
               </Show>
             </Match>
+            <Match when={store.popover === "slash"}>
+              <Show
+                when={slashFlat().length > 0}
+                fallback={
+                  <div class="workspace-composer__suggestion-empty">{language.t("prompt.popover.emptyCommands")}</div>
+                }
+              >
+                {/* A suggestion refresh must not suspend the session and detach the focused editor. */}
+                <For each={slashVisible()}>
+                  {(group) => (
+                    <section class="workspace-composer__slash-group" aria-label={group.category || "Results"}>
+                      <Show when={group.category}>
+                        <header class="workspace-composer__slash-heading" aria-hidden="true">
+                          {group.category}
+                        </header>
+                      </Show>
+                      <For each={group.items}>
+                        {(cmd) => (
+                          <button
+                            type="button"
+                            id={slashOptionId(cmd)}
+                            role="option"
+                            aria-selected={slashActive() === cmd.id}
+                            data-slash-id={cmd.id}
+                            classList={{
+                              "workspace-composer__slash-row": true,
+                              "is-active": slashActive() === cmd.id,
+                            }}
+                            onClick={() => handleSlashSelect(cmd)}
+                            onMouseEnter={() => setSlashActive(cmd.id)}
+                          >
+                            <span class="workspace-composer__slash-icon" aria-hidden="true">
+                              <Icon name={slashIcon(cmd)} size="small" />
+                            </span>
+                            <span class="workspace-composer__slash-name">/{cmd.trigger}</span>
+                            <span class="workspace-composer__slash-detail">{cmd.description || cmd.title}</span>
+                            <Show when={command.keybind(cmd.id) || cmd.meta}>
+                              <span class="workspace-composer__slash-meta">{command.keybind(cmd.id) || cmd.meta}</span>
+                            </Show>
+                          </button>
+                        )}
+                      </For>
+                    </section>
+                  )}
+                </For>
+                <Show when={slashRendered() < slashFlat().length}>
+                  <div
+                    class="workspace-composer__slash-sentinel"
+                    ref={(el) => {
+                      const observer = new IntersectionObserver((entries) => {
+                        if (entries.some((entry) => entry.isIntersecting)) revealSlash()
+                      })
+                      observer.observe(el)
+                      onCleanup(() => observer.disconnect())
+                    }}
+                  />
+                </Show>
+              </Show>
+            </Match>
           </Switch>
+        </div>
+      </Show>
+      <Show when={store.mode === "normal" && !local.model.current()}>
+        <div class="workspace-composer__setup" role="status">
+          <span>
+            <strong>Choose a model to start</strong>
+            <small>Connect a provider in Settings to choose a model.</small>
+          </span>
+          <button type="button" onClick={() => dialog.show(() => <DialogSettings />)}>
+            Set up model
+          </button>
         </div>
       </Show>
       <form
         onSubmit={handleSubmit}
         classList={{
           "group/prompt-input": true,
-          "bg-surface-raised-stronger-non-alpha shadow-xs-border relative": true,
-          "rounded-[14px] overflow-clip focus-within:shadow-xs-border": true,
+          "workspace-composer": true,
+          "relative overflow-visible": true,
           "border-icon-info-active border-dashed": store.dragging,
           [props.class ?? ""]: !!props.class,
         }}
       >
         <Show when={store.dragging}>
-          <div class="absolute inset-0 z-10 flex items-center justify-center bg-surface-raised-stronger-non-alpha/90 pointer-events-none">
-            <div class="flex flex-col items-center gap-2 text-text-weak">
-              <Icon name="photo" class="size-8" />
-              <span class="text-14-regular">{language.t("prompt.dropzone.label")}</span>
+          <div class="workspace-composer__dropzone absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+            <div class="workspace-composer__dropzone-copy">
+              <Icon name="paperclip" class="size-6" />
+              <strong>{language.t("prompt.dropzone.label")}</strong>
+              <span>{language.t("prompt.dropzone.hint")}</span>
             </div>
           </div>
         </Show>
         <Show when={prompt.context.items().length > 0}>
-          <div class="flex flex-nowrap items-start gap-2 p-2 overflow-x-auto no-scrollbar">
+          <div class="workspace-composer__context flex flex-nowrap items-start gap-2 overflow-x-auto no-scrollbar">
             <For each={prompt.context.items()}>
               {(item) => {
                 const active = () => {
@@ -1793,19 +2726,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                   >
                     <div
                       classList={{
-                        "group shrink-0 flex flex-col rounded-[6px] pl-2 pr-1 py-1 max-w-[200px] h-12 transition-all transition-transform shadow-xs-border hover:shadow-xs-border-hover": true,
+                        "workspace-composer__context-item group shrink-0 flex flex-col max-w-[220px]": true,
                         "cursor-pointer hover:bg-surface-interactive-weak": !!item.commentID && !active(),
-                        "cursor-pointer bg-surface-interactive-hover hover:bg-surface-interactive-hover shadow-xs-border-hover":
-                          active(),
-                        "bg-background-stronger": !active(),
+                        "cursor-pointer bg-surface-interactive-hover hover:bg-surface-interactive-hover": active(),
                       }}
                       onClick={() => {
                         openComment(item)
                       }}
                     >
-                      <div class="flex items-center gap-1.5">
+                      <div class="workspace-composer__context-heading flex items-center gap-1.5">
                         <FileIcon node={{ path: item.path, type: "file" }} class="shrink-0 size-3.5" />
-                        <div class="flex items-center text-11-regular min-w-0">
+                        <div class="flex items-center min-w-0">
                           <span class="text-text-strong whitespace-nowrap">{getFilenameTruncated(item.path, 14)}</span>
                           <Show when={item.selection}>
                             {(sel) => (
@@ -1821,7 +2752,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                           type="button"
                           icon="close-small"
                           variant="ghost"
-                          class="ml-auto h-5 w-5 opacity-0 group-hover:opacity-100 transition-all"
+                          class="workspace-composer__context-remove ml-auto"
                           onClick={(e) => {
                             e.stopPropagation()
                             if (item.commentID) comments.remove(item.path, item.commentID)
@@ -1831,9 +2762,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                         />
                       </div>
                       <Show when={item.comment}>
-                        {(comment) => (
-                          <div class="text-12-regular text-text-strong ml-5 pr-1 truncate">{comment()}</div>
-                        )}
+                        {(comment) => <div class="workspace-composer__context-comment truncate">{comment()}</div>}
                       </Show>
                     </div>
                   </Tooltip>
@@ -1843,62 +2772,77 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           </div>
         </Show>
         <Show when={imageAttachments().length > 0}>
-          <div class="flex flex-wrap gap-2 px-3 pt-3">
+          <div class="workspace-composer__attachments" aria-label="Attached files">
             <For each={imageAttachments()}>
               {(attachment) => (
-                <div class="relative group">
-                  <Show
-                    when={attachment.mime.startsWith("image/")}
-                    fallback={
-                      <div class="size-16 rounded-md bg-surface-base flex items-center justify-center border border-border-base">
-                        <Icon name="folder" class="size-6 text-text-weak" />
-                      </div>
-                    }
+                <div
+                  class="workspace-composer__attachment"
+                  data-image={attachment.mime.startsWith("image/")}
+                  data-attachment-status="attached"
+                >
+                  <a
+                    href={attachment.dataUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    class="workspace-composer__attachment-open"
+                    aria-label={`${attachment.mime.startsWith("image/") ? "Preview" : "Open"} ${attachment.filename}`}
+                    onClick={(event) => {
+                      if (!attachment.mime.startsWith("image/")) return
+                      event.preventDefault()
+                      dialog.show(() => <ImagePreview src={attachment.dataUrl} alt={attachment.filename} />)
+                    }}
                   >
-                    <img
-                      src={attachment.dataUrl}
-                      alt={attachment.filename}
-                      class="size-16 rounded-md object-cover border border-border-base hover:border-border-strong-base transition-colors"
-                      onClick={() =>
-                        dialog.show(() => <ImagePreview src={attachment.dataUrl} alt={attachment.filename} />)
+                    <Show
+                      when={attachment.mime.startsWith("image/")}
+                      fallback={
+                        <div class="workspace-composer__attachment-icon" aria-hidden="true">
+                          <FileIcon node={{ path: attachment.filename, type: "file" }} class="size-4" />
+                        </div>
                       }
-                    />
-                  </Show>
+                    >
+                      <img src={attachment.dataUrl} alt="" class="workspace-composer__attachment-preview" />
+                    </Show>
+                    <span class="workspace-composer__attachment-copy">
+                      <strong title={attachment.filename}>{attachment.filename}</strong>
+                      <span>
+                        Attached · {attachmentFormat({ name: attachment.filename, type: attachment.mime })}
+                        <Show when={attachment.size !== undefined}> · {attachmentSize(attachment.size!)}</Show>
+                      </span>
+                    </span>
+                  </a>
                   <button
                     type="button"
                     onClick={() => removeImageAttachment(attachment.id)}
-                    class="absolute -top-1.5 -right-1.5 size-5 rounded-full bg-surface-raised-stronger-non-alpha border border-border-base flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-surface-raised-base-hover"
+                    class="workspace-composer__attachment-remove"
                     aria-label={language.t("prompt.attachment.remove")}
                   >
                     <Icon name="close" class="size-3 text-text-weak" />
                   </button>
-                  <div class="absolute bottom-0 left-0 right-0 px-1 py-0.5 bg-black/50 rounded-b-md">
-                    <span class="text-10-regular text-white truncate block">{attachment.filename}</span>
-                  </div>
                 </div>
               )}
             </For>
           </div>
         </Show>
-        <div class="relative max-h-[240px] overflow-y-auto" ref={(el) => (scrollRef = el)}>
+        <div class="workspace-composer__editor" data-composer-mode={store.mode} ref={(el) => (scrollRef = el)}>
           <div
             data-component="prompt-input"
             ref={(el) => {
               editorRef = el
               props.ref?.(el)
             }}
-            role="textbox"
+            role="combobox"
             aria-multiline="true"
-            aria-label={
-              store.mode === "shell"
-                ? language.t("prompt.placeholder.shell")
-                : commentCount() > 1
-                  ? language.t("prompt.placeholder.summarizeComments")
-                  : commentCount() === 1
-                    ? language.t("prompt.placeholder.summarizeComment")
-                    : language.t("prompt.placeholder.normal", { example: language.t(EXAMPLES[store.placeholder]) })
+            aria-label={placeholder()}
+            aria-busy={submitting()}
+            aria-autocomplete="list"
+            aria-haspopup="listbox"
+            aria-expanded={store.popover === "slash"}
+            aria-controls={store.popover === "slash" ? "composer-slash-listbox" : undefined}
+            aria-activedescendant={
+              store.popover === "slash" && slashActive() ? slashOptionId({ id: slashActive()! }) : undefined
             }
-            contenteditable="true"
+            dir="auto"
+            contenteditable={submitting() ? "false" : "true"}
             onInput={handleInput}
             onPaste={handlePaste}
             onCompositionStart={() => setComposing(true)}
@@ -1906,26 +2850,37 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             onKeyDown={handleKeyDown}
             classList={{
               "select-text": true,
-              "w-full p-3 pr-12 text-[15px] leading-relaxed text-text-strong focus:outline-none whitespace-pre-wrap": true,
+              "focus:outline-none focus-visible:outline focus-visible:outline-1 focus-visible:outline-border-strong focus-visible:outline-offset-2 whitespace-pre-wrap": true,
               "[&_[data-type=file]]:text-syntax-property": true,
               "[&_[data-type=agent]]:text-syntax-type": true,
-              "font-mono!": store.mode === "shell",
+              "[&_[data-type=conversation]]:text-syntax-keyword": true,
             }}
           />
           <Show when={!prompt.dirty()}>
-            <div class="absolute top-0 inset-x-0 p-3 pr-12 text-14-regular text-text-weak pointer-events-none whitespace-nowrap truncate">
-              {store.mode === "shell"
-                ? language.t("prompt.placeholder.shell")
-                : commentCount() > 1
-                  ? language.t("prompt.placeholder.summarizeComments")
-                  : commentCount() === 1
-                    ? language.t("prompt.placeholder.summarizeComment")
-                    : language.t("prompt.placeholder.normal", { example: language.t(EXAMPLES[store.placeholder]) })}
+            <div class="workspace-composer__placeholder" aria-hidden="true" dir="auto">
+              {placeholder()}
             </div>
           </Show>
         </div>
-        <div class="relative p-3 flex items-center justify-between">
-          <div data-slot="prompt-controls" class="flex items-center justify-start gap-2">
+        <div class="workspace-composer__footer">
+          <div
+            data-slot="prompt-controls"
+            class="workspace-composer__controls flex items-center justify-start gap-2"
+            role="group"
+            aria-label="Composer tools"
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={ATTACHMENT_ACCEPT}
+              multiple
+              class="hidden"
+              onChange={(e) => {
+                const selected = Array.from(e.currentTarget.files ?? [])
+                for (const file of selected) void addAttachment(file)
+                e.currentTarget.value = ""
+              }}
+            />
             <Switch>
               <Match when={store.mode === "shell"}>
                 <div class="flex items-center gap-2 px-2 h-6">
@@ -1935,158 +2890,169 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                 </div>
               </Match>
               <Match when={store.mode === "normal"}>
-                <TooltipKeybind
-                  placement="top"
-                  title={language.t("command.agent.cycle")}
-                  keybind={command.keybind("agent.cycle")}
-                >
-                  <Select
-                    options={(() => {
-                      const visible = local.agent.list().map((a) => a.name)
-                      const current = local.agent.current()?.name
-                      if (current && !visible.includes(current)) return [current, ...visible]
-                      return visible
-                    })()}
-                    current={local.agent.current()?.name ?? ""}
-                    onSelect={local.agent.set}
-                    label={(name) => (name === "ml" ? "ML" : name)}
-                    class="capitalize"
-                    variant="ghost"
-                  />
-                </TooltipKeybind>
-                {/* Research mode selector */}
-                <Show when={local.research.current() && local.research.list().length > 1}>
-                  <TooltipKeybind placement="top" title="Research Mode" keybind={command.keybind("research.cycle")}>
-                    <Select
-                      options={local.research.list()}
-                      current={local.research.current()}
-                      placeholder="mode"
-                      onSelect={(name) => {
-                        if (name) local.agent.set(name)
-                      }}
-                      label={(name) => {
-                        if (!name) return "mode"
-                        if (name === "research") return "default"
-                        if (name === "ml") return "ML"
-                        return name
-                      }}
-                      class="capitalize"
-                      variant="ghost"
-                    />
-                  </TooltipKeybind>
-                </Show>
-                {/* Model selector */}
-                <>
-                  <Show
-                    when={providers.paid().length > 0}
-                    fallback={
-                      <TooltipKeybind
-                        placement="top"
-                        title={language.t("command.model.choose")}
-                        keybind={command.keybind("model.choose")}
-                      >
-                        <Button as="div" variant="ghost" onClick={() => dialog.show(() => <DialogSelectModelUnpaid />)}>
-                          <Show when={local.model.current()?.provider?.id}>
-                            <ProviderIcon id={local.model.current()!.provider.id as IconName} class="size-4 shrink-0" />
-                          </Show>
-                          {local.model.current()?.name ?? language.t("dialog.model.select.title")}
-                          <Icon name="chevron-down" size="small" />
-                        </Button>
-                      </TooltipKeybind>
-                    }
-                  >
-                    <TooltipKeybind
-                      placement="top"
-                      title={language.t("command.model.choose")}
-                      keybind={command.keybind("model.choose")}
-                    >
-                      <ModelSelectorPopover triggerAs={Button} triggerProps={{ variant: "ghost" }}>
-                        <Show when={local.model.current()?.provider?.id}>
-                          <ProviderIcon id={local.model.current()!.provider.id as IconName} class="size-4 shrink-0" />
-                        </Show>
-                        {local.model.current()?.name ?? language.t("dialog.model.select.title")}
-                        <Icon name="chevron-down" size="small" />
-                      </ModelSelectorPopover>
-                    </TooltipKeybind>
-                  </Show>
-                </>
-                {/* Variant selector */}
-                <Show when={local.model.variant.list().length > 0}>
-                  <TooltipKeybind
-                    placement="top"
-                    title={language.t("command.model.variant.cycle")}
-                    keybind={command.keybind("model.variant.cycle")}
-                  >
-                    <Button
-                      data-action="model-variant-cycle"
-                      variant="ghost"
-                      class="text-text-base group-hover/prompt-input:inline-block capitalize"
-                      onClick={() => local.model.variant.cycle()}
-                    >
-                      {local.model.variant.current() ?? language.t("common.default")}
-                    </Button>
-                  </TooltipKeybind>
-                </Show>
-                <Show when={permission.permissionsEnabled() && params.id}>
-                  <TooltipKeybind
-                    placement="top"
-                    title={language.t("command.permissions.autoaccept.enable")}
-                    keybind={command.keybind("permissions.autoaccept")}
-                  >
-                    <Button
-                      variant="ghost"
-                      onClick={() => permission.toggleAutoAccept(params.id!, sdk.directory)}
-                      classList={{
-                        "group-hover/prompt-input:flex size-6 items-center justify-center": true,
-                        "text-text-base": !permission.isAutoAccepting(params.id!, sdk.directory),
-                        "hover:bg-surface-success-base": permission.isAutoAccepting(params.id!, sdk.directory),
-                      }}
-                      aria-label={
-                        permission.isAutoAccepting(params.id!, sdk.directory)
-                          ? language.t("command.permissions.autoaccept.disable")
-                          : language.t("command.permissions.autoaccept.enable")
-                      }
-                      aria-pressed={permission.isAutoAccepting(params.id!, sdk.directory)}
-                    >
-                      <Icon
-                        name="chevron-double-right"
-                        size="small"
-                        classList={{ "text-icon-success-base": permission.isAutoAccepting(params.id!, sdk.directory) }}
-                      />
-                    </Button>
-                  </TooltipKeybind>
-                </Show>
-              </Match>
-            </Switch>
-          </div>
-          <div class="flex items-center gap-3 absolute right-3 bottom-3">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept={[...ACCEPTED_FILE_TYPES, ".md", ".markdown", ".txt"].join(",")}
-              class="hidden"
-              onChange={(e) => {
-                const file = e.currentTarget.files?.[0]
-                if (file) addImageAttachment(file)
-                e.currentTarget.value = ""
-              }}
-            />
-            <div class="flex items-center gap-2">
-              <SessionContextUsage />
-              <Show when={store.mode === "normal"}>
                 <Tooltip placement="top" value={language.t("prompt.action.attachFile")}>
                   <Button
                     type="button"
                     variant="ghost"
-                    class="size-6"
-                    onClick={() => fileInputRef.click()}
+                    class="workspace-composer__attach shrink-0"
+                    onClick={attach}
                     aria-label={language.t("prompt.action.attachFile")}
                   >
-                    <Icon name="photo" class="size-4.5" />
+                    <Icon name="paperclip" class="size-4" />
                   </Button>
                 </Tooltip>
-              </Show>
-            </div>
+                <details
+                  ref={(element) => (researchToolsRef = element)}
+                  class="workspace-composer__research-tools"
+                  onToggle={(event) => {
+                    if (event.currentTarget.open) return
+                    resetResearchTools()
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Escape") return
+                    event.preventDefault()
+                    closeResearchTools()
+                    researchToolsRef?.querySelector("summary")?.focus()
+                  }}
+                >
+                  <summary aria-label="Tools">
+                    <span class="workspace-composer__research-tools-label">Tools</span>
+                    <Icon name="chevron-down" size="small" />
+                  </summary>
+                  <div class="workspace-composer__research-tools-menu" role="group" aria-label="Tools">
+                    <section class="workspace-composer__research-controls" aria-label="Research roles">
+                      <ResearchSlider
+                        label="Delegation"
+                        value={delegation().level}
+                        options={DELEGATION_LEVELS}
+                        disabled={!capabilities()}
+                        onSelect={(value) => saveDelegation({ level: value as DelegationLevel })}
+                      />
+                      {/* Independence governs the lead's own questions, not only
+                          delegated work, so it stays visible with delegation off. */}
+                      <ResearchSlider
+                        label="Independence"
+                        value={delegation().autonomy}
+                        options={DELEGATION_AUTONOMY}
+                        onSelect={(value) => saveDelegation({ autonomy: value as DelegationAutonomy })}
+                      />
+                      <div class="workspace-composer__research-access">
+                        <Show
+                          when={!researchAccess.error}
+                          fallback={
+                            <button
+                              type="button"
+                              class="workspace-composer__research-access-retry"
+                              onClick={() => void researchAccessControls.refetch()}
+                            >
+                              Access settings unavailable · Retry
+                            </button>
+                          }
+                        >
+                          <details
+                            class="workspace-composer__research-setting workspace-composer__research-choice"
+                            onToggle={toggleResearchChoice}
+                          >
+                            <summary aria-label={`Action approval, ${researchAccessLabel()}`}>
+                              <span class="workspace-composer__research-setting-label">Action approval</span>
+                              <strong class="workspace-composer__research-setting-value" aria-live="polite">
+                                {researchAccessSaving() ? "Saving…" : researchAccessLabel()}
+                              </strong>
+                              <Icon name="chevron-right" size="small" />
+                            </summary>
+                            <div
+                              class="workspace-composer__research-choice-menu"
+                              role="radiogroup"
+                              aria-label="How should OpenScience actions be approved?"
+                              aria-busy={researchAccessSaving() ? "true" : undefined}
+                              onKeyDown={navigateResearchChoices}
+                            >
+                              <For each={RESEARCH_ACCESS_OPTIONS}>
+                                {(option) => (
+                                  <button
+                                    type="button"
+                                    role="radio"
+                                    data-research-access={option.value}
+                                    data-tone={option.value === "full" ? "warning" : undefined}
+                                    aria-checked={selectedResearchAccess() === option.value}
+                                    tabindex={selectedResearchAccess() === option.value ? 0 : -1}
+                                    disabled={researchAccess.loading || researchAccessSaving()}
+                                    onClick={(event) => {
+                                      void applyResearchAccess(option.value, event.currentTarget)
+                                      event.currentTarget.closest("details")?.removeAttribute("open")
+                                    }}
+                                  >
+                                    <span>
+                                      <strong>{option.label}</strong>
+                                      <small>
+                                        {option.value !== "full" &&
+                                        currentResearchAccess()?.sandboxStatus.available === false
+                                          ? `Fail-closed until setup: ${currentResearchAccess()?.sandboxStatus.reason ?? "sandbox backend not installed"}`
+                                          : option.description}
+                                      </small>
+                                    </span>
+                                    <Show when={selectedResearchAccess() === option.value}>
+                                      <Icon name="check" size="small" />
+                                    </Show>
+                                  </button>
+                                )}
+                              </For>
+                            </div>
+                          </details>
+                        </Show>
+                        <button
+                          type="button"
+                          class="workspace-composer__research-setting workspace-composer__research-control workspace-composer__research-connectors"
+                          onClick={() => {
+                            closeResearchTools()
+                            dialog.show(() => <DialogSettings initial="connectors" />)
+                          }}
+                        >
+                          <span class="workspace-composer__research-setting-label">MCP servers</span>
+                          <strong class="workspace-composer__research-setting-value">
+                            {configuredConnectorCount() === 0
+                              ? "None configured"
+                              : `${configuredConnectorCount()} configured`}
+                          </strong>
+                          <Icon name="chevron-right" size="small" />
+                        </button>
+                      </div>
+                    </section>
+                  </div>
+                </details>
+                <WorkingFolderChip
+                  client={sdk.client}
+                  sessionID={params.id && params.id !== "new" ? params.id : undefined}
+                  pending={pendingWorkingRoot()}
+                  onPending={setPendingWorkingRoot}
+                />
+                <Show when={store.intent}>
+                  {(intent) => (
+                    <Tooltip placement="top" value={`Exit ${intent()} mode`}>
+                      <button
+                        type="button"
+                        class="workspace-composer__intent"
+                        data-composer-intent={intent()}
+                        aria-label={`Exit ${intent()} mode`}
+                        onClick={() => setIntent(null)}
+                      >
+                        <span class="workspace-composer__intent-close" aria-hidden="true">
+                          <Icon name="close" size="small" />
+                        </span>
+                        <span>{intent() === "plan" ? "Plan" : "Goal"}</span>
+                      </button>
+                    </Tooltip>
+                  )}
+                </Show>
+              </Match>
+            </Switch>
+          </div>
+          <div
+            class="workspace-composer__actions flex items-center gap-3"
+            role="group"
+            aria-label="Model, effort, and send"
+          >
+            <ModelSettingsPopover />
             <Tooltip
               placement="top"
               inactive={!prompt.dirty() && !working()}
@@ -2112,8 +3078,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                 disabled={!prompt.dirty() && !working()}
                 icon={working() ? "stop" : "arrow-up"}
                 variant="primary"
-                class="size-6"
+                class="workspace-composer__send rounded-full"
+                data-composer-action={working() ? "stop" : prompt.dirty() ? "send" : "idle"}
                 aria-label={working() ? language.t("prompt.action.stop") : language.t("prompt.action.send")}
+                onClick={(event: MouseEvent) => {
+                  // The button is Stop while a response runs; Enter in the
+                  // editor still submits, so the draft joins the turn instead.
+                  if (!working()) return
+                  event.preventDefault()
+                  void abort()
+                }}
               />
             </Tooltip>
           </div>
@@ -2139,11 +3113,6 @@ function createTextFragment(content: string): DocumentFragment {
   return fragment
 }
 
-function getNodeLength(node: Node): number {
-  if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "BR") return 1
-  return (node.textContent ?? "").replace(/\u200B/g, "").length
-}
-
 function getTextLength(node: Node): number {
   if (node.nodeType === Node.TEXT_NODE) return (node.textContent ?? "").replace(/\u200B/g, "").length
   if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "BR") return 1
@@ -2163,68 +3132,4 @@ function getCursorPosition(parent: HTMLElement): number {
   preCaretRange.selectNodeContents(parent)
   preCaretRange.setEnd(range.startContainer, range.startOffset)
   return getTextLength(preCaretRange.cloneContents())
-}
-
-function setCursorPosition(parent: HTMLElement, position: number) {
-  let remaining = position
-  let node = parent.firstChild
-  while (node) {
-    const length = getNodeLength(node)
-    const isText = node.nodeType === Node.TEXT_NODE
-    const isPill =
-      node.nodeType === Node.ELEMENT_NODE &&
-      ((node as HTMLElement).dataset.type === "file" || (node as HTMLElement).dataset.type === "agent")
-    const isBreak = node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === "BR"
-
-    if (isText && remaining <= length) {
-      const range = document.createRange()
-      const selection = window.getSelection()
-      range.setStart(node, remaining)
-      range.collapse(true)
-      selection?.removeAllRanges()
-      selection?.addRange(range)
-      return
-    }
-
-    if ((isPill || isBreak) && remaining <= length) {
-      const range = document.createRange()
-      const selection = window.getSelection()
-      if (remaining === 0) {
-        range.setStartBefore(node)
-      }
-      if (remaining > 0 && isPill) {
-        range.setStartAfter(node)
-      }
-      if (remaining > 0 && isBreak) {
-        const next = node.nextSibling
-        if (next && next.nodeType === Node.TEXT_NODE) {
-          range.setStart(next, 0)
-        }
-        if (!next || next.nodeType !== Node.TEXT_NODE) {
-          range.setStartAfter(node)
-        }
-      }
-      range.collapse(true)
-      selection?.removeAllRanges()
-      selection?.addRange(range)
-      return
-    }
-
-    remaining -= length
-    node = node.nextSibling
-  }
-
-  const fallbackRange = document.createRange()
-  const fallbackSelection = window.getSelection()
-  const last = parent.lastChild
-  if (last && last.nodeType === Node.TEXT_NODE) {
-    const len = last.textContent ? last.textContent.length : 0
-    fallbackRange.setStart(last, len)
-  }
-  if (!last || last.nodeType !== Node.TEXT_NODE) {
-    fallbackRange.selectNodeContents(parent)
-  }
-  fallbackRange.collapse(false)
-  fallbackSelection?.removeAllRanges()
-  fallbackSelection?.addRange(fallbackRange)
 }

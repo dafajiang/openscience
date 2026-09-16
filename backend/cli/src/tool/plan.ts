@@ -17,32 +17,43 @@ async function getLastModel(sessionID: string) {
   return Provider.defaultModel()
 }
 
+async function getLastEffort(sessionID: string) {
+  for await (const item of MessageV2.stream(sessionID)) {
+    if (item.info.role === "user") return MessageV2.resolveResearchEffort(item.info.effort)
+  }
+  return "normal" as const
+}
+
 export const PlanExitTool = Tool.define("plan_exit", {
   description: EXIT_DESCRIPTION,
   parameters: z.object({}),
   async execute(_params, ctx) {
     const session = await Session.get(ctx.sessionID)
     const plan = path.relative(Instance.worktree, Session.plan(session))
-    const answers = await Question.ask({
-      sessionID: ctx.sessionID,
-      questions: [
-        {
-          question: `Plan at ${plan} is complete. Would you like to switch to the build agent and start implementing?`,
-          header: "Build Agent",
-          custom: false,
-          options: [
-            { label: "Yes", description: "Switch to build agent and start implementing the plan" },
-            { label: "No", description: "Stay with plan agent to continue refining the plan" },
-          ],
-        },
-      ],
-      tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
-    })
+    const answers = await Question.ask(
+      {
+        sessionID: ctx.sessionID,
+        questions: [
+          {
+            question: `Plan at ${plan} is complete. Would you like to switch to the build agent and start implementing?`,
+            header: "Build Agent",
+            custom: false,
+            options: [
+              { label: "Yes", description: "Switch to build agent and start implementing the plan" },
+              { label: "No", description: "Stay with plan agent to continue refining the plan" },
+            ],
+          },
+        ],
+        tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+      },
+      ctx.abort,
+    )
 
     const answer = answers[0]?.[0]
     if (answer === "No") throw new Question.RejectedError()
 
     const model = await getLastModel(ctx.sessionID)
+    const effort = await getLastEffort(ctx.sessionID)
 
     const userMsg: MessageV2.User = {
       id: Identifier.ascending("message"),
@@ -53,6 +64,7 @@ export const PlanExitTool = Tool.define("plan_exit", {
       },
       agent: "research",
       model,
+      effort,
     }
     await Session.updateMessage(userMsg)
     await Session.updatePart({
@@ -79,27 +91,31 @@ export const PlanEnterTool = Tool.define("plan_enter", {
     const session = await Session.get(ctx.sessionID)
     const plan = path.relative(Instance.worktree, Session.plan(session))
 
-    const answers = await Question.ask({
-      sessionID: ctx.sessionID,
-      questions: [
-        {
-          question: `Would you like to switch to the plan agent and create a plan saved to ${plan}?`,
-          header: "Plan Mode",
-          custom: false,
-          options: [
-            { label: "Yes", description: "Switch to plan agent for research and planning" },
-            { label: "No", description: "Stay with build agent to continue making changes" },
-          ],
-        },
-      ],
-      tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
-    })
+    const answers = await Question.ask(
+      {
+        sessionID: ctx.sessionID,
+        questions: [
+          {
+            question: `Would you like to switch to the plan agent and create a plan saved to ${plan}?`,
+            header: "Plan Mode",
+            custom: false,
+            options: [
+              { label: "Yes", description: "Switch to plan agent for research and planning" },
+              { label: "No", description: "Stay with build agent to continue making changes" },
+            ],
+          },
+        ],
+        tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+      },
+      ctx.abort,
+    )
 
     const answer = answers[0]?.[0]
 
     if (answer === "No") throw new Question.RejectedError()
 
     const model = await getLastModel(ctx.sessionID)
+    const effort = await getLastEffort(ctx.sessionID)
 
     const userMsg: MessageV2.User = {
       id: Identifier.ascending("message"),
@@ -110,6 +126,7 @@ export const PlanEnterTool = Tool.define("plan_enter", {
       },
       agent: "plan",
       model,
+      effort,
     }
     await Session.updateMessage(userMsg)
     await Session.updatePart({

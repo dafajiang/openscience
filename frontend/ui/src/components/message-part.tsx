@@ -32,11 +32,12 @@ import { useData } from "../context"
 import { useDiffComponent } from "../context/diff"
 import { useCodeComponent } from "../context/code"
 import { useDialog } from "../context/dialog"
-import { useI18n } from "../context/i18n"
+import { type UiI18nKey, useI18n } from "../context/i18n"
+import { ComputeJobDetails } from "./compute-job-details"
 import { BasicTool } from "./basic-tool"
+import { ResearchSearchTool } from "./research-search-tool"
 import { GenericTool } from "./basic-tool"
 import { Button } from "./button"
-import { Card } from "./card"
 import { createTypewriter } from "./typewriter"
 import { Icon } from "./icon"
 import { Checkbox } from "./checkbox"
@@ -44,6 +45,8 @@ import { DiffChanges } from "./diff-changes"
 import { Spinner } from "./spinner"
 import { Markdown } from "./markdown"
 import { ImagePreview } from "./image-preview"
+import { PermissionActions, type PermissionReply } from "./permission-actions"
+import { useClock } from "./clock"
 import { findLast } from "@synsci/util/array"
 import { getDirectory as _getDirectory, getFilename } from "@synsci/util/path"
 import { checksum } from "@synsci/util/encode"
@@ -51,8 +54,25 @@ import { Tooltip } from "./tooltip"
 import { IconButton } from "./icon-button"
 import { createAutoScroll } from "../hooks"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
-import { NotebookView, type NotebookCellProps } from "./notebook-cell"
-import { skillName, stripRedactedReasoning } from "./tool-display"
+import {
+  reasoningDisplayText,
+  runningLabel,
+  savedArtifact,
+  scienceTaskLabel,
+  sentenceCaseLabel,
+  loadedSkillName,
+  skillActivity,
+  stripBashMetadata,
+  taskOutcome,
+  taskPhase,
+  toolOutcome,
+  toolChanges,
+  toolSummary,
+} from "./tool-display"
+import { ToolRegistry, type ToolProps } from "./tool-registry"
+import { elapsedLabel, formatTaskDuration, parseTaskHandoff, traceFamily } from "./research-trace"
+
+export { ARTIFACT_TOOL, ToolRegistry, type ToolComponent, type ToolProps } from "./tool-registry"
 
 interface Diagnostic {
   range: {
@@ -103,16 +123,12 @@ export interface MessagePartProps {
   message: MessageType
   hideDetails?: boolean
   defaultOpen?: boolean
+  hideCopy?: boolean
 }
 
 export type PartComponent = Component<MessagePartProps>
 
 export const PART_MAPPING: Record<string, PartComponent | undefined> = {}
-
-// Openscience science-artifact tool renderer id. tool-renderer.tsx registers a
-// custom renderer under this name and imports it from here; re-exported so that
-// import resolves against the v1.1.116 message-part.
-export const ARTIFACT_TOOL = "__artifact__"
 
 // A file-mutation tool (write/edit/apply_patch) has no diff/content for a brief
 // window right after it starts, which would otherwise render a title-only card
@@ -153,6 +169,19 @@ function getDirectory(path: string | undefined) {
   return relativizeProjectPaths(_getDirectory(path), data.directory)
 }
 
+/** The folder a search ran in, for tools whose `path` is already a directory
+ * (glob, grep, list). `getDirectory` is for file paths and returns the parent,
+ * which here showed the folder above the one searched. Inside the project the
+ * folder reads relative to it, the project itself as "./". */
+function getSearchDirectory(path: string | undefined) {
+  const data = useData()
+  const trimmed = (path || "/").replace(/[\/\\]+$/, "")
+  const root = data.directory?.replace(/[\/\\]+$/, "")
+  if (root && trimmed === root) return "./"
+  if (root && trimmed.startsWith(`${root}/`)) return `${trimmed.slice(root.length + 1)}/`
+  return `${trimmed}/`
+}
+
 export function getSessionToolParts(store: ReturnType<typeof useData>["store"], sessionId: string): ToolPart[] {
   const messages = store.message[sessionId]?.filter((m) => m.role === "assistant")
   if (!messages) return []
@@ -175,6 +204,15 @@ export type ToolInfo = {
   icon: IconProps["name"]
   title: string
   subtitle?: string
+}
+
+/** A row reads as what happened: "Ran", "Read", "Searched". While the call
+ * executes it reads as what is happening. A pending call is still being
+ * written by the model, so it keeps the noun: nothing is being read or run
+ * yet, and the row's state glyph says "Preparing". */
+function toolVerb(i18n: ReturnType<typeof useI18n>, tool: string, status: string | undefined, done: UiI18nKey) {
+  const key = status === "running" ? runningLabel(tool) : undefined
+  return i18n.t(key ?? done)
 }
 
 export function getToolInfo(tool: string, input: any = {}): ToolInfo {
@@ -213,7 +251,7 @@ export function getToolInfo(tool: string, input: any = {}): ToolInfo {
     case "task":
       return {
         icon: "task",
-        title: i18n.t("ui.tool.agent", { type: input.subagent_type || "task" }),
+        title: i18n.t("ui.tool.agent", { type: sentenceCaseLabel(String(input.subagent_type || "task")) }),
         subtitle: input.description,
       }
     case "bash":
@@ -233,6 +271,12 @@ export function getToolInfo(tool: string, input: any = {}): ToolInfo {
         icon: "code-lines",
         title: i18n.t("ui.messagePart.title.write"),
         subtitle: input.filePath ? getFilename(input.filePath) : undefined,
+      }
+    case "generate_image":
+      return {
+        icon: "photo",
+        title: "Generate image",
+        subtitle: input.output_path,
       }
     case "apply_patch":
       return {
@@ -393,6 +437,21 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
     dialog.show(() => <ImagePreview src={url} alt={alt} />)
   }
 
+  const attachmentFormat = (file: FilePart) => {
+    const name = file.filename?.trim() ?? ""
+    const dot = name.lastIndexOf(".")
+    const extension =
+      dot > -1
+        ? name
+            .slice(dot + 1)
+            .trim()
+            .toUpperCase()
+        : ""
+    if (extension && extension.length <= 8) return extension
+    if (file.mime === "application/pdf") return "PDF"
+    return file.mime.split("/").pop()?.replace(/^x-/, "").toUpperCase() || "FILE"
+  }
+
   const handleCopy = async () => {
     const content = text()
     if (!content) return
@@ -412,11 +471,16 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
         <div data-slot="user-message-attachments">
           <For each={attachments()}>
             {(file) => (
-              <div
+              <a
                 data-slot="user-message-attachment"
                 data-type={file.mime.startsWith("image/") ? "image" : "file"}
-                onClick={() => {
+                href={file.url}
+                target="_blank"
+                rel="noreferrer"
+                aria-label={`${file.mime.startsWith("image/") ? "Preview" : "Open"} ${file.filename ?? i18n.t("ui.message.attachment.alt")}`}
+                onClick={(event) => {
                   if (file.mime.startsWith("image/") && file.url) {
+                    event.preventDefault()
                     openImagePreview(file.url, file.filename)
                   }
                 }}
@@ -425,44 +489,35 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
                   when={file.mime.startsWith("image/") && file.url}
                   fallback={
                     <div data-slot="user-message-attachment-icon">
-                      <Icon name="folder" />
+                      <Icon name="file" />
                     </div>
                   }
                 >
-                  <img
-                    data-slot="user-message-attachment-image"
-                    src={file.url}
-                    alt={file.filename ?? i18n.t("ui.message.attachment.alt")}
-                  />
+                  <img data-slot="user-message-attachment-image" src={file.url} alt="" />
                 </Show>
-              </div>
+                <span data-slot="user-message-attachment-copy">
+                  <strong title={file.filename}>{file.filename ?? i18n.t("ui.message.attachment.alt")}</strong>
+                  <span>
+                    {attachmentFormat(file)} · {file.mime.startsWith("image/") ? "Preview" : "Open"}
+                  </span>
+                </span>
+              </a>
             )}
           </For>
         </div>
       </Show>
       <Show when={text()}>
-        <div data-slot="user-message-text" ref={(el) => (textRef = el)} onClick={toggleExpanded}>
-          <HighlightedText text={text()} references={inlineFiles()} agents={agents()} />
-          <button
-            data-slot="user-message-expand"
-            type="button"
-            aria-label={expanded() ? i18n.t("ui.message.collapse") : i18n.t("ui.message.expand")}
-            onClick={(event) => {
-              event.stopPropagation()
-              toggleExpanded()
-            }}
-          >
-            <Icon name="chevron-down" size="small" />
-          </button>
-          <div data-slot="user-message-copy-wrapper">
+        <div data-slot="user-message-row">
+          <div data-slot="user-message-copy-wrapper" data-copied={copied()}>
             <Tooltip
               value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
               placement="top"
               gutter={8}
             >
               <IconButton
+                type="button"
                 icon={copied() ? "check" : "copy"}
-                variant="secondary"
+                variant="ghost"
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={(event) => {
                   event.stopPropagation()
@@ -470,6 +525,28 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
                 }}
                 aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
               />
+            </Tooltip>
+          </div>
+          <div data-slot="user-message-content">
+            <div data-slot="user-message-text" ref={(el) => (textRef = el)} onClick={toggleExpanded}>
+              <HighlightedText text={text()} references={inlineFiles()} agents={agents()} />
+            </div>
+            <Tooltip
+              value={expanded() ? i18n.t("ui.message.collapse") : i18n.t("ui.message.expand")}
+              placement="top"
+              gutter={8}
+            >
+              <button
+                data-slot="user-message-expand"
+                type="button"
+                aria-label={expanded() ? i18n.t("ui.message.collapse") : i18n.t("ui.message.expand")}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  toggleExpanded()
+                }}
+              >
+                <Icon name="chevron-down" size="small" />
+              </button>
             </Tooltip>
           </div>
         </div>
@@ -527,47 +604,10 @@ export function Part(props: MessagePartProps) {
         message={props.message}
         hideDetails={props.hideDetails}
         defaultOpen={props.defaultOpen}
+        hideCopy={props.hideCopy}
       />
     </Show>
   )
-}
-
-export interface ToolProps {
-  input: Record<string, any>
-  metadata: Record<string, any>
-  tool: string
-  output?: string
-  status?: string
-  partID?: string
-  title?: string
-  hideDetails?: boolean
-  defaultOpen?: boolean
-  forceOpen?: boolean
-  locked?: boolean
-}
-
-export type ToolComponent = Component<ToolProps>
-
-const state: Record<
-  string,
-  {
-    name: string
-    render?: ToolComponent
-  }
-> = {}
-
-export function registerTool(input: { name: string; render?: ToolComponent }) {
-  state[input.name] = input
-  return input
-}
-
-export function getTool(name: string) {
-  return state[name]?.render
-}
-
-export const ToolRegistry = {
-  register: registerTool,
-  render: getTool,
 }
 
 PART_MAPPING["tool"] = function ToolPartDisplay(props) {
@@ -617,7 +657,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
     if (permission() || questionRequest()) setForceOpen(true)
   })
 
-  const respond = (response: "once" | "always" | "reject") => {
+  const respond = (response: PermissionReply) => {
     const perm = permission()
     if (!perm || !data.respondToPermission) return
     data.respondToPermission({
@@ -641,67 +681,47 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   // @ts-expect-error - title only exists on the running/completed state variants
   const title = () => part.state?.title as string | undefined
 
-  const render = ToolRegistry.render(part.tool) ?? GenericTool
+  const render = createMemo(() => ToolRegistry.render(part.tool, metadata()) ?? GenericTool)
+  const time = () => ("time" in part.state ? part.state.time : undefined)
+  const error = () => (part.state.status === "error" ? part.state.error : undefined)
+  const summary = createMemo(() =>
+    toolSummary({
+      tool: part.tool,
+      status: part.state.status,
+      output: part.state.status === "completed" ? part.state.output : undefined,
+      metadata: partMetadata(),
+    }),
+  )
 
   return (
-    <div data-component="tool-part-wrapper" data-permission={showPermission()} data-question={showQuestion()}>
-      <Switch>
-        <Match when={part.state.status === "error" && part.state.error}>
-          {(error) => {
-            const cleaned = error().replace("Error: ", "")
-            const [title, ...rest] = cleaned.split(": ")
-            return (
-              <Card variant="error">
-                <div data-component="tool-error">
-                  <Icon name="circle-ban-sign" size="small" />
-                  <Switch>
-                    <Match when={title && title.length < 30}>
-                      <div data-slot="message-part-tool-error-content">
-                        <div data-slot="message-part-tool-error-title">{title}</div>
-                        <span data-slot="message-part-tool-error-message">{rest.join(": ")}</span>
-                      </div>
-                    </Match>
-                    <Match when={true}>
-                      <span data-slot="message-part-tool-error-message">{cleaned}</span>
-                    </Match>
-                  </Switch>
-                </div>
-              </Card>
-            )
-          }}
-        </Match>
-        <Match when={true}>
-          <Dynamic
-            component={render}
-            input={input()}
-            tool={part.tool}
-            metadata={metadata()}
-            // @ts-expect-error
-            output={part.state.output}
-            status={part.state.status}
-            partID={part.id}
-            title={title()}
-            hideDetails={props.hideDetails}
-            forceOpen={forceOpen()}
-            locked={showPermission() || showQuestion()}
-            defaultOpen={props.defaultOpen}
-          />
-        </Match>
-      </Switch>
+    <div
+      data-component="tool-part-wrapper"
+      data-permission={showPermission()}
+      data-question={showQuestion()}
+      data-tool-family={traceFamily(part.tool)}
+      data-tool-status={part.state.status}
+    >
+      <Dynamic
+        component={render()}
+        input={input()}
+        tool={part.tool}
+        metadata={metadata()}
+        // @ts-expect-error
+        output={part.state.output}
+        status={part.state.status}
+        time={time()}
+        summary={summary()}
+        error={error()}
+        partID={part.id}
+        attachments={part.state.status === "completed" ? part.state.attachments : undefined}
+        title={title()}
+        hideDetails={props.hideDetails}
+        forceOpen={forceOpen()}
+        locked={showPermission() || showQuestion()}
+        defaultOpen={props.defaultOpen}
+      />
       <Show when={showPermission() && permission()}>
-        <div data-component="permission-prompt">
-          <div data-slot="permission-actions">
-            <Button variant="ghost" size="small" onClick={() => respond("reject")}>
-              {i18n.t("ui.permission.deny")}
-            </Button>
-            <Button variant="secondary" size="small" onClick={() => respond("always")}>
-              {i18n.t("ui.permission.allowAlways")}
-            </Button>
-            <Button variant="primary" size="small" onClick={() => respond("once")}>
-              {i18n.t("ui.permission.allowOnce")}
-            </Button>
-          </div>
-        </div>
+        <PermissionActions respond={respond} metadata={permission()?.metadata} />
       </Show>
       <Show when={showQuestion() && questionRequest()}>{(request) => <QuestionPrompt request={request()} />}</Show>
     </div>
@@ -709,12 +729,14 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
 }
 
 PART_MAPPING["text"] = function TextPartDisplay(props) {
-  const data = useData()
   const i18n = useI18n()
   const part = props.part as TextPart
-  const displayText = () => relativizeProjectPaths((part.text ?? "").trim(), data.directory)
+  // Paths inside Markdown targets, prose, and code are content, not labels.
+  // Removing a project prefix corrupts their meaning before file resolution.
+  const displayText = () => (part.text ?? "").trim()
   const throttledText = createTypewriter(displayText)
   const [copied, setCopied] = createSignal(false)
+  const streaming = () => props.message.role === "assistant" && !completedAt(props.message) && !part.time?.end
 
   const handleCopy = async () => {
     const content = displayText()
@@ -726,53 +748,276 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
 
   return (
     <Show when={throttledText()}>
-      <div data-component="text-part">
+      <div data-component="text-part" data-streaming={streaming() ? "true" : undefined}>
         <div data-slot="text-part-body">
-          <Markdown text={throttledText()} cacheKey={part.id} />
-          <div data-slot="text-part-copy-wrapper">
-            <Tooltip
-              value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
-              placement="top"
-              gutter={8}
-            >
-              <IconButton
-                icon={copied() ? "check" : "copy"}
-                variant="secondary"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={handleCopy}
-                aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
-              />
-            </Tooltip>
-          </div>
+          <Markdown
+            data-slot={props.message.role === "assistant" ? "assistant-prose" : undefined}
+            text={throttledText()}
+            cacheKey={part.id}
+          />
+          <Show when={!props.hideCopy}>
+            <div data-slot="text-part-copy-wrapper">
+              <Tooltip
+                value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
+                placement="top"
+                gutter={8}
+              >
+                <IconButton
+                  icon={copied() ? "check" : "copy"}
+                  variant="secondary"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={handleCopy}
+                  aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
+                />
+              </Tooltip>
+            </div>
+          </Show>
         </div>
       </div>
     </Show>
   )
 }
 
-// Providers that don't expose raw chain-of-thought — OpenAI's models, and
-// anything routed through OpenRouter — return the reasoning *encrypted*: the
-// real content lives in providerMetadata (for multi-turn continuation) and the
-// visible text is empty, a literal "[REDACTED]" placeholder, or a readable
-// summary with "[REDACTED]" appended. None of the placeholder is meaningful, so
-// stripRedactedReasoning() drops it — a wholly-encrypted part collapses to empty
-// and the <Show> hides it, while a "…summary![REDACTED]" keeps its readable text.
-// (Supersedes the exact-match approach: OpenRouter mostly appends the placeholder
-// to a real summary, which exact-match would leave visible.)
+// Display normalization and visibility never alter stored provider continuation.
+
+function completedAt(message: MessageType) {
+  return message.role === "assistant" ? (message as AssistantMessage).time.completed : undefined
+}
 
 PART_MAPPING["reasoning"] = function ReasoningPartDisplay(props) {
   const part = props.part as ReasoningPart
-  const text = () => stripRedactedReasoning(part.text)
-  const throttledText = createTypewriter(text)
-
+  const text = () => reasoningDisplayText(part.text)
+  const live = () => !part.time?.end && !completedAt(props.message)
+  // A private-only continuation renders nothing; its time still counts in the
+  // row label, and the persisted provider text is never shown.
   return (
-    <Show when={throttledText()}>
-      <div data-component="reasoning-part">
-        <Markdown text={throttledText()} cacheKey={part.id} />
+    <Show when={text()}>
+      <div data-component="reasoning-part" data-origin="provider-reasoning" data-live={live() ? "true" : undefined}>
+        <div data-slot="reasoning-part-body">
+          <Markdown text={text()} cacheKey={part.id} />
+        </div>
       </div>
     </Show>
   )
 }
+
+function KernelTool(props: ToolProps & { language: "python" | "r"; label: "Python" | "R" }) {
+  const code = () => (typeof props.input.code === "string" ? props.input.code : "")
+  const kernel = () => (typeof props.input.kernel === "string" ? props.input.kernel : props.language)
+  const task = () => scienceTaskLabel({ title: props.input.title, code: code(), language: props.language })
+  const source = () => (typeof props.input.source === "string" ? props.input.source : undefined)
+  const count = () => (typeof props.metadata.executionCount === "number" ? props.metadata.executionCount : undefined)
+  const failed = () => props.metadata.ok === false || props.status === "error"
+  const subtitle = () =>
+    [props.label, `env ${kernel()}`, count() === undefined ? undefined : `run ${count()}`, source()]
+      .filter(Boolean)
+      .join(" · ")
+  const images = () => {
+    const artifact = props.metadata.artifact
+    if (!artifact || typeof artifact !== "object") return []
+    const data = "data" in artifact && artifact.data && typeof artifact.data === "object" ? artifact.data : undefined
+    const value = data && "images" in data ? data.images : undefined
+    if (!Array.isArray(value)) return []
+    return value.filter((item): item is string => typeof item === "string" && item.startsWith("data:image/"))
+  }
+
+  if (props.input.action === "stop") {
+    return (
+      <BasicTool
+        {...props}
+        icon="circle-check"
+        trigger={{ title: "Kernel stopped", subtitle: `${props.label} · ${kernel()}` }}
+      />
+    )
+  }
+
+  return (
+    <BasicTool
+      {...props}
+      icon="code"
+      trigger={{
+        title: failed() ? `Failed · ${task()}` : props.status === "completed" ? task() : `Running · ${task()}`,
+        subtitle: subtitle(),
+      }}
+    >
+      <div data-component="kernel-tool" data-language={props.language}>
+        <header>
+          <strong>{props.label}</strong>
+          <span>{subtitle()}</span>
+        </header>
+        <Show when={props.output || images().length > 0}>
+          <div data-slot="kernel-tool-output-cell">
+            <span data-slot="kernel-tool-prompt">Out [{count() ?? " "}]:</span>
+            <div data-slot="kernel-tool-output-body">
+              <Show when={props.output}>
+                <div data-slot="kernel-tool-result">
+                  <pre>{stripAnsi(props.output ?? "")}</pre>
+                </div>
+              </Show>
+              <Show when={images().length > 0}>
+                <div data-slot="kernel-tool-images">
+                  <For each={images()}>
+                    {(image) => <img src={image} alt={`${props.label} execution result`} loading="lazy" />}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </div>
+        </Show>
+        <details data-slot="kernel-tool-source">
+          <summary>
+            <span data-slot="kernel-tool-prompt">In [{count() ?? " "}]:</span>
+            <span>Code</span>
+          </summary>
+          <div data-slot="kernel-tool-input-cell">
+            <span data-slot="kernel-tool-prompt" aria-hidden="true">
+              In [{count() ?? " "}]:
+            </span>
+            <pre>
+              <code>{code()}</code>
+            </pre>
+          </div>
+        </details>
+      </div>
+    </BasicTool>
+  )
+}
+
+ToolRegistry.register({
+  name: "python",
+  render: (props) => <KernelTool {...props} language="python" label="Python" />,
+})
+
+ToolRegistry.register({
+  name: "r",
+  render: (props) => <KernelTool {...props} language="r" label="R" />,
+})
+
+ToolRegistry.register({
+  name: "notebook",
+  render: (props) => <KernelTool {...props} language="python" label="Python" />,
+})
+
+ToolRegistry.register({
+  name: "rkernel",
+  render: (props) => <KernelTool {...props} language="r" label="R" />,
+})
+
+function SavedArtifactTool(props: ToolProps) {
+  const data = useData()
+  const saved = () => savedArtifact(props.metadata.savedArtifact)
+  const open = () => {
+    const artifact = saved()
+    if (!artifact) return
+    if (data.openArtifact) {
+      data.openArtifact(artifact.id)
+      return
+    }
+    data.openFile?.(artifact.path)
+  }
+
+  return (
+    <BasicTool
+      {...props}
+      icon="archive"
+      trigger={{
+        title: saved() ? "Saved to Results" : props.title || "Result",
+        subtitle: saved() ? getFilename(saved()!.path) : undefined,
+      }}
+    >
+      <Show
+        when={saved()}
+        fallback={
+          <Show when={props.output}>
+            <div data-component="tool-output" data-scrollable>
+              <pre>{stripAnsi(props.output ?? "")}</pre>
+            </div>
+          </Show>
+        }
+      >
+        {(artifact) => (
+          <div data-component="saved-artifact-tool">
+            <header>
+              <strong>{getFilename(artifact().path)}</strong>
+              <span>{artifact().kind}</span>
+            </header>
+            <Show when={artifact().preview?.kind === "image" ? artifact().preview?.data : undefined}>
+              {(image) => (
+                <img data-slot="saved-artifact-preview" src={image()} alt={artifact().title} loading="lazy" />
+              )}
+            </Show>
+            <Show when={artifact().preview?.kind === "text" ? artifact().preview?.data : undefined}>
+              {(preview) => (
+                <div data-slot="saved-artifact-preview-text">
+                  <Markdown
+                    text={artifact().mimeType === "text/markdown" ? preview() : `\`\`\`\n${preview()}\n\`\`\``}
+                  />
+                </div>
+              )}
+            </Show>
+            <footer>
+              <button type="button" onClick={open}>
+                Open Result
+              </button>
+            </footer>
+          </div>
+        )}
+      </Show>
+    </BasicTool>
+  )
+}
+
+ToolRegistry.register({
+  name: "artifact",
+  render: (props) => <SavedArtifactTool {...props} />,
+})
+
+function RemoteComputeTool(props: ToolProps) {
+  const job = () => {
+    const envelope = props.metadata.compute_job
+    const value =
+      props.metadata.job ?? (envelope && typeof envelope === "object" && "job" in envelope ? envelope.job : undefined)
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined
+  }
+  const gpu = () => {
+    const value = job()?.modal
+    if (value && typeof value === "object" && "gpu" in value && typeof value.gpu === "string" && value.gpu !== "none")
+      return value.gpu
+    return typeof props.input.gpu === "string" && props.input.gpu !== "none" ? props.input.gpu : undefined
+  }
+  const status = () => (typeof job()?.status === "string" ? job()!.status : props.status)
+  return (
+    <BasicTool
+      {...props}
+      icon="console"
+      trigger={{
+        title: props.title || (props.tool === "modal" ? "Modal compute" : "Remote compute"),
+        subtitle: [gpu(), job() ? `${status()} at ${props.input.action === "start" ? "dispatch" : "check"}` : status()]
+          .filter(Boolean)
+          .join(" · "),
+      }}
+    >
+      <Show when={typeof job()?.id === "string" ? (job()!.id as string) : undefined}>
+        {(id) => <ComputeJobDetails id={id()} />}
+      </Show>
+      <Show when={typeof props.input.command === "string" ? props.input.command : undefined}>
+        {(command) => (
+          <div data-component="tool-output" data-scrollable>
+            <pre>{command()}</pre>
+          </div>
+        )}
+      </Show>
+      <Show when={props.output}>
+        <div data-component="tool-output" data-scrollable>
+          <pre>{stripAnsi(props.output ?? "")}</pre>
+        </div>
+      </Show>
+    </BasicTool>
+  )
+}
+
+ToolRegistry.register({ name: "modal", render: (props) => <RemoteComputeTool {...props} /> })
+ToolRegistry.register({ name: "compute_job", render: (props) => <RemoteComputeTool {...props} /> })
 
 ToolRegistry.register({
   name: "read",
@@ -794,7 +1039,7 @@ ToolRegistry.register({
           {...props}
           icon="glasses"
           trigger={{
-            title: i18n.t("ui.tool.read"),
+            title: toolVerb(i18n, "read", props.status, "ui.tool.read"),
             subtitle: props.input.filePath ? getFilename(props.input.filePath) : "",
             args,
           }}
@@ -818,10 +1063,55 @@ ToolRegistry.register({
 ToolRegistry.register({
   name: "skill",
   render(props) {
-    const i18n = useI18n()
-    const name = skillName({ metadata: props.metadata, input: props.input, title: props.title })
+    const activity = () =>
+      skillActivity({
+        metadata: props.metadata,
+        input: props.input,
+        title: props.title,
+        status: props.status,
+        error: props.error,
+      })
     return (
-      <BasicTool {...props} icon="mcp" trigger={{ title: i18n.t("ui.tool.skill", { name }) }}>
+      <BasicTool {...props} icon="mcp" trigger={{ title: activity().title, subtitle: activity().subtitle }}>
+        <Show when={loadedSkillName(props)}>
+          <details data-slot="skill-load-receipt">
+            <summary>Load details</summary>
+            <pre>{JSON.stringify({ input: props.input, metadata: props.metadata }, null, 2)}</pre>
+          </details>
+        </Show>
+        <Show when={props.output}>
+          {(output) => (
+            <div data-component="tool-output" data-scrollable>
+              <Markdown text={output()} />
+            </div>
+          )}
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "modal",
+  render(props) {
+    const plan = () => props.metadata.compute
+    return (
+      <BasicTool
+        {...props}
+        icon="mcp"
+        trigger={{
+          title: props.title || (props.status === "pending" ? "Review Modal job" : "Modal job"),
+          subtitle: props.input.name,
+          args: [props.input.gpu || "none"],
+        }}
+      >
+        <Show when={plan()}>
+          {(value) => (
+            <div data-component="tool-output" data-scrollable>
+              <Markdown text={`\`\`\`json\n${JSON.stringify(value(), null, 2)}\n\`\`\``} />
+            </div>
+          )}
+        </Show>
         <Show when={props.output}>
           {(output) => (
             <div data-component="tool-output" data-scrollable>
@@ -842,7 +1132,10 @@ ToolRegistry.register({
       <BasicTool
         {...props}
         icon="bullet-list"
-        trigger={{ title: i18n.t("ui.tool.list"), subtitle: getDirectory(props.input.path || "/") }}
+        trigger={{
+          title: toolVerb(i18n, "list", props.status, "ui.tool.list"),
+          subtitle: getSearchDirectory(props.input.path),
+        }}
       >
         <Show when={props.output}>
           {(output) => (
@@ -865,8 +1158,8 @@ ToolRegistry.register({
         {...props}
         icon="magnifying-glass-menu"
         trigger={{
-          title: i18n.t("ui.tool.glob"),
-          subtitle: getDirectory(props.input.path || "/"),
+          title: toolVerb(i18n, "glob", props.status, "ui.tool.glob"),
+          subtitle: getSearchDirectory(props.input.path),
           args: props.input.pattern ? ["pattern=" + props.input.pattern] : [],
         }}
       >
@@ -894,8 +1187,8 @@ ToolRegistry.register({
         {...props}
         icon="magnifying-glass-menu"
         trigger={{
-          title: i18n.t("ui.tool.grep"),
-          subtitle: getDirectory(props.input.path || "/"),
+          title: toolVerb(i18n, "grep", props.status, "ui.tool.grep"),
+          subtitle: getSearchDirectory(props.input.path),
           args,
         }}
       >
@@ -911,17 +1204,35 @@ ToolRegistry.register({
   },
 })
 
+ToolRegistry.register({ name: "research_search", render: ResearchSearchTool })
+
 ToolRegistry.register({
   name: "webfetch",
   render(props) {
     const i18n = useI18n()
+    const data = useData()
+    const downloaded = () => {
+      const value = props.metadata.download
+      return value && typeof value === "object" ? (value as { path?: unknown; autoOpen?: unknown }) : undefined
+    }
+    // Do not reopen persisted downloads on reload, but keep listening if the
+    // completed metadata arrives one event after the terminal status.
+    let opened = props.status === "completed"
+    createEffect(() => {
+      const status = props.status
+      const download = downloaded()
+      if (!opened && status === "completed" && download?.autoOpen === true && typeof download.path === "string") {
+        opened = true
+        data.openFile?.(download.path)
+      }
+    })
     return (
       <BasicTool
         {...props}
         icon="window-cursor"
         trigger={{
-          title: i18n.t("ui.tool.webfetch"),
-          subtitle: props.input.url || "",
+          title: downloaded() ? "Downloaded file" : toolVerb(i18n, "webfetch", props.status, "ui.tool.webfetch"),
+          subtitle: typeof downloaded()?.path === "string" ? (downloaded()!.path as string) : props.input.url || "",
           args: props.input.format ? ["format=" + props.input.format] : [],
           action: (
             <div data-component="tool-action">
@@ -929,6 +1240,9 @@ ToolRegistry.register({
             </div>
           ),
         }}
+        onSubtitleClick={
+          typeof downloaded()?.path === "string" ? () => data.openFile?.(downloaded()!.path as string) : undefined
+        }
       >
         <Show when={props.output}>
           {(output) => (
@@ -943,19 +1257,170 @@ ToolRegistry.register({
 })
 
 ToolRegistry.register({
+  name: "generate_image",
+  render(props) {
+    const data = useData()
+    const dialog = useDialog()
+    const route = () =>
+      props.metadata.route === "gemini"
+        ? "Connected Gemini account"
+        : props.metadata.route === "openrouter"
+          ? "Connected OpenRouter account"
+          : undefined
+    const filepath = () =>
+      typeof props.metadata.filepath === "string"
+        ? props.metadata.filepath
+        : typeof props.input.output_path === "string"
+          ? props.input.output_path
+          : undefined
+    const attachment = createMemo(() => {
+      const filename = filepath() ? getFilename(filepath()!) : undefined
+      return props.attachments?.find(
+        (part) =>
+          part.type === "file" &&
+          part.mime.startsWith("image/") &&
+          (!filename || !part.filename || part.filename === filename),
+      )
+    })
+    const size = () => {
+      const value = typeof props.metadata.size === "number" ? props.metadata.size : undefined
+      if (value === undefined) return undefined
+      if (value < 1024) return `${value} B`
+      if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`
+      return `${(value / (1024 * 1024)).toFixed(1)} MB`
+    }
+    return (
+      <BasicTool
+        {...props}
+        icon="photo"
+        defaultOpen={true}
+        trigger={{
+          title:
+            props.status === "error"
+              ? "Image generation failed"
+              : props.status === "completed"
+                ? "Generated image"
+                : "Generating image",
+          subtitle: props.title || props.input.output_path || "generated-image.png",
+          args: [props.metadata.model || props.input.model, route()].filter((value): value is string => !!value),
+        }}
+      >
+        <Show when={props.status === "completed"}>
+          <div data-component="generated-image-preview">
+            <Show
+              when={attachment()?.url?.startsWith("data:image/") ? attachment() : undefined}
+              fallback={
+                <div data-slot="generated-image-placeholder">
+                  <Icon name="photo" size="small" />
+                  <span>The image is saved to the workspace. Open the file to preview it.</span>
+                </div>
+              }
+            >
+              {(image) => (
+                <button
+                  type="button"
+                  data-slot="generated-image-preview-button"
+                  aria-label={`Preview ${image().filename ?? "generated image"}`}
+                  onClick={() => dialog.show(() => <ImagePreview src={image().url} alt={image().filename} />)}
+                >
+                  <img src={image().url} alt={image().filename ?? "Generated image"} loading="lazy" />
+                </button>
+              )}
+            </Show>
+            <div data-slot="generated-image-meta">
+              <span>{[props.metadata.model, size()].filter(Boolean).join(" · ")}</span>
+              <Show when={filepath()}>
+                {(path) => (
+                  <Button variant="secondary" size="small" icon="folder" onClick={() => data.openFile?.(path())}>
+                    Open image
+                  </Button>
+                )}
+              </Show>
+            </div>
+          </div>
+        </Show>
+        <Show when={props.output}>
+          {(output) => (
+            <div data-component="tool-output">
+              <Markdown text={output()} />
+            </div>
+          )}
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
   name: "task",
   render(props) {
     const data = useData()
     const i18n = useI18n()
-    const summary = () =>
-      (props.metadata.summary ?? []) as { id: string; tool: string; state: { status: string; title?: string } }[]
-
-    const autoScroll = createAutoScroll({
-      working: () => true,
-      overflowAnchor: "auto",
-    })
-
     const childSessionId = () => props.metadata.sessionId as string | undefined
+    const handoff = createMemo(() => parseTaskHandoff(props.output ?? props.error))
+    const child = () => {
+      const id = childSessionId()
+      return id ? data.store.session.find((session) => session.id === id) : undefined
+    }
+    const childBusy = () => {
+      const id = childSessionId()
+      const status = id ? data.store.session_status[id] : undefined
+      return !!status && status.type !== "idle"
+    }
+    // A background dispatch settles at once while its worker keeps going; the
+    // card follows the worker until the worker's outcome is on the part.
+    const background = () =>
+      props.status === "completed" && props.metadata.background === true && props.metadata.outcome === undefined
+    const live = () => props.status === "running" || props.status === "pending" || (background() && childBusy())
+    const now = useClock(() => live() && !!props.time?.start)
+    const duration = () => {
+      if (live() && props.time?.start) return elapsedLabel(now() - props.time.start)
+      const recorded = props.metadata.durationMs as number | undefined
+      // A worker whose outcome was never written back: the child's last
+      // activity is the best end time; the dispatch call's own time is not.
+      const finished = background() ? child()?.time?.updated : undefined
+      const measured =
+        finished !== undefined && props.time?.start
+          ? finished - props.time.start
+          : props.time?.end === undefined
+            ? undefined
+            : props.time.end - props.time.start
+      return formatTaskDuration(recorded ?? measured)
+    }
+    // Phases come from the part state and the Task metadata the backend
+    // recorded, never from the pending placeholder alone: a delegation that
+    // fails before a child exists must not look like a worker in trouble.
+    const phase = createMemo(() =>
+      taskPhase({ status: props.status, error: props.error, metadata: props.metadata, childBusy: childBusy() }),
+    )
+    const outcome = () => taskOutcome(phase())
+    const outcomeLabel = () => {
+      switch (phase()) {
+        case "preparing":
+          return i18n.t("ui.tool.task.preparing")
+        case "queued":
+          return i18n.t("ui.tool.task.queued")
+        case "running":
+          return i18n.t("ui.tool.task.running")
+        case "failed_to_start":
+          return i18n.t("ui.tool.task.failedToStart")
+        case "failed":
+          return i18n.t("ui.tool.task.failed")
+        case "partial":
+          return i18n.t("ui.tool.task.partial")
+        case "timed_out":
+          return i18n.t("ui.tool.task.timedOut")
+        case "cancelled":
+          return i18n.t("ui.tool.status.cancelled")
+        default:
+          return Number(props.metadata.failedToolCalls) > 0
+            ? i18n.t("ui.tool.task.completedWithErrors")
+            : i18n.t("ui.tool.task.completed")
+      }
+    }
+    const [expanded, setExpanded] = createSignal<boolean>()
+    const agentLabel = () =>
+      i18n.t("ui.tool.agent", { type: sentenceCaseLabel(String(props.input.subagent_type || props.tool)) })
 
     const childPermission = createMemo(() => {
       const sessionId = childSessionId()
@@ -964,18 +1429,38 @@ ToolRegistry.register({
       return permissions[0]
     })
 
-    const childToolPart = createMemo(() => {
-      const perm = childPermission()
-      if (!perm || !perm.tool) return undefined
+    const childQuestion = createMemo(() => {
       const sessionId = childSessionId()
       if (!sessionId) return undefined
-      // Find the tool part that matches the permission's callID
+      const questions = data.store.question?.[sessionId] ?? []
+      return questions[0]
+    })
+
+    const childRequest = createMemo(() => childPermission() ?? childQuestion())
+    const attention = () => (childPermission() ? "permission" : childQuestion() ? "question" : undefined)
+    // A worker waiting on the user must stay visible; otherwise the card is a
+    // closed line until the user opens it. Nothing streams from the worker:
+    // its transcript is one click away and its handoff lands here when done.
+    const open = () => (attention() ? true : (expanded() ?? false))
+    const statusLabel = () =>
+      attention() === "permission"
+        ? i18n.t("ui.tool.task.needsApproval")
+        : attention() === "question"
+          ? i18n.t("ui.tool.task.hasQuestion")
+          : outcomeLabel()
+
+    const childToolPart = createMemo(() => {
+      const request = childRequest()
+      if (!request || !request.tool) return undefined
+      const sessionId = childSessionId()
+      if (!sessionId) return undefined
+      // Find the tool part that owns the pending permission or question.
       const messages = data.store.message[sessionId] ?? []
-      const message = findLast(messages, (m) => m.id === perm.tool!.messageID)
+      const message = findLast(messages, (m) => m.id === request.tool!.messageID)
       if (!message) return undefined
       const parts = data.store.part[message.id] ?? []
       for (const part of parts) {
-        if (part.type === "tool" && (part as ToolPart).callID === perm.tool!.callID) {
+        if (part.type === "tool" && (part as ToolPart).callID === request.tool!.callID) {
           return { part: part as ToolPart, message }
         }
       }
@@ -983,7 +1468,7 @@ ToolRegistry.register({
       return undefined
     })
 
-    const respond = (response: "once" | "always" | "reject") => {
+    const respond = (response: PermissionReply) => {
       const perm = childPermission()
       if (!perm || !data.respondToPermission) return
       data.respondToPermission({
@@ -993,7 +1478,7 @@ ToolRegistry.register({
       })
     }
 
-    const handleSubtitleClick = () => {
+    const openAgent = () => {
       const sessionId = childSessionId()
       if (sessionId && data.navigateToSession) {
         data.navigateToSession(sessionId)
@@ -1004,9 +1489,9 @@ ToolRegistry.register({
       const toolData = childToolPart()
       if (!toolData) return null
       const { part } = toolData
-      const render = ToolRegistry.render(part.tool) ?? GenericTool
       // @ts-expect-error
       const metadata = part.state?.metadata ?? {}
+      const render = ToolRegistry.render(part.tool, metadata) ?? GenericTool
       const input = part.state?.input ?? {}
       return (
         <Dynamic
@@ -1023,79 +1508,131 @@ ToolRegistry.register({
     }
 
     return (
-      <div data-component="tool-part-wrapper" data-permission={!!childPermission()}>
-        <Switch>
-          <Match when={childPermission()}>
-            <>
-              <Show
-                when={childToolPart()}
-                fallback={
-                  <BasicTool
-                    icon="task"
-                    defaultOpen={true}
-                    trigger={{
-                      title: i18n.t("ui.tool.agent", { type: props.input.subagent_type || props.tool }),
-                      titleClass: "capitalize",
-                      subtitle: props.input.description,
-                    }}
-                    onSubtitleClick={handleSubtitleClick}
-                  />
-                }
-              >
-                {renderChildToolPart()}
+      <div data-component="tool-part-wrapper" data-permission={!!childPermission()} data-question={!!childQuestion()}>
+        <details
+          data-component="delegation-card"
+          data-outcome={outcome()}
+          data-phase={phase()}
+          data-attention={attention()}
+          open={open()}
+        >
+          <summary
+            data-slot="delegation-summary"
+            aria-label={`${statusLabel()}: ${agentLabel()}`}
+            onClick={(event) => {
+              event.preventDefault()
+              if (attention()) return
+              setExpanded(!open())
+            }}
+          >
+            <span data-slot="delegation-mark" aria-hidden="true">
+              <Show when={live() && !attention()} fallback={<Icon name="research" size="small" />}>
+                <Spinner />
               </Show>
-              <div data-component="permission-prompt">
-                <div data-slot="permission-actions">
-                  <Button variant="ghost" size="small" onClick={() => respond("reject")}>
-                    {i18n.t("ui.permission.deny")}
-                  </Button>
-                  <Button variant="secondary" size="small" onClick={() => respond("always")}>
-                    {i18n.t("ui.permission.allowAlways")}
-                  </Button>
-                  <Button variant="primary" size="small" onClick={() => respond("once")}>
-                    {i18n.t("ui.permission.allowOnce")}
-                  </Button>
-                </div>
+            </span>
+            {/* What the worker is doing leads; who is doing it sits at the
+                right in the quiet colour, and the state reads on its own line. */}
+            <span data-slot="delegation-heading">
+              <span data-slot="delegation-title">{String(props.input.description || agentLabel())}</span>
+              <span data-slot="delegation-subline">
+                <span data-slot="delegation-status">{statusLabel()}</span>
+                <Show when={duration()}>{(value) => <span>{value()}</span>}</Show>
+              </span>
+            </span>
+            <span data-slot="delegation-summary-meta">
+              <Show when={props.input.description}>
+                <span data-slot="delegation-agent">{agentLabel()}</span>
+              </Show>
+              <Icon name="chevron-down" size="small" />
+            </span>
+          </summary>
+
+          <div data-slot="delegation-body">
+            <Show when={attention()}>
+              <div data-slot="delegation-attention" data-kind={attention()}>
+                <Show
+                  when={childToolPart()}
+                  fallback={
+                    <div data-slot="delegation-attention-fallback">
+                      <Icon name="research" size="small" />
+                      <span>{String(props.input.description ?? agentLabel())}</span>
+                    </div>
+                  }
+                >
+                  {renderChildToolPart()}
+                </Show>
+                <Show when={childPermission()}>
+                  <PermissionActions respond={respond} metadata={childPermission()?.metadata} />
+                </Show>
+                <Show when={childQuestion()}>{(request) => <QuestionPrompt request={request()} />}</Show>
               </div>
-            </>
-          </Match>
-          <Match when={true}>
-            <BasicTool
-              icon="task"
-              defaultOpen={true}
-              trigger={{
-                title: i18n.t("ui.tool.agent", { type: props.input.subagent_type || props.tool }),
-                titleClass: "capitalize",
-                subtitle: props.input.description,
-              }}
-              onSubtitleClick={handleSubtitleClick}
-            >
-              <div
-                ref={autoScroll.scrollRef}
-                onScroll={autoScroll.handleScroll}
-                data-component="tool-output"
-                data-scrollable
-              >
-                <div ref={autoScroll.contentRef} data-component="task-tools">
-                  <For each={summary()}>
-                    {(item) => {
-                      const info = getToolInfo(item.tool)
-                      return (
-                        <div data-slot="task-tool-item">
-                          <Icon name={info.icon} size="small" />
-                          <span data-slot="task-tool-title">{info.title}</span>
-                          <Show when={item.state.title}>
-                            <span data-slot="task-tool-subtitle">{item.state.title}</span>
-                          </Show>
-                        </div>
-                      )
-                    }}
+            </Show>
+
+            <Show when={handoff().notes.length > 0}>
+              <ul data-slot="delegation-notes" data-outcome={outcome()}>
+                <For each={handoff().notes}>{(note) => <li>{note}</li>}</For>
+              </ul>
+            </Show>
+
+            <Show when={handoff().text}>
+              {(value) => (
+                <div data-slot="delegation-findings" data-error={props.status === "error" ? "true" : undefined}>
+                  <Show when={!handoff().headed}>
+                    <span data-slot="delegation-section-label">
+                      {outcome() === "cancelled"
+                        ? i18n.t("ui.tool.status.cancelled")
+                        : props.status === "error"
+                          ? "Error"
+                          : "Findings"}
+                    </span>
+                  </Show>
+                  <Markdown text={value()} />
+                </div>
+              )}
+            </Show>
+
+            <Show when={handoff().outputs.length > 0}>
+              <div data-slot="delegation-outputs">
+                <span data-slot="delegation-section-label">Saved to Results</span>
+                <div>
+                  <For each={handoff().outputs}>
+                    {(file) => (
+                      <button
+                        type="button"
+                        data-slot="delegation-output"
+                        disabled={!file.artifactID || !data.openArtifact}
+                        onClick={() => file.artifactID && data.openArtifact?.(file.artifactID)}
+                      >
+                        <Icon name="file" size="small" />
+                        {file.filename}
+                      </button>
+                    )}
                   </For>
                 </div>
               </div>
-            </BasicTool>
-          </Match>
-        </Switch>
+            </Show>
+
+            <Show when={live() && !attention()}>
+              <p data-slot="delegation-quiet">Working in its own session; the handoff appears here when it finishes.</p>
+            </Show>
+            <div data-slot="delegation-footer">
+              <span data-slot="delegation-metrics" aria-label="Delegated research details" />
+              <span data-slot="delegation-actions">
+                <Show when={childSessionId() && data.navigateToSession}>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="small"
+                    data-slot="delegation-link"
+                    onClick={openAgent}
+                  >
+                    Open agent
+                  </Button>
+                </Show>
+              </span>
+            </div>
+          </div>
+        </details>
       </div>
     )
   },
@@ -1105,31 +1642,61 @@ ToolRegistry.register({
   name: "bash",
   render(props) {
     const i18n = useI18n()
-    const openInShellTab = (e: MouseEvent) => {
-      e.stopPropagation()
-      document.dispatchEvent(
-        new CustomEvent("open-shell-tab", { detail: { partId: props.partID, command: props.input.command } }),
+    const command = () => String(props.input.command ?? props.metadata.command ?? "")
+    const output = () => stripAnsi(stripBashMetadata(props.output ?? props.metadata.output))
+    const transcript = () => [command() ? `$ ${command()}` : "", output()].filter(Boolean).join("\n\n")
+    const [copy, setCopy] = createStore({ copied: false, error: false })
+    const handleCopy = async () => {
+      setCopy({ copied: false, error: false })
+      if (!navigator.clipboard?.writeText) {
+        setCopy("error", true)
+        return
+      }
+      await navigator.clipboard.writeText(transcript()).then(
+        () => setCopy("copied", true),
+        () => setCopy("error", true),
       )
+    }
+    createEffect(() => {
+      if (!copy.copied) return
+      const timer = setTimeout(() => setCopy("copied", false), 2_000)
+      onCleanup(() => clearTimeout(timer))
+    })
+    const subtitle = () => {
+      if (typeof props.input.description === "string" && props.input.description.trim()) return props.input.description
+      const command = typeof props.input.command === "string" ? props.input.command : ""
+      return command.trim().split("\n")[0]?.slice(0, 80) || undefined
     }
     return (
       <BasicTool
         {...props}
         icon="console"
         trigger={{
-          title: i18n.t("ui.tool.shell"),
-          subtitle: props.input.description,
-          action: (
-            <Tooltip value="Open in Shell tab">
-              <IconButton icon="square-arrow-top-right" variant="ghost" class="h-5 w-5" onClick={openInShellTab} />
-            </Tooltip>
-          ),
+          title: toolVerb(i18n, "bash", props.status, "ui.tool.shell"),
+          subtitle: subtitle(),
         }}
       >
-        <Show when={props.input.command || props.metadata.command || props.output || props.metadata.output}>
-          <div data-component="tool-output" data-scrollable>
-            <Markdown
-              text={`\`\`\`\`command\n$ ${props.input.command ?? props.metadata.command ?? ""}${props.output || props.metadata.output ? "\n\n" + stripAnsi(props.output || props.metadata.output) : ""}\n\`\`\`\``}
-            />
+        <Show when={transcript()}>
+          <div data-component="shell-output">
+            <div data-slot="shell-output-actions">
+              <IconButton
+                icon={copy.copied ? "check" : "copy"}
+                variant="ghost"
+                onClick={handleCopy}
+                aria-label={copy.copied ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
+                title={copy.copied ? i18n.t("ui.message.copied") : i18n.t("ui.message.copy")}
+              />
+            </div>
+            <Show when={copy.error}>
+              <div data-slot="shell-output-copy-error" role="status" aria-live="polite">
+                Could not copy. Select the command and output and copy it manually.
+              </div>
+            </Show>
+            <div data-component="tool-output" data-scrollable>
+              <pre>
+                <code>{transcript()}</code>
+              </pre>
+            </div>
           </div>
         </Show>
       </BasicTool>
@@ -1150,7 +1717,7 @@ ToolRegistry.register({
     return (
       <Show
         when={isToolDone(props.status) || bodyReady()}
-        fallback={<ToolProgress label={i18n.t("ui.messagePart.title.edit")} subtitle={filename()} />}
+        fallback={<ToolProgress label={i18n.t("ui.tool.running.edit")} subtitle={filename()} />}
       >
         <BasicTool
           {...props}
@@ -1179,9 +1746,7 @@ ToolRegistry.register({
                 </Show>
               </div>
               <div data-slot="message-part-actions">
-                <Show when={props.metadata.filediff}>
-                  <DiffChanges changes={props.metadata.filediff} />
-                </Show>
+                <Show when={toolChanges(props)}>{(changes) => <DiffChanges changes={changes()} />}</Show>
               </div>
             </div>
           }
@@ -1217,42 +1782,16 @@ ToolRegistry.register({
     const diagnostics = createMemo(() => getDiagnostics(props.metadata.diagnostics, props.input.filePath))
     const filename = () => getFilename(props.input.filePath ?? "")
     const canOpen = () => !!(data.openFile && props.input.filePath)
-    const isNotebook = () => (props.input.filePath ?? "").endsWith(".ipynb")
     const bodyReady = () => !!props.input.content
-
-    const notebookCells = createMemo((): NotebookCellProps[] => {
-      if (!isNotebook() || !props.input.content) return []
-      try {
-        const nb = JSON.parse(props.input.content)
-        if (!nb.cells || !Array.isArray(nb.cells)) return []
-        return nb.cells.map((cell: any) => ({
-          cellType: cell.cell_type ?? "code",
-          source: Array.isArray(cell.source) ? cell.source.join("") : (cell.source ?? ""),
-          executionCount: cell.execution_count ?? null,
-          outputs: (cell.outputs ?? []).map((o: any) => {
-            if (o.output_type === "stream")
-              return { type: "stream", name: o.name, text: Array.isArray(o.text) ? o.text.join("") : o.text }
-            if (o.output_type === "execute_result")
-              return { type: "execute_result", data: o.data ?? {}, executionCount: o.execution_count }
-            if (o.output_type === "display_data") return { type: "display_data", data: o.data ?? {} }
-            if (o.output_type === "error")
-              return { type: "error", ename: o.ename, evalue: o.evalue, traceback: o.traceback ?? [] }
-            return { type: "stream", name: "stdout", text: "" }
-          }),
-        }))
-      } catch {
-        return []
-      }
-    })
 
     return (
       <Show
         when={isToolDone(props.status) || bodyReady()}
-        fallback={<ToolProgress label={i18n.t("ui.messagePart.title.write")} subtitle={filename()} />}
+        fallback={<ToolProgress label={i18n.t("ui.tool.running.write")} subtitle={filename()} />}
       >
         <BasicTool
           {...props}
-          icon={isNotebook() ? "code" : "code-lines"}
+          icon="code-lines"
           trigger={
             <div data-component="write-trigger">
               <div data-slot="message-part-title-area">
@@ -1276,31 +1815,24 @@ ToolRegistry.register({
                   </div>
                 </Show>
               </div>
-              <div data-slot="message-part-actions">{/* <DiffChanges diff={diff} /> */}</div>
+              <div data-slot="message-part-actions">
+                <Show when={toolChanges(props)}>{(changes) => <DiffChanges changes={changes()} />}</Show>
+              </div>
             </div>
           }
         >
           <Show when={props.input.content}>
-            <Show
-              when={isNotebook() && notebookCells().length > 0}
-              fallback={
-                <div data-component="write-content">
-                  <Dynamic
-                    component={codeComponent}
-                    file={{
-                      name: props.input.filePath,
-                      contents: props.input.content,
-                      cacheKey: checksum(props.input.content),
-                    }}
-                    overflow="scroll"
-                  />
-                </div>
-              }
-            >
-              <div data-component="write-content">
-                <NotebookView cells={notebookCells()} title={filename()} />
-              </div>
-            </Show>
+            <div data-component="write-content">
+              <Dynamic
+                component={codeComponent}
+                file={{
+                  name: props.input.filePath,
+                  contents: props.input.content,
+                  cacheKey: checksum(props.input.content),
+                }}
+                overflow="scroll"
+              />
+            </div>
           </Show>
           <DiagnosticsDisplay diagnostics={diagnostics()} />
         </BasicTool>
@@ -1337,14 +1869,15 @@ ToolRegistry.register({
     return (
       <Show
         when={isToolDone(props.status) || files().length > 0}
-        fallback={<ToolProgress label={i18n.t("ui.tool.patch")} subtitle={subtitle()} />}
+        fallback={<ToolProgress label={i18n.t("ui.tool.running.patch")} subtitle={subtitle()} />}
       >
         <BasicTool
           {...props}
           icon="code-lines"
           trigger={{
-            title: i18n.t("ui.tool.patch"),
+            title: toolVerb(i18n, "apply_patch", props.status, "ui.tool.patch"),
             subtitle: subtitle(),
+            action: <Show when={toolChanges(props)}>{(changes) => <DiffChanges changes={changes()} />}</Show>,
           }}
         >
           <Show when={files().length > 0}>
@@ -1485,11 +2018,17 @@ ToolRegistry.register({
     const answers = createMemo(() => (props.metadata.answers ?? []) as QuestionAnswer[])
     const completed = createMemo(() => answers().length > 0)
 
+    // One question reads as "Question · <its header>"; several read as
+    // "Questions · 3 questions". Answered, the count of answers follows.
+    const title = createMemo(() =>
+      questions().length === 1 ? i18n.t("ui.tool.question") : i18n.t("ui.tool.questions"),
+    )
     const subtitle = createMemo(() => {
       const count = questions().length
       if (count === 0) return ""
       if (completed()) return i18n.t("ui.question.subtitle.answered", { count })
-      return `${count} ${i18n.t(count > 1 ? "ui.common.question.other" : "ui.common.question.one")}`
+      if (count === 1) return questions()[0]?.header ?? ""
+      return `${count} ${i18n.t("ui.common.question.other")}`
     })
 
     return (
@@ -1498,7 +2037,7 @@ ToolRegistry.register({
         defaultOpen={completed()}
         icon="bubble-5"
         trigger={{
-          title: i18n.t("ui.tool.questions"),
+          title: title(),
           subtitle: subtitle(),
         }}
       >
@@ -1664,7 +2203,7 @@ ToolRegistry.register({
 
 // --- End Colab Plugin Tool Renderers ---
 
-function QuestionPrompt(props: { request: QuestionRequest }) {
+export function QuestionPrompt(props: { request: QuestionRequest }) {
   const data = useData()
   const i18n = useI18n()
   const questions = createMemo(() => props.request.questions)
@@ -1678,6 +2217,15 @@ function QuestionPrompt(props: { request: QuestionRequest }) {
   })
 
   const question = createMemo(() => questions()[store.tab])
+  // A question that asks for a login or token is a credential request: point
+  // at the encrypted store instead of letting a secret land in the chat.
+  const credential = createMemo(
+    () =>
+      !!data.openCredentials &&
+      /\b(credentials?|tokens?|api\s*keys?|log\s*in|login|sign\s*in|gh auth|hf auth|hugging\s*face|github)\b/i.test(
+        `${question()?.header ?? ""} ${question()?.question ?? ""}`,
+      ),
+  )
   const confirm = createMemo(() => !single() && store.tab === questions().length)
   const options = createMemo(() => question()?.options ?? [])
   const input = createMemo(() => store.custom[store.tab] ?? "")
@@ -1804,35 +2352,67 @@ function QuestionPrompt(props: { request: QuestionRequest }) {
             {question()?.question}
             {multi() ? " " + i18n.t("ui.question.multiHint") : ""}
           </div>
-          <div data-slot="question-options">
+          <Show when={credential()}>
+            <div data-slot="question-credential">
+              <span>{i18n.t("ui.question.credentialHint")}</span>
+              <button type="button" onClick={() => data.openCredentials?.()}>
+                {i18n.t("ui.question.openCredentials")}
+              </button>
+            </div>
+          </Show>
+          <div
+            data-slot="question-options"
+            role={multi() ? "group" : "radiogroup"}
+            data-multiple={multi() ? "true" : undefined}
+          >
             <For each={options()}>
               {(opt, i) => {
                 const picked = () => store.answers[store.tab]?.includes(opt.label) ?? false
+                // The model marks its recommendation in the label itself; show
+                // it as a quiet tag and keep the full label as the answer.
+                const recommended = () => /\s*\(recommended\)\s*$/i.test(opt.label)
+                const shown = () => opt.label.replace(/\s*\(recommended\)\s*$/i, "")
                 return (
-                  <button data-slot="question-option" data-picked={picked()} onClick={() => selectOption(i())}>
-                    <span data-slot="option-label">{opt.label}</span>
-                    <Show when={opt.description}>
-                      <span data-slot="option-description">{opt.description}</span>
-                    </Show>
-                    <Show when={picked()}>
-                      <Icon name="check-small" size="normal" />
-                    </Show>
+                  <button
+                    type="button"
+                    data-slot="question-option"
+                    data-picked={picked()}
+                    role={multi() ? "checkbox" : "radio"}
+                    aria-checked={picked()}
+                    onClick={() => selectOption(i())}
+                  >
+                    <span data-slot="option-mark" aria-hidden="true" />
+                    <span data-slot="option-copy">
+                      <span data-slot="option-label">
+                        {shown()}
+                        <Show when={recommended()}>
+                          <span data-slot="option-tag">{i18n.t("ui.question.recommended")}</span>
+                        </Show>
+                      </span>
+                      <Show when={opt.description}>
+                        <span data-slot="option-description">{opt.description}</span>
+                      </Show>
+                    </span>
                   </button>
                 )
               }}
             </For>
             <button
+              type="button"
               data-slot="question-option"
+              data-custom="true"
               data-picked={customPicked()}
+              role={multi() ? "checkbox" : "radio"}
+              aria-checked={customPicked()}
               onClick={() => selectOption(options().length)}
             >
-              <span data-slot="option-label">{i18n.t("ui.messagePart.option.typeOwnAnswer")}</span>
-              <Show when={!store.editing && input()}>
-                <span data-slot="option-description">{input()}</span>
-              </Show>
-              <Show when={customPicked()}>
-                <Icon name="check-small" size="normal" />
-              </Show>
+              <span data-slot="option-mark" aria-hidden="true" />
+              <span data-slot="option-copy">
+                <span data-slot="option-label">{i18n.t("ui.messagePart.option.typeOwnAnswer")}</span>
+                <Show when={!store.editing && input()}>
+                  <span data-slot="option-description">{input()}</span>
+                </Show>
+              </span>
             </button>
             <Show when={store.editing}>
               <form data-slot="custom-input-form" onSubmit={handleCustomSubmit}>
@@ -1881,7 +2461,7 @@ function QuestionPrompt(props: { request: QuestionRequest }) {
       </Show>
 
       <div data-slot="question-actions">
-        <Button variant="ghost" size="small" onClick={reject}>
+        <Button variant="secondary" size="small" onClick={reject}>
           {i18n.t("ui.common.dismiss")}
         </Button>
         <Show when={!single()}>

@@ -4,15 +4,27 @@ import { Log } from "../util/log"
 import { LSPClient } from "./client"
 import path from "path"
 import { pathToFileURL } from "url"
-import { LSPServer } from "./server"
+import { LSPServer, spawnLSPChild, withLSPSandbox } from "./server"
 import z from "zod"
 import { Config } from "../config/config"
-import { spawn } from "child_process"
 import { Instance } from "../project/instance"
 import { Flag } from "@/flag/flag"
+import { OpenScience } from "@/openscience"
+import { ProjectTrust } from "@/project/trust"
+import { CredentialProcessLedger } from "@/credentials/process-ledger"
+import { withTimeout } from "@/util/timeout"
 
 export namespace LSP {
   const log = Log.create({ service: "lsp" })
+  const TOUCH_STARTUP_TIMEOUT_MS = 5_000
+
+  async function completeProcess(id: string) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (await CredentialProcessLedger.complete(id)) return
+      await Bun.sleep(20)
+    }
+    throw new Error(`Language-server process ${id} did not exit after completion`)
+  }
 
   export const Event = {
     Updated: BusEvent.define("lsp.updated", z.object({})),
@@ -80,15 +92,18 @@ export namespace LSP {
     async () => {
       const clients: LSPClient.Info[] = []
       const servers: Record<string, LSPServer.Info> = {}
-      const cfg = await Config.get()
+      const cfg = await Config.getExecution()
 
       if (cfg.lsp === false) {
         log.info("all LSPs are disabled")
         return {
-          broken: new Set<string>(),
+          broken: new Map<string, Status>(),
           servers,
           clients,
           spawning: new Map<string, Promise<LSPClient.Info | undefined>>(),
+          processes: new Set<import("child_process").ChildProcessWithoutNullStreams>(),
+          generation: 0,
+          projectID: Instance.project.id,
         }
       }
 
@@ -105,20 +120,35 @@ export namespace LSP {
           delete servers[name]
           continue
         }
+        const project = await Config.projectControls("lsp", name)
         servers[name] = {
           ...existing,
           id: name,
+          configured: true,
           root: existing?.root ?? (async () => Instance.directory),
           extensions: item.extensions ?? existing?.extensions ?? [],
           spawn: async (root) => {
+            // Language servers need runtime/toolchain discovery, not account,
+            // provider, or cloud credentials. Explicit per-LSP config remains
+            // available for servers that genuinely require custom variables.
+            // Project/global config may use {env:SECRET}; pass only the
+            // credential-free runtime subset needed for toolchain discovery.
+            const env: Record<string, string> = OpenScience.kernelEnv({ ...process.env, ...item.env })
+            const command = item.command[0]
+            const target = path.isAbsolute(command)
+              ? command
+              : command.includes("/") || command.includes("\\")
+                ? path.resolve(root, command)
+                : Bun.which(command, { PATH: env.PATH })
+            const local =
+              target !== null && (Instance.containsPath(target) || (await Instance.containsCanonicalPath(target)))
+            if (project || local) await ProjectTrust.require(Instance.project, "project_lsp")
             return {
-              process: spawn(item.command[0], item.command.slice(1), {
+              process: await spawnLSPChild(item.command[0], item.command.slice(1), {
                 cwd: root,
-                env: {
-                  ...process.env,
-                  ...item.env,
-                },
+                env,
               }),
+              project: project || local,
               initialization: item.initialization,
             }
           },
@@ -132,19 +162,55 @@ export namespace LSP {
       })
 
       return {
-        broken: new Set<string>(),
+        broken: new Map<string, Status>(),
         servers,
         clients,
         spawning: new Map<string, Promise<LSPClient.Info | undefined>>(),
+        processes: new Set<import("child_process").ChildProcessWithoutNullStreams>(),
+        generation: 0,
+        projectID: Instance.project.id,
       }
     },
     async (state) => {
-      await Promise.all(state.clients.map((client) => client.shutdown()))
+      // Revoke while every registered leader is still alive. The durable
+      // ledger snapshots the live PPID descendant closure here, including a
+      // direct child that already moved into its own process group. Killing a
+      // leader first would reparent that child and destroy the only safe link.
+      await CredentialProcessLedger.revoke({ kind: "lsp", projectID: state.projectID })
+      for (const process of state.processes) process.kill()
+      state.processes.clear()
+      const clients = state.clients.splice(0)
+      const results = await Promise.allSettled(clients.map((client) => client.shutdown()))
+      const failures = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []))
+      if (failures.length) log.warn("Language-server client cleanup failed after durable revocation", { failures })
     },
   )
 
   export async function init() {
     return state()
+  }
+
+  /** Stop every language server for the current project. A generation bump
+   * also invalidates servers whose spawn/initialize handshake was in flight
+   * when trust was revoked in this or another server process. */
+  export async function dispose() {
+    const current = await state()
+    current.generation++
+    current.spawning.clear()
+    // Preserve live ancestry until durable revocation has captured and killed
+    // direct setsid/start_new_session descendants.
+    await CredentialProcessLedger.revoke({ kind: "lsp", projectID: current.projectID })
+    const processes = [...current.processes]
+    current.processes.clear()
+    for (const process of processes) process.kill()
+    const clients = current.clients.splice(0)
+    const results = await Promise.allSettled(clients.map((client) => client.shutdown()))
+    const failures = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []))
+    if (failures.length) log.warn("Language-server client cleanup failed after durable revocation", { failures })
+    // An explicit project/config reset permits one fresh startup attempt.
+    // Ordinary file touches and status reads never retry a broken server.
+    current.broken.clear()
+    await Bus.publish(Event.Updated, {})
   }
 
   export const Status = z
@@ -161,7 +227,7 @@ export namespace LSP {
 
   export async function status() {
     return state().then((x) => {
-      const result: Status[] = []
+      const result: Status[] = [...x.broken.values()]
       for (const client of x.clients) {
         result.push({
           id: client.serverID,
@@ -179,28 +245,109 @@ export namespace LSP {
     const extension = path.parse(file).ext || file
     const result: LSPClient.Info[] = []
 
+    async function active(client: LSPClient.Info) {
+      try {
+        await ProjectTrust.require(Instance.project, "project_lsp")
+        return true
+      } catch (error) {
+        if (!ProjectTrust.DeniedError.isInstance(error)) throw error
+        const index = s.clients.indexOf(client)
+        if (index !== -1) s.clients.splice(index, 1)
+        await client.shutdown()
+        return false
+      }
+    }
+
     async function schedule(server: LSPServer.Info, root: string, key: string) {
-      const handle = await server
-        .spawn(root)
-        .then((value) => {
-          if (!value) s.broken.add(key)
+      const generation = s.generation
+      async function failed() {
+        if (generation !== s.generation) return
+        // Do not expose command lines, environment values, stderr, or raw
+        // exceptions through the public status response.
+        s.broken.set(key, {
+          id: server.id,
+          name: server.id,
+          root: path.relative(Instance.directory, root),
+          status: "error",
+        })
+        await Bus.publish(Event.Updated, {})
+      }
+      // Even a globally installed LSP can execute project-owned config,
+      // plugins, hooks, or code merely by starting in the project root.
+      // Binary location is therefore not a safe trust classifier.
+      const policy = await Config.trustedSandbox()
+      const handle = await ProjectTrust.require(Instance.project, "project_lsp")
+        .then(() =>
+          withLSPSandbox(
+            {
+              root,
+              options: policy,
+              readable: server.readable,
+              allowArgumentReadDirectories: server.configured !== true,
+              async register(process, windowsRelease) {
+                if (!process.pid) throw new Error("Language server started without a process id")
+                const id = `lsp-${crypto.randomUUID()}`
+                const registered = await CredentialProcessLedger.register({
+                  id,
+                  kind: "lsp",
+                  pid: process.pid,
+                  detached: globalThis.process.platform !== "win32",
+                  projectID: s.projectID,
+                  windowsRelease,
+                })
+                if (!registered) {
+                  throw new Error("Language server exited before durable process-group ownership was established")
+                }
+                s.processes.add(process)
+                let completed = false
+                return () => {
+                  if (completed) return
+                  completed = true
+                  s.processes.delete(process)
+                  void completeProcess(id).catch((error) =>
+                    log.error("Failed to complete durable language-server ownership", { error, id }),
+                  )
+                }
+              },
+            },
+            () => server.spawn(root),
+          ),
+        )
+        .then(async (value) => {
+          if (!value) await failed()
           return value
         })
-        .catch((err) => {
-          s.broken.add(key)
+        .catch(async (err) => {
+          if (ProjectTrust.DeniedError.isInstance(err)) {
+            log.warn(`Project trust denied LSP server ${server.id}`, { error: err })
+            return undefined
+          }
+          await failed()
           log.error(`Failed to spawn LSP server ${server.id}`, { error: err })
           return undefined
         })
 
       if (!handle) return undefined
+      handle.project = true
+      if (generation !== s.generation) {
+        handle.process.kill()
+        return undefined
+      }
+      try {
+        await ProjectTrust.require(Instance.project, "project_lsp")
+      } catch (error) {
+        handle.process.kill()
+        if (ProjectTrust.DeniedError.isInstance(error)) return undefined
+        throw error
+      }
       log.info("spawned lsp server", { serverID: server.id })
 
       const client = await LSPClient.create({
         serverID: server.id,
         server: handle,
         root,
-      }).catch((err) => {
-        s.broken.add(key)
+      }).catch(async (err) => {
+        await failed()
         handle.process.kill()
         log.error(`Failed to initialize LSP client ${server.id}`, { error: err })
         return undefined
@@ -210,6 +357,12 @@ export namespace LSP {
         handle.process.kill()
         return undefined
       }
+
+      if (generation !== s.generation) {
+        await client.shutdown()
+        return undefined
+      }
+      if (!(await active(client))) return undefined
 
       const existing = s.clients.find((x) => x.root === root && x.serverID === server.id)
       if (existing) {
@@ -230,6 +383,7 @@ export namespace LSP {
 
       const match = s.clients.find((x) => x.root === root && x.serverID === server.id)
       if (match) {
+        if (!(await active(match))) continue
         result.push(match)
         continue
       }
@@ -238,6 +392,7 @@ export namespace LSP {
       if (inflight) {
         const client = await inflight
         if (!client) continue
+        if (!(await active(client))) continue
         result.push(client)
         continue
       }
@@ -274,9 +429,23 @@ export namespace LSP {
     return false
   }
 
-  export async function touchFile(input: string, waitForDiagnostics?: boolean) {
+  export async function touchFile(
+    input: string,
+    waitForDiagnostics?: boolean,
+    options?: { startupTimeoutMs?: number },
+  ) {
     log.info("touching file", { file: input })
-    const clients = await getClients(input)
+    // File reads and writes are the primary operation; installing or starting
+    // an optional language server is not. In particular, a stalled release
+    // download must never leave an already-committed edit permanently
+    // "running". The spawn continues in the shared LSP state and later calls
+    // can use it, while this notification settles promptly without diagnostics.
+    const clients = await withTimeout(getClients(input), options?.startupTimeoutMs ?? TOUCH_STARTUP_TIMEOUT_MS).catch(
+      (err) => {
+        log.warn("language server was not ready before file notification timeout", { err, file: input })
+        return [] as LSPClient.Info[]
+      },
+    )
     await Promise.all(
       clients.map(async (client) => {
         const wait = waitForDiagnostics ? client.waitForDiagnostics({ path: input }) : Promise.resolve()

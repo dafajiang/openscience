@@ -1,16 +1,19 @@
 import fs from "fs/promises"
 import path from "path"
-import { Global } from "../global"
 import { Identifier } from "../id/id"
 import { PermissionNext } from "../permission/next"
 import type { Agent } from "../agent/agent"
 import { Scheduler } from "../scheduler"
+import { SessionFilesystem } from "../session/filesystem"
+import { ToolOutputPath } from "./tool-output-path"
+import { HarnessState } from "@/harness/state"
+import { Config } from "@/config/config"
 
 export namespace Truncate {
   export const MAX_LINES = 2000
   export const MAX_BYTES = 50 * 1024
-  export const DIR = path.join(Global.Path.data, "tool-output")
-  export const GLOB = path.join(DIR, "*")
+  export const DIR = ToolOutputPath.root
+  export const GLOB = ToolOutputPath.glob
   const RETENTION_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
   const HOUR_MS = 60 * 60 * 1000
 
@@ -20,6 +23,7 @@ export namespace Truncate {
     maxLines?: number
     maxBytes?: number
     direction?: "head" | "tail"
+    sessionID?: string
   }
 
   export function init() {
@@ -32,12 +36,14 @@ export namespace Truncate {
   }
 
   export async function cleanup() {
-    const cutoff = Identifier.timestamp(Identifier.create("tool", false, Date.now() - RETENTION_MS))
+    const cutoff = Date.now() - RETENTION_MS
     const glob = new Bun.Glob("tool_*")
     const entries = await Array.fromAsync(glob.scan({ cwd: DIR, onlyFiles: true })).catch(() => [] as string[])
     for (const entry of entries) {
-      if (Identifier.timestamp(entry) >= cutoff) continue
-      await fs.unlink(path.join(DIR, entry)).catch(() => {})
+      const file = path.join(DIR, entry)
+      const stat = await fs.stat(file).catch(() => undefined)
+      if (!stat || stat.mtimeMs >= cutoff) continue
+      await fs.unlink(file).catch(() => {})
     }
   }
 
@@ -45,6 +51,38 @@ export namespace Truncate {
     if (!agent?.permission) return false
     const rule = PermissionNext.evaluate("task", "*", agent.permission)
     return rule.action !== "deny"
+  }
+
+  /** A fresh owned output path; the file is created by whoever writes it. */
+  export function file(): string {
+    return path.join(DIR, Identifier.ascending("tool"))
+  }
+
+  /** Offer Task only when this session can actually delegate this turn; a
+   * hint the model cannot follow costs a wasted call. */
+  export function hint(filepath: string, agent?: Agent.Info, delegation = true): string {
+    return hasTaskTool(agent) && delegation
+      ? `The tool call succeeded but the output was truncated. Full output saved to: ${filepath}\nUse the Task tool to have the explore agent process this file with Grep and Read (with offset/limit), or use Grep and Read with offset/limit yourself for a targeted look.`
+      : `The tool call succeeded but the output was truncated. Full output saved to: ${filepath}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
+  }
+
+  /** The model-facing text for a truncated result: the kept preview, what was
+   * left out, and where the full output lives. */
+  export function message(
+    input: { preview: string; removed: number; unit: "bytes" | "lines"; filepath: string; direction?: "head" | "tail" },
+    agent?: Agent.Info,
+    delegation = true,
+  ): string {
+    const note = `...${input.removed} ${input.unit} truncated...`
+    const guidance = hint(input.filepath, agent, delegation)
+    return (input.direction ?? "head") === "head"
+      ? `${input.preview}\n\n${note}\n\n${guidance}`
+      : `${note}\n\n${guidance}\n\n${input.preview}`
+  }
+
+  export async function grant(filepath: string, sessionID?: string): Promise<void> {
+    if (!sessionID?.startsWith("ses_")) return
+    await SessionFilesystem.grantToolOutput({ sessionID, path: filepath })
   }
 
   export async function output(text: string, options: Options = {}, agent?: Agent.Info): Promise<Result> {
@@ -89,18 +127,18 @@ export namespace Truncate {
     const unit = hitBytes ? "bytes" : "lines"
     const preview = out.join("\n")
 
-    const id = Identifier.ascending("tool")
-    const filepath = path.join(DIR, id)
+    const filepath = file()
     await Bun.write(Bun.file(filepath), text)
+    await grant(filepath, options.sessionID)
 
-    const hint = hasTaskTool(agent)
-      ? `The tool call succeeded but the output was truncated. Full output saved to: ${filepath}\nUse the Task tool to have explore agent process this file with Grep and Read (with offset/limit). Do NOT read the full file yourself - delegate to save context.`
-      : `The tool call succeeded but the output was truncated. Full output saved to: ${filepath}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
-    const message =
-      direction === "head"
-        ? `${preview}\n\n...${removed} ${unit} truncated...\n\n${hint}`
-        : `...${removed} ${unit} truncated...\n\n${hint}\n\n${preview}`
-
-    return { content: message, truncated: true, outputPath: filepath }
+    // Tool output can be truncated outside a project instance (tests, CLI
+    // helpers); the hint then keeps its default form.
+    const config = await Config.get().catch(() => undefined)
+    const delegation = config ? HarnessState.delegates(config, options.sessionID) : true
+    return {
+      content: message({ preview, removed, unit, filepath, direction }, agent, delegation),
+      truncated: true,
+      outputPath: filepath,
+    }
   }
 }

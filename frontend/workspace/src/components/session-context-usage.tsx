@@ -3,15 +3,22 @@ import { Tooltip } from "@synsci/ui/tooltip"
 import { ProgressCircle } from "@synsci/ui/progress-circle"
 import { Button } from "@synsci/ui/button"
 import { useParams } from "@solidjs/router"
-import { AssistantMessage } from "@synsci/sdk/v2/client"
+import { AssistantMessage, type UserMessage } from "@synsci/sdk/v2/client"
 import { findLast } from "@synsci/util/array"
+import { Dialog } from "@synsci/ui/dialog"
+import { useDialog } from "@synsci/ui/context/dialog"
 
 import { useLayout } from "@/context/layout"
 import { useSync } from "@/context/sync"
 import { useLanguage } from "@/context/language"
+import { SessionContextTab } from "@/components/session/session-context-tab"
+import { compactContextTokens, formatContextTokens, usageSample, type ContextSample } from "@/pages/session-context"
 
 interface SessionContextUsageProps {
-  variant?: "button" | "indicator"
+  variant?: "button" | "indicator" | "header"
+  // Resolved sample from the page that subscribes to `session.context`; without one the
+  // component falls back to the newest provider-reported usage.
+  sample?: ContextSample
 }
 
 export function SessionContextUsage(props: SessionContextUsageProps) {
@@ -19,11 +26,15 @@ export function SessionContextUsage(props: SessionContextUsageProps) {
   const params = useParams()
   const layout = useLayout()
   const language = useLanguage()
+  const dialog = useDialog()
 
   const variant = createMemo(() => props.variant ?? "button")
   const sessionKey = createMemo(() => `${params.dir}${params.id ? "/" + params.id : ""}`)
-  const tabs = createMemo(() => layout.tabs(sessionKey))
+  const view = layout.view(sessionKey)
   const messages = createMemo(() => (params.id ? (sync.data.message[params.id] ?? []) : []))
+  const visibleUserMessages = createMemo(() =>
+    messages().filter((message): message is UserMessage => message.role === "user"),
+  )
 
   const usd = createMemo(
     () =>
@@ -33,34 +44,55 @@ export function SessionContextUsage(props: SessionContextUsageProps) {
       }),
   )
 
+  // The lead's own provider cost plus what its delegated workers spent. Each
+  // Task result carries the child turn's usage, so the readout is the whole
+  // run rather than only the messages in this session.
+  const workerCost = createMemo(() =>
+    messages().reduce((sum, message) => {
+      if (message.role !== "assistant") return sum
+      return (sync.data.part[message.id] ?? []).reduce((inner, part) => {
+        if (part.type !== "tool" || part.tool !== "task" || part.state.status !== "completed") return inner
+        const usage = (part.state.metadata as { usage?: { cost?: unknown } } | undefined)?.usage
+        return inner + (typeof usage?.cost === "number" ? usage.cost : 0)
+      }, sum)
+    }, 0),
+  )
   const cost = createMemo(() => {
-    const total = messages().reduce((sum, x) => sum + (x.role === "assistant" ? x.cost : 0), 0)
-    return usd().format(total)
+    const lead = messages().reduce((sum, x) => sum + (x.role === "assistant" ? x.cost : 0), 0)
+    return usd().format(lead + workerCost())
   })
 
   const context = createMemo(() => {
     const locale = language.locale()
-    const last = findLast(messages(), (x) => {
-      if (x.role !== "assistant") return false
-      const total = x.tokens.input + x.tokens.output + x.tokens.reasoning + x.tokens.cache.read + x.tokens.cache.write
-      return total > 0
-    }) as AssistantMessage
-    if (!last) return
-    const total =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
-    const model = sync.data.provider.all.find((x) => x.id === last.providerID)?.models[last.modelID]
+    const sample = props.sample ?? usageSample(messages())
+    if (!sample) return
+    // A compaction summary runs on the compaction agent's model; size the window by the
+    // model the conversation itself uses.
+    const last = findLast(messages(), (x) => x.role === "assistant" && !x.summary) as AssistantMessage | undefined
+    const model = last ? sync.data.provider.all.find((x) => x.id === last.providerID)?.models[last.modelID] : undefined
     return {
-      tokens: total.toLocaleString(locale),
-      percentage: model?.limit.context ? Math.round((total / model.limit.context) * 100) : null,
+      tokens: formatContextTokens(sample.total, locale),
+      compact: compactContextTokens(sample.total, locale),
+      percentage: model?.limit.context ? Math.round((sample.total / model.limit.context) * 100) : null,
+      estimate: sample.source === "estimate",
     }
   })
 
   const openContext = () => {
     if (!params.id) return
-    layout.fileTree.open()
-    layout.fileTree.setTab("all")
-    tabs().open("context")
-    tabs().setActive("context")
+    dialog.show(() => (
+      <Dialog title={language.t("session.tab.context")} size="large" transition>
+        <div style={{ width: "min(760px, 82vw)", height: "min(680px, 75vh)", overflow: "hidden" }}>
+          <SessionContextTab
+            composition={props.sample?.composition}
+            messages={messages}
+            visibleUserMessages={visibleUserMessages}
+            view={() => view}
+            info={() => (params.id ? sync.session.get(params.id) : undefined)}
+          />
+        </div>
+      </Dialog>
+    ))
   }
 
   const circle = () => (
@@ -82,6 +114,9 @@ export function SessionContextUsage(props: SessionContextUsageProps) {
               <span class="text-text-invert-strong">{ctx().percentage ?? 0}%</span>
               <span class="text-text-invert-base">{language.t("context.usage.usage")}</span>
             </div>
+            <Show when={ctx().estimate}>
+              <div class="text-text-invert-base">{language.t("context.usage.estimate")}</div>
+            </Show>
           </>
         )}
       </Show>
@@ -89,6 +124,11 @@ export function SessionContextUsage(props: SessionContextUsageProps) {
         <span class="text-text-invert-strong">{cost()}</span>
         <span class="text-text-invert-base">{language.t("context.usage.cost")}</span>
       </div>
+      <Show when={workerCost() > 0}>
+        <div class="text-text-invert-base">
+          {language.t("context.usage.workerCost", { cost: usd().format(workerCost()) })}
+        </div>
+      </Show>
     </div>
   )
 
@@ -97,6 +137,25 @@ export function SessionContextUsage(props: SessionContextUsageProps) {
       <Tooltip value={tooltipValue()} placement="top">
         <Switch>
           <Match when={variant() === "indicator"}>{circle()}</Match>
+          <Match when={variant() === "header"}>
+            <Show when={context()}>
+              {(ctx) => (
+                <button
+                  type="button"
+                  class="workspace-header__context"
+                  data-estimate={ctx().estimate ? "true" : undefined}
+                  onClick={openContext}
+                  aria-label={`${ctx().tokens} ${language.t("context.usage.tokens")}. ${language.t("context.usage.view")}`}
+                >
+                  <ProgressCircle size={14} strokeWidth={2} percentage={ctx().percentage ?? 0} />
+                  <span class="workspace-header__context-tokens">{ctx().compact}</span>
+                  <Show when={ctx().percentage !== null}>
+                    <span class="workspace-header__context-percent">{ctx().percentage}%</span>
+                  </Show>
+                </button>
+              )}
+            </Show>
+          </Match>
           <Match when={true}>
             <Button
               type="button"

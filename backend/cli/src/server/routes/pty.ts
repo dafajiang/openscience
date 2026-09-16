@@ -5,7 +5,7 @@ import z from "zod"
 import { Pty } from "@/pty"
 import { Storage } from "../../storage/storage"
 import { errors } from "../error"
-import { lazy } from "../../util/lazy"
+import { lazy } from "@synsci/util/lazy"
 
 export const PtyRoutes = lazy(() =>
   new Hono()
@@ -152,7 +152,7 @@ export const PtyRoutes = lazy(() =>
       upgradeWebSocket((c) => {
         const id = c.req.param("ptyID")
         let handler: ReturnType<typeof Pty.connect>
-        if (!Pty.get(id)) throw new Error("Session not found")
+        if (!id || !Pty.get(id)) throw new Error("Session not found")
         return {
           onOpen(_event, ws) {
             handler = Pty.connect(id, ws)

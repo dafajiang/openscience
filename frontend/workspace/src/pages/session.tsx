@@ -1,3 +1,4 @@
+import { delegatedAssignment } from "./session-delegation"
 import {
   createEffect,
   createMemo,
@@ -8,35 +9,36 @@ import {
   onCleanup,
   onMount,
   Show,
-  Suspense,
   Switch,
   type JSX,
 } from "solid-js"
-import { useNavigate, useParams } from "@solidjs/router"
+import { useLocation, useNavigate, useParams } from "@solidjs/router"
+import { createMediaQuery } from "@solid-primitives/media"
 import { SessionTurn } from "@synsci/ui/session-turn"
+import { isContinuationCarrier } from "@synsci/ui/session-turn-carrier"
 import { createAutoScroll } from "@synsci/ui/hooks"
 import { useSync } from "@/context/sync"
 import { useSDK } from "@/context/sdk"
 import { useLayout } from "@/context/layout"
-import { useTheme } from "@synsci/ui/theme"
+import { usePrompt } from "@/context/prompt"
+import { useServer } from "@/context/server"
+import { usePlatform } from "@/context/platform"
+import { useTerminal } from "@/context/terminal"
 import { PromptInput } from "@/components/prompt-input"
-import { NewSessionView } from "@/components/session/session-new-view"
 import { AsciiSpinner } from "@/atlas/shared/AsciiSpinner"
-import { Wordmark } from "@/atlas/Wordmark"
-import { AppHeader, HeaderIconButton, HeaderDivider } from "@/atlas/AppHeader"
-import { RightPane } from "@/atlas/RightPane"
-import { FileExplorer } from "@/atlas/FileExplorer"
-import { FileView } from "@/atlas/FilePreview"
-import SkillsPage from "@/atlas/SkillsPage"
-import { centerTabs } from "@/atlas/store/centerTabs"
-import { FONT_MONO, FONT_SANS } from "@/styles/tokens"
+import { PaneResizer } from "@/atlas/PaneResizer"
+import { AppHeader } from "@/atlas/AppHeader"
+import { FONT_SANS } from "@/styles/tokens"
 import { uiStore } from "@/atlas/store/ui"
 import { useGlobalKeys } from "@/atlas/useGlobalKeys"
 import { useDialog } from "@synsci/ui/context/dialog"
+import { DropdownMenu } from "@synsci/ui/dropdown-menu"
 import { useCommand, type CommandOption } from "@/context/command"
 import { useLanguage } from "@/context/language"
+import { useSettings } from "@/context/settings"
 import { confirmDialog } from "@/atlas/dialogs"
 import { DialogSettings } from "@/components/dialog-settings"
+import { SessionSidebarActions, SidebarAction, type SessionContext } from "@/pages/session-sidebar-action"
 import { DisconnectedPanel } from "@/atlas/DisconnectedPanel"
 import { CommandPalette } from "@/atlas/CommandPalette"
 import { HelpOverlay } from "@/atlas/HelpOverlay"
@@ -44,88 +46,304 @@ import { ToastContainer } from "@/atlas/Toast"
 import {
   IconChevronDown,
   IconChevronLeft,
+  IconChevronRight,
+  IconHome,
   IconPlus,
   IconSearch,
-  IconBookOpen,
   IconSettings,
-  IconSun,
-  IconMoon,
   IconMessageSquare,
-  IconFolderTree,
-  IconFile,
-  IconBrain,
+  IconMoreH,
+  IconPin,
+  IconPinFilled,
+  IconArchive,
+  IconShield,
+  IconSplit,
+  IconRefresh,
   IconX,
 } from "@/atlas/shared/Icon"
 import { StatusDot } from "@/atlas/shared/StatusDot"
-import { DateTime } from "luxon"
 import { IconTrash } from "@/atlas/shared/Icon"
 import { toast } from "@/atlas/Toast"
+import { createSessionTabs } from "@/atlas/store/sessionTabs"
+import { terminalEndpointAvailable } from "@/atlas/terminal-endpoint"
+import { productPreferences, type ProductPreferences } from "@/context/product-preferences"
+import { SIDEBAR_WIDTH, clampSidebarWidth } from "@/pages/session-sidebar-size"
+import { URLS } from "@/config/urls"
+import { SessionTabStrip, sessionTabID, type SessionTabItem } from "@/pages/session-tabs"
+import { sessionUnavailable } from "@/pages/session-availability"
+import { publicContextAvailable, sanitizePublicContexts } from "@/pages/public-contexts"
+import { useExecutionAuthority } from "@/atlas/use-execution-authority"
+import { sessionEntryTarget } from "@/pages/session-entry"
+import { shouldConfirmUndo, undoPreview, undoSummary, type UndoPreview } from "@/pages/session-undo"
+import { SessionContextUsage } from "@/components/session-context-usage"
+import { createTraceExpansion } from "@/pages/session-trace"
+import { estimate, latestContext, type ContextEstimate, type ContextSample } from "@/pages/session-context"
+import "./session-header.css"
+import "./session-undo.css"
+import "./session-empty.css"
+import "../components/chat-surface.css"
 
 type SyncSession = ReturnType<typeof useSync>["data"]["session"][number]
+type RevertInfo = NonNullable<SyncSession["revert"]> & { turns?: number; files?: string[] }
+
+function requestError(error: unknown) {
+  if (error && typeof error === "object" && "data" in error) {
+    const data = (error as { data?: { message?: string } }).data
+    if (data?.message) return data.message
+  }
+  if (error instanceof Error) return error.message
+  return String(error)
+}
 
 /**
  * Session page — new visual identity (Synthetic Sciences wordmark + sessions
- * sidebar + chat + canvas/agents/skills/files right pane) wrapping the
- * unchanged openscience backend chat (SessionTurn rendering, PromptInput, real
- * SSE streaming, sub-task delegation, tool calls, TODOs, diff cards).
+ * sidebar + conversation workspace + contextual files and research pane) wrapping
+ * the unchanged openscience backend chat (SessionTurn rendering, PromptInput,
+ * real SSE streaming, sub-task delegation, tool calls, TODOs, diff cards).
  */
+const sessionSidebarKey = "openscience-session-sidebar-v1"
+const sessionSidebarWidthKey = "openscience-session-sidebar-width-v1"
+
+function readSessionSidebar() {
+  if (typeof localStorage === "undefined") return false
+  try {
+    return localStorage.getItem(sessionSidebarKey) === "collapsed"
+  } catch {
+    return false
+  }
+}
+
+function writeSessionSidebar(collapsed: boolean) {
+  try {
+    localStorage.setItem(sessionSidebarKey, collapsed ? "collapsed" : "expanded")
+  } catch {}
+}
+
+function readSessionSidebarWidth() {
+  if (typeof localStorage === "undefined") return SIDEBAR_WIDTH.initial
+  try {
+    const value = Number.parseFloat(localStorage.getItem(sessionSidebarWidthKey) ?? "")
+    return Number.isFinite(value) ? clampSidebarWidth(value) : SIDEBAR_WIDTH.initial
+  } catch {
+    return SIDEBAR_WIDTH.initial
+  }
+}
+
+function writeSessionSidebarWidth(width: number) {
+  try {
+    localStorage.setItem(sessionSidebarWidthKey, clampSidebarWidth(width).toString())
+  } catch {}
+}
+
 export default function Page(): JSX.Element {
   const params = useParams()
+  const location = useLocation()
   const navigate = useNavigate()
   const sync = useSync()
   const sdk = useSDK()
   const layout = useLayout()
-  const theme = useTheme()
+  const prompt = usePrompt()
+  const terminal = useTerminal()
+  const server = useServer()
+  const platform = usePlatform()
+  const settings = useSettings()
   const dialog = useDialog()
   const [creating, setCreating] = createSignal(false)
+  const pending: { value?: Promise<string | undefined>; context?: SessionContext } = {}
+  const [mobileSessionsOpen, setMobileSessionsOpen] = createSignal(false)
+  const [undoOperation, setUndoOperation] = createSignal<
+    { type: "confirm" | "undo"; messageID: string } | { type: "restore" } | undefined
+  >()
+  const [sessionsCollapsed, setSessionsCollapsed] = createSignal(readSessionSidebar())
+  const [sessionsWidth, setSessionsWidth] = createSignal(readSessionSidebarWidth())
+  const [sessionListReady, setSessionListReady] = createSignal<string>()
+  const sessionTabs = createSessionTabs()
+  const hydration = new Map<string, Promise<void>>()
+  const prewarmed = new Set<string>()
+  // A transcript that failed to load must say so instead of posing as a new,
+  // empty conversation.
+  const [loadFailure, setLoadFailure] = createSignal<{ id: string; message: string }>()
 
-  async function newSession() {
-    if (creating()) return
-    setCreating(true)
-    try {
-      const res: any = await sdk.client.session.create({
-        directory: sync.project?.worktree ?? sync.data.path.directory,
-      } as any)
-      const data = res?.data ?? res
-      const id = data?.id ?? data?.sessionID
-      if (id) {
-        navigate(`/${params.dir}/session/${id}`)
-      } else {
-        navigate(`/${params.dir}/session/new`)
-      }
-    } catch {
-      navigate(`/${params.dir}/session/new`)
-    } finally {
-      setCreating(false)
+  const hydrateSession = (id: string) => {
+    const pending = hydration.get(id)
+    if (pending) return pending
+    // The global event stream cannot replay parts emitted while this route was
+    // inactive. Reconcile the active transcript once on every route entry;
+    // ordinary/background sync calls retain their cache fast path.
+    const request = sync.session.sync(id, { refresh: true }).finally(() => hydration.delete(id))
+    hydration.set(id, request)
+    return request
+  }
+
+  const discardUnavailableSession = (id: string, error: unknown) => {
+    if (!sessionUnavailable(error)) return false
+    prewarmed.delete(id)
+    const target = sessionTabs.close(id)
+    if (params.id === id) {
+      toast.error("Session is no longer available")
+      navigate(target ? `/${params.dir}/session/${target}` : `/${params.dir}/session/new`, { replace: true })
     }
+    return true
+  }
+
+  createEffect(
+    on(
+      () => server.url,
+      (url) => {
+        productPreferences.sync({ show_trace: false, atlas_enabled: false, show_local_models: true })
+        if (!url) return
+        const endpoint = `${url.replace(/\/$/, "")}/settings/preferences`
+        void (platform.fetch ?? fetch)(endpoint)
+          .then((response) => (response.ok ? response.json() : Promise.reject(new Error("Preferences unavailable"))))
+          .then((preferences: ProductPreferences) => productPreferences.sync(preferences))
+          .catch(() => productPreferences.sync({ show_trace: false, atlas_enabled: false, show_local_models: true }))
+      },
+    ),
+  )
+
+  createEffect(on(uiStore.scope, () => sanitizePublicContexts(uiStore)))
+
+  function newSession() {
+    if (params.id === "new") {
+      prompt.reset()
+      return
+    }
+    navigate(`/${params.dir}/session/new`)
+  }
+
+  async function ensureSession() {
+    if (!params.id) return
+    if (params.id !== "new") return params.id
+    const context = uiStore.context()
+    if (context === "terminal") {
+      pending.context = context as SessionContext
+    }
+    if (pending.value) return pending.value
+    setCreating(true)
+    const task = sdk.client.session
+      .create()
+      .then((res) => {
+        const data = res.data
+        const id = data?.id
+        if (!id) return
+        const context = pending.context
+        if (context) {
+          uiStore.activateScope(sdk.scope, id)
+          uiStore.openContext(context)
+        }
+        navigate(`/${params.dir}/session/${id}`)
+        return id
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        pending.value = undefined
+        pending.context = undefined
+        setCreating(false)
+      })
+    pending.value = task
+    return task
+  }
+
+  const openContext = (context: SessionContext) => {
+    if (!publicContextAvailable(context)) return
+    uiStore.openContext(context)
+    if (context !== "terminal") return
+    void ensureSession()
   }
 
   async function deleteSession(sessionID: string) {
+    const ok = await confirmDialog(dialog, {
+      title: "Delete this session?",
+      message: "This removes the conversation and its session workspace. Saved Results stay available.",
+      confirmLabel: "Delete session",
+      danger: true,
+    })
+    if (!ok) return
     // Capture the next-active id BEFORE the optimistic splice so we
     // know where to navigate.
     const active = params.id === sessionID
     const next = sessions().find((s) => s.id !== sessionID)?.id
     try {
       await sync.session.delete(sessionID)
-      toast.info("session deleted")
+      const open = sessionTabs.close(sessionID)
+      toast.info("Session deleted")
       if (active) {
-        navigate(next ? `/${params.dir}/session/${next}` : `/${params.dir}/session/new`)
+        const target = open ?? next
+        navigate(target ? `/${params.dir}/session/${target}` : `/${params.dir}/session/new`)
       }
-    } catch (e: any) {
-      console.error("session.delete failed", e)
-      toast.error("could not delete", e?.message ?? String(e))
+    } catch (error: unknown) {
+      console.error("session.delete failed", error)
+      toast.error("Could not delete session", error instanceof Error ? error.message : String(error))
     }
   }
 
-  async function renameSession(sessionID: string, title: string) {
+  async function renameSession(sessionID: string, title: string): Promise<boolean> {
     const trimmed = title.trim()
-    if (!trimmed) return
+    if (!trimmed) return false
     try {
       await sync.session.rename(sessionID, trimmed)
-    } catch (e: any) {
-      console.error("session.rename failed", e)
-      toast.error("could not rename", e?.message ?? String(e))
+      return true
+    } catch (error: unknown) {
+      console.error("session.rename failed", error)
+      toast.error("Could not rename session", error instanceof Error ? error.message : String(error))
+      return false
     }
+  }
+
+  async function pinSession(sessionID: string, pinned: boolean) {
+    await sync.session.pin(sessionID, pinned).catch((error: unknown) => {
+      toast.error("Could not update pin", error instanceof Error ? error.message : String(error))
+    })
+  }
+
+  async function archiveSession(sessionID: string) {
+    const active = params.id === sessionID
+    const next = sessions().find((session) => session.id !== sessionID)?.id
+    try {
+      await sync.session.archive(sessionID)
+      await sync.session.fetch(50)
+      const open = sessionTabs.close(sessionID)
+      toast.success("Session archived", "Archived sessions remain available from project search.")
+      if (!active) return
+      const target = open ?? next
+      navigate(target ? `/${params.dir}/session/${target}` : `/${params.dir}/session/new`)
+    } catch (error: unknown) {
+      console.error("session.archive failed", error)
+      toast.error("Could not archive session", error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  async function restoreSession(sessionID: string) {
+    try {
+      await sdk.client.session.update({ sessionID, time: { archived: 0 } })
+      await sync.session.fetch(50)
+      toast.success("Session restored")
+    } catch (error: unknown) {
+      console.error("session.restore failed", error)
+      toast.error("Could not restore session", error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  async function forkSession(messageID?: string) {
+    const sessionID = params.id
+    if (!sessionID || sessionID === "new") return
+    try {
+      const forked = await sdk.client.session.fork({ sessionID, messageID }).then((response) => response.data)
+      if (!forked?.id) throw new Error("The new session was not returned by the server.")
+      await sync.session.fetch(1)
+      sessionTabs.open(forked.id)
+      navigate(`/${params.dir}/session/${forked.id}`)
+      toast.success("Session forked", "Continue independently from the selected turn.")
+    } catch (error: unknown) {
+      console.error("session.fork failed", error)
+      toast.error("Could not fork session", error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  function toggleSessions() {
+    const next = !sessionsCollapsed()
+    setSessionsCollapsed(next)
+    writeSessionSidebar(next)
   }
 
   // Force-load the session list into the sync store every time we land
@@ -136,14 +354,28 @@ export default function Page(): JSX.Element {
     on(
       () => params.dir,
       () => {
+        const scope = sdk.scope
+        setSessionListReady(undefined)
         ;(async () => {
           try {
             await sync.session.fetch(50)
+            if (sdk.scope === scope) setSessionListReady(scope)
           } catch {}
         })()
       },
     ),
   )
+
+  // A bare /<project>/session route means "resume this project", not "start
+  // new research". Wait for the project session list before resolving so a
+  // cold load cannot briefly manufacture and activate a blank session.
+  createEffect(() => {
+    if (params.id !== undefined) return
+    const scope = sdk.scope
+    if (sessionListReady() !== scope) return
+    const target = sessionEntryTarget(sync.data.session, sessionTabs.active())
+    navigate(`/${params.dir}/session/${target}${location.search}${location.hash}`, { replace: true })
+  })
 
   // When the active session id changes, hydrate that session's messages
   // (and parts) into the store. Without this the chat panel shows blank
@@ -154,10 +386,14 @@ export default function Page(): JSX.Element {
       () => params.id,
       (id) => {
         if (!id || id === "new") return
+        setLoadFailure(undefined)
         ;(async () => {
           try {
-            await sync.session.sync(id)
-          } catch {}
+            await hydrateSession(id)
+          } catch (error) {
+            if (discardUnavailableSession(id, error)) return
+            setLoadFailure({ id, message: error instanceof Error ? error.message : String(error) })
+          }
         })()
       },
     ),
@@ -179,19 +415,106 @@ export default function Page(): JSX.Element {
 
   const project = createMemo(() => sync.project)
   const projectName = () => {
+    const configured = project()?.name?.trim()
+    if (configured) return configured
     const p = projectPath()
     const segs = p.split("/").filter(Boolean)
     return segs[segs.length - 1] ?? p
   }
-  const projectPath = () => project()?.worktree ?? sdk.directory
-
+  const projectPath = () => sdk.directory
   const sessions = createMemo<SyncSession[]>(() =>
-    [...sync.data.session].filter((s) => !s.parentID).sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0)),
+    [...sync.data.session]
+      .filter((s) => !s.parentID && !s.time?.archived)
+      .sort(
+        (a, b) =>
+          Number(Boolean(b.time?.pinned)) - Number(Boolean(a.time?.pinned)) ||
+          (b.time?.pinned ?? 0) - (a.time?.pinned ?? 0) ||
+          (b.time?.updated ?? 0) - (a.time?.updated ?? 0),
+      ),
   )
+  const archivedSessions = createMemo<SyncSession[]>(() =>
+    [...sync.data.session]
+      .filter((session) => !session.parentID && Boolean(session.time?.archived))
+      .toSorted((a, b) => (b.time?.archived ?? 0) - (a.time?.archived ?? 0)),
+  )
+
+  createEffect(
+    on(
+      () => [sdk.scope, params.id] as const,
+      ([scope, id]) => {
+        sessionTabs.activateProject(scope)
+        if (!id || id === "new") return
+        sessionTabs.open(id)
+      },
+    ),
+  )
+
+  createEffect(() => {
+    const id = params.id
+    if (!id || id === "new") return
+    sessionTabs.setDraft(id, prompt.dirty())
+  })
+
+  createEffect(() => {
+    const id = params.id
+    if (!id || id === "new") return
+    const updated = sessions().find((session) => session.id === id)?.time?.updated ?? 0
+    if (!updated) return
+    sessionTabs.markRead(id, updated)
+  })
+
+  const openSessions = createMemo<SessionTabItem[]>(() => {
+    const tabs = sessionTabs.tabs().map((id) => {
+      const session = sessions().find((item) => item.id === id)
+      const updated = session?.time?.updated ?? 0
+      return {
+        id,
+        title: session?.title?.trim() || "Session",
+        working: Boolean(sync.data.session_status?.[id] && sync.data.session_status[id].type !== "idle"),
+        dirty: sessionTabs.dirty(id),
+        unread: sessionTabs.unread(id, updated),
+        editable: true,
+        closable: true,
+        reorderable: true,
+      }
+    })
+    if (params.id === undefined || params.id !== "new") return tabs
+    return [
+      ...tabs,
+      {
+        id: "new",
+        title: "New session",
+        working: false,
+        dirty: prompt.dirty(),
+        unread: false,
+        editable: false,
+        closable: tabs.length > 0,
+        reorderable: false,
+      },
+    ]
+  })
+
+  const closeSessionTab = (id: string) => {
+    if (id === "new") {
+      const target = sessionTabs.active() ?? sessionTabs.tabs().at(-1)
+      if (target) navigate(`/${params.dir}/session/${target}`)
+      return target ?? "new"
+    }
+    const target = sessionTabs.close(id)
+    if (params.id !== id) return params.id ?? sessionTabs.active() ?? "new"
+    navigate(target ? `/${params.dir}/session/${target}` : `/${params.dir}/session/new`)
+    return target ?? "new"
+  }
+
   const messages = createMemo(() => (params.id ? (sync.data.message[params.id] ?? []) : []))
+  // Runtime continuations (a background worker's completion, a harness nudge)
+  // are user messages nobody typed; they extend the turn before them rather
+  // than opening one, so they never get a turn card of their own.
+  const opensTurn = (message: (typeof sync.data.message)[string][number]) =>
+    message.role === "user" && !isContinuationCarrier(message, sync.data.part[message.id])
   const lastUserMessage = createMemo(() => {
     const ms = messages()
-    for (let i = ms.length - 1; i >= 0; i--) if (ms[i].role === "user") return ms[i]
+    for (let i = ms.length - 1; i >= 0; i--) if (opensTurn(ms[i])) return ms[i]
   })
   // A SessionTurn renders nothing for an assistant message — it only renders
   // when handed a user message, gathering that turn's assistant replies itself.
@@ -203,48 +526,85 @@ export default function Page(): JSX.Element {
   // stay hidden until the user restores them or sends a new message (which
   // makes the revert permanent server-side).
   const activeSession = createMemo(() => (params.id ? sync.session.get(params.id) : undefined))
-  const revertInfo = createMemo(() => activeSession()?.revert)
-  // New-session worktree selection, shared between the empty-state view and the
-  // composer (matches the v1.1.116 new-session flow).
-  const [newSessionWorktree, setNewSessionWorktree] = createSignal("main")
-
-  // A `path.md` mentioned in an assistant message dispatches this; open it as a
-  // document tab (same surface as the Files tab / a tool-card filename click).
+  createEffect(() => {
+    const parent = activeSession()?.parentID
+    if (parent) void sync.session.sync(parent).catch(() => {})
+  })
+  const assignment = createMemo(() => {
+    const session = activeSession()
+    return delegatedAssignment(session, sync.data.message[session?.parentID ?? ""] ?? [], sync.data.part)
+  })
+  const childSessions = createMemo(() => {
+    const parent = activeSession()?.parentID
+    if (!parent) return []
+    return sync.data.session
+      .filter((session) => session.parentID === parent)
+      .toSorted((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0) || a.id.localeCompare(b.id))
+  })
+  const childIndex = createMemo(() => childSessions().findIndex((session) => session.id === params.id))
+  const previousChild = createMemo(() => {
+    const index = childIndex()
+    if (index <= 0) return
+    return childSessions()[index - 1]
+  })
+  const nextChild = createMemo(() => {
+    const index = childIndex()
+    if (index < 0 || index >= childSessions().length - 1) return
+    return childSessions()[index + 1]
+  })
+  const revertInfo = createMemo(() => activeSession()?.revert as RevertInfo | undefined)
   onMount(() => {
-    const onOpenFile = (e: Event) => {
-      const path = (e as CustomEvent).detail?.path
-      if (typeof path !== "string" || !path) return
-      const dir = projectPath()
-      const rel = dir && path.startsWith(dir + "/") ? path.slice(dir.length + 1) : path
-      centerTabs.openFile(dir, rel)
+    const onOpenContext = (event: Event) => {
+      const context = (event as CustomEvent).detail?.context
+      if (!(["files", "terminal", "kernels", "autoresearch", "trace"] as SessionContext[]).includes(context)) return
+      openContext(context)
     }
-    document.addEventListener("openscience:open-file", onOpenFile)
-    onCleanup(() => document.removeEventListener("openscience:open-file", onOpenFile))
-
-    // "Open in Shell tab" on a bash tool card → reveal the right pane's terminal
-    // and re-run the command there (the RightPane picks up terminalCommand).
-    const onShell = (e: Event) => {
-      const command = (e as CustomEvent).detail?.command
-      if (typeof command !== "string" || !command) return
-      uiStore.setRightPaneOpen(true)
-      uiStore.setTerminalCommand({
-        command: "bash",
-        args: ["-lc", command],
-        title: command.length > 24 ? command.slice(0, 24) + "…" : command,
-      })
-    }
-    document.addEventListener("open-shell-tab", onShell)
-    onCleanup(() => document.removeEventListener("open-shell-tab", onShell))
+    document.addEventListener("openscience:open-context", onOpenContext)
+    onCleanup(() => {
+      document.removeEventListener("openscience:open-context", onOpenContext)
+    })
   })
   const turnMessages = createMemo(() => {
     const revertID = revertInfo()?.messageID
-    return messages().filter((m) => m.role === "user" && (!revertID || m.id < revertID))
+    return messages().filter((m) => opensTurn(m) && (!revertID || m.id < revertID))
   })
   const sessionStatus = createMemo(() =>
     params.id ? (sync.data.session_status?.[params.id] as { type?: string } | undefined)?.type : undefined,
   )
+  const sessionBusy = () => {
+    const status = sessionStatus()
+    return Boolean(status && status !== "idle")
+  }
+  // Live pre-call context estimate per session from `session.context`, so the header
+  // count moves during the first-token wait instead of only after the turn completes.
+  // Each one is anchored to the newest stored message, so a later turn or compaction
+  // summary supersedes it by id rather than by comparing the client's clock to the server's.
+  const [estimates, setEstimates] = createSignal<Record<string, ContextEstimate>>({})
+  const contextSubscription = sdk.event.on("session.context", (event) => {
+    const id = event.properties.sessionID
+    const stored = sync.data.message[id] ?? []
+    setEstimates((current) => ({
+      ...current,
+      [id]: estimate(stored, event.properties.total, {
+        total: event.properties.total,
+        tokens: event.properties.tokens,
+      }),
+    }))
+  })
+  onCleanup(contextSubscription)
+  const contextSample = createMemo(() => {
+    const id = params.id
+    if (!id || id === "new") return undefined
+    return latestContext(messages(), estimates()[id])
+  })
   // A message is a compaction boundary when it carries a `compaction` part.
-  const hasCompactionPart = (id: string) => (sync.data.part[id] ?? []).some((p) => p.type === "compaction")
+  const compactionPart = (id: string) => (sync.data.part[id] ?? []).find((part) => part.type === "compaction")
+  const hasCompactionPart = (id: string) => Boolean(compactionPart(id))
+  const compactionSummary = (id: string) => {
+    const assistant = messages().find((message) => message.role === "assistant" && message.parentID === id)
+    if (!assistant) return undefined
+    return (sync.data.part[assistant.id] ?? []).find((part) => part.type === "text")?.text
+  }
   // While compacting, an inline loader replaces the divider on the compaction
   // message currently being summarized (the most recent one). Once compaction
   // finishes the status leaves "compacting" and it becomes the "context
@@ -260,36 +620,85 @@ export default function Page(): JSX.Element {
   const revertedCount = createMemo(() => {
     const revertID = revertInfo()?.messageID
     if (!revertID) return 0
-    return messages().filter((m) => m.role === "user" && m.id >= revertID).length
+    return messages().filter((m) => opensTurn(m) && m.id >= revertID).length
   })
+  const revertedPreview = createMemo<UndoPreview>(() => ({
+    turns: revertInfo()?.turns ?? revertedCount(),
+    files: revertInfo()?.files ?? [],
+  }))
+  const undoing = (messageID: string) => {
+    const operation = undoOperation()
+    return operation?.type === "undo" && operation.messageID === messageID
+  }
+
+  const nextTurnID = (messageID: string) => {
+    const turns = turnMessages()
+    const index = turns.findIndex((message) => message.id === messageID)
+    return index >= 0 ? turns[index + 1]?.id : undefined
+  }
 
   const revertTo = async (messageID: string) => {
     const id = params.id
-    if (!id) return
-    const ok = await confirmDialog(dialog, {
-      title: "Undo from here?",
-      message:
-        "Hides this message and everything after it, and rolls back the file changes they made. You can restore until you send the next message.",
-      confirmLabel: "undo",
-      danger: true,
-    })
-    if (!ok) return
+    if (!id || undoOperation()) return
+    if (sessionBusy()) {
+      toast.info("Undo available when this response finishes")
+      return
+    }
+    const preview = undoPreview(messages(), sync.data.part, messageID, projectPath())
+    setUndoOperation({ type: "confirm", messageID })
     try {
-      await sync.session.revert(id, messageID)
-      toast.success("reverted", "files rolled back. send a message to continue from here")
-    } catch (e: any) {
-      toast.error("undo failed", e?.message ?? String(e))
+      if (shouldConfirmUndo(preview)) {
+        const ok = await confirmDialog(dialog, {
+          title: "Undo from here?",
+          message: (
+            <div class="session-undo-preview">
+              <p>
+                <strong>{undoSummary(preview)}</strong> will be hidden and its file changes rolled back. You can restore
+                everything until you send another message.
+              </p>
+              <Show when={preview.files.length > 0}>
+                <ul class="session-undo-preview__files" aria-label="Files that will be rolled back">
+                  <For each={preview.files.slice(0, 6)}>{(file) => <li title={file}>{file}</li>}</For>
+                  <Show when={preview.files.length > 6}>
+                    <li class="session-undo-preview__more">+{preview.files.length - 6} more</li>
+                  </Show>
+                </ul>
+              </Show>
+            </div>
+          ),
+          confirmLabel: "Undo",
+        })
+        if (!ok) return
+      }
+      setUndoOperation({ type: "undo", messageID })
+      const result = await sync.session.revert(id, messageID)
+      const applied = {
+        turns: result?.turns ?? preview.turns,
+        files: result?.files ?? preview.files,
+      }
+      toast.success("Undone", `${undoSummary(applied)} rolled back. Restore remains available below the conversation.`)
+    } catch (error: unknown) {
+      toast.error("Undo failed", requestError(error))
+    } finally {
+      setUndoOperation(undefined)
     }
   }
 
   const restoreRevert = async () => {
     const id = params.id
-    if (!id) return
+    if (!id || undoOperation()) return
+    if (sessionBusy()) {
+      toast.info("Restore available when this response finishes")
+      return
+    }
+    setUndoOperation({ type: "restore" })
     try {
       await sync.session.unrevert(id)
-      toast.success("messages restored")
-    } catch (e: any) {
-      toast.error("restore failed", e?.message ?? String(e))
+      toast.success("Undo restored", `${undoSummary(revertedPreview())} restored.`)
+    } catch (error: unknown) {
+      toast.error("Restore failed", requestError(error))
+    } finally {
+      setUndoOperation(undefined)
     }
   }
 
@@ -299,10 +708,106 @@ export default function Page(): JSX.Element {
   // a pending revert until the next message makes it permanent.
   const commands = useCommand()
   const language = useLanguage()
+  const showTerminal = () => {
+    if (uiStore.context() === "terminal" && uiStore.open()) return
+    openContext("terminal")
+  }
+  // Native session commands (/compact, /status, ...) reuse the last turn's effort and
+  // delegation so the palette and the slash menu behave alike.
+  const sessionCommand = (sessionID: string, name: string) => {
+    const last = lastUserMessage()
+    const request = {
+      sessionID,
+      command: name,
+      arguments: "",
+      effort: last?.role === "user" ? (last.effort ?? "normal") : "normal",
+      delegation: last?.role === "user" ? (last.delegation ?? true) : true,
+    } satisfies Parameters<typeof sdk.client.session.command>[0] & {
+      effort: "normal" | "ultra"
+      delegation: boolean
+    }
+    void sdk.client.session.command(request).catch((error: unknown) => {
+      console.error(`${name} failed`, error)
+      toast.error(`Could not run /${name}`, requestError(error))
+    })
+  }
   commands.register(() => {
     const id = params.id
-    if (!id || id === "new") return []
     const list: CommandOption[] = []
+    list.push(
+      {
+        id: "session.new",
+        title: "New session",
+        description: "Start a new research conversation",
+        category: "Session",
+        onSelect: newSession,
+      },
+      {
+        id: "project.files",
+        title: "Open project files",
+        description: "Browse, preview, and edit files in this project",
+        category: "Project",
+        onSelect: () => openContext("files"),
+      },
+      {
+        id: "project.compute",
+        title: "Open project compute",
+        description: "View local executions, live runtimes, and remote jobs",
+        category: "Project",
+        onSelect: () => openContext("kernels"),
+      },
+      {
+        id: "project.autoresearch",
+        title: "Open project autoresearch",
+        description: "Studies that hill-climb a metric, with their runs and charts",
+        category: "Project",
+        onSelect: () => openContext("autoresearch"),
+      },
+      {
+        id: "settings.open",
+        title: "Open settings",
+        description: "Configure models, capabilities, runtime, and the app",
+        category: "Application",
+        onSelect: () => dialog.show(() => <DialogSettings />),
+      },
+      {
+        id: "project.home",
+        title: "Back to projects",
+        description: "Return to the projects home",
+        category: "Navigation",
+        onSelect: () => navigate("/"),
+      },
+      {
+        id: "documentation.open",
+        title: "Open documentation",
+        description: "Read the OpenScience documentation",
+        category: "Help",
+        onSelect: () => platform.openLink(URLS.docs),
+      },
+      {
+        id: "terminal.toggle",
+        title: language.t("command.terminal.toggle"),
+        description: "Open or close the project terminal",
+        category: language.t("command.category.terminal"),
+        keybind: "ctrl+`",
+        onSelect: () => openContext("terminal"),
+      },
+      {
+        id: "terminal.new",
+        title: language.t("command.terminal.new"),
+        description: language.t("command.terminal.new.description"),
+        category: language.t("command.category.terminal"),
+        keybind: "ctrl+shift+`",
+        disabled: !terminalEndpointAvailable(sdk.url) || !id || id === "new",
+        onSelect: () => {
+          showTerminal()
+          void terminal.new().catch((cause: unknown) => {
+            toast.error("Could not start terminal", cause instanceof Error ? cause.message : String(cause))
+          })
+        },
+      },
+    )
+    if (!id || id === "new") return list
     const last = lastUserMessage()
     if (last && !revertInfo()) {
       list.push({
@@ -310,7 +815,7 @@ export default function Page(): JSX.Element {
         title: language.t("command.session.undo"),
         description: language.t("command.session.undo.description"),
         category: language.t("command.category.session"),
-        slash: "undo",
+        disabled: sessionBusy(),
         onSelect: () => void revertTo(last.id),
       })
     }
@@ -320,71 +825,35 @@ export default function Page(): JSX.Element {
         title: language.t("command.session.redo"),
         description: language.t("command.session.redo.description"),
         category: language.t("command.category.session"),
-        slash: "redo",
+        disabled: sessionBusy(),
         onSelect: () => void restoreRevert(),
       })
     }
-    // /compact — summarize the conversation to free up context. Runs the backend
-    // compaction action (model/agent default to the session's last); it does NOT
-    // prefill text, so it must be a builtin option, not a `sync.data.command`
-    // entry (those prefill). The backend command is deduped out of the prompt
-    // menu's custom list by its `menu` flag.
-    list.push({
-      id: "session.compact",
-      title: "Compact conversation",
-      description: "Summarize the conversation so far to free up context",
+    const action = (name: string, title: string, description: string) => ({
+      id: `session.${name}`,
+      title,
+      description,
       category: language.t("command.category.session"),
-      slash: "compact",
-      onSelect: () => {
-        void sdk.client.session
-          .command({ sessionID: id, command: "compact", arguments: "" } as any)
-          .catch((e: unknown) => {
-            console.error("compact failed", e)
-            toast.error("could not compact", e instanceof Error ? e.message : String(e))
-          })
-      },
+      slash: name,
+      onSelect: () => sessionCommand(id, name),
     })
-    // /handoff — write a self-contained handoff.md for another agent, then compact.
-    list.push({
-      id: "session.handoff",
-      title: "Write handoff & compact",
-      description: "Write a self-contained handoff.md for another agent, then compact",
-      category: language.t("command.category.session"),
-      slash: "handoff",
-      onSelect: () => {
-        void sdk.client.session
-          .command({ sessionID: id, command: "handoff", arguments: "" } as any)
-          .catch((e: unknown) => {
-            console.error("handoff failed", e)
-            toast.error("could not write handoff", e instanceof Error ? e.message : String(e))
-          })
-      },
-    })
+    list.push(
+      action("stop", "Stop active work", "Stop the active response in this session"),
+      action("compact", "Compact conversation", "Summarize the conversation so far to free up context"),
+      action("handoff", "Write handoff & compact", "Save a resumable handoff.md for another agent, then compact"),
+      action("checkpoint", "Save checkpoint", "Capture a local recovery packet from the session state"),
+    )
     return list
   })
 
-  const [stepsExpanded, setStepsExpanded] = createSignal<Record<string, boolean>>({})
-  const toggleSteps = (id: string) => setStepsExpanded((prev) => ({ ...prev, [id]: !prev[id] }))
+  useGlobalKeys({ onNew: newSession })
 
-  const isDark = () => theme.mode() === "dark"
-  useGlobalKeys({ onNew: () => void newSession() })
-
-  // Center-pane tabs. The chat tab is always mounted (so streaming + scroll
-  // survive tab switches); Files mounts on first visit; document tabs mount
-  // when opened from the explorer and unmount on close.
+  // The center belongs to the conversation for the lifetime of the route.
+  // Files and other research surfaces mount only in the right context pane.
   const chatTitle = createMemo(() => {
-    const s = sessions().find((x) => x.id === params.id)
-    return s?.title || "Chat"
+    if (!params.id || params.id === "new") return "New session"
+    return activeSession()?.title?.trim() || "Session"
   })
-  const [visitedFiles, setVisitedFiles] = createSignal(false)
-  createEffect(() => {
-    if (centerTabs.active() === "files") setVisitedFiles(true)
-  })
-  const [visitedSkills, setVisitedSkills] = createSignal(false)
-  createEffect(() => {
-    if (centerTabs.active() === "skills") setVisitedSkills(true)
-  })
-
   // Chat scroll: stick to the bottom while the agent streams; detach the
   // moment the user scrolls up (a "jump to latest" button re-attaches).
   // Follow is driven by content growth (ResizeObserver on the content
@@ -397,49 +866,167 @@ export default function Page(): JSX.Element {
     return !!status && status.type !== "idle"
   })
 
-  const chatScroll = createAutoScroll({
-    working,
-    overflowAnchor: "dynamic",
-    bottomThreshold: 120,
-  })
-
-  // Re-pin when the user switches sessions, and on initial mount once
-  // messages populate (covers direct URL / bookmark / refresh into a long,
-  // idle session, where createAutoScroll's settling window would otherwise
-  // expire before async-loaded messages render).
+  const traceExpansion = createTraceExpansion()
   createEffect(
     on(
-      () => [params.id, messages().length > 0] as const,
-      ([, hasMessages]) => {
-        if (!hasMessages) return
-        // A turn's markdown/code-highlight/katex renders progressively AFTER the
-        // message array populates, growing scrollHeight over ~1s. An idle session
-        // isn't in follow-mode, so createAutoScroll won't track that growth — a
-        // single scroll lands at the early bottom. Re-pin across the load window
-        // (bail the moment the user scrolls up, so we never fight them).
-        chatScroll.forceScrollToBottom()
-        const timers = [80, 200, 450, 800, 1200].map((ms) =>
-          setTimeout(() => {
-            if (!chatScroll.userScrolled()) chatScroll.forceScrollToBottom()
-          }, ms),
-        )
-        onCleanup(() => timers.forEach(clearTimeout))
+      () => (working() ? lastUserMessage()?.id : undefined),
+      (id) => {
+        if (id) traceExpansion.open(id)
       },
     ),
   )
+
+  const chatScroll = createAutoScroll({
+    working,
+    overflowAnchor: "dynamic",
+    // A small threshold keeps live output pinned only when the reader is
+    // genuinely at the bottom. The old 120px zone repeatedly recaptured users
+    // who had started scrolling through tool output.
+    bottomThreshold: 24,
+  })
+  const sessionKey = createMemo(() => `${sdk.scope}/${params.id ?? "new"}`)
+  const chatView = layout.view(sessionKey)
+  const restoration: {
+    initialized?: string
+    target?: {
+      scope: string
+      x: number
+      y: number
+    }
+  } = {}
+  let chatElement: HTMLDivElement | undefined
+  let contentElement: HTMLDivElement | undefined
+  let historyVersion = 0
+  const [historyLoading, setHistoryLoading] = createSignal(false)
+
+  const loadOlderMessages = async () => {
+    const sessionID = params.id
+    const scope = sessionKey()
+    const scroller = chatElement
+    if (!sessionID || !scroller || historyLoading()) return
+
+    const top = scroller.getBoundingClientRect().top
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-message-id]"))
+    const anchor = rows.find((row) => row.getBoundingClientRect().bottom > top)
+    const anchorID = anchor?.dataset.messageId
+    const offset = anchor ? anchor.getBoundingClientRect().top - top : 0
+    const height = scroller.scrollHeight
+    cancelRestoration()
+    const version = historyVersion
+    setHistoryLoading(true)
+    try {
+      await sync.session.history.loadMore(sessionID)
+      const restore = () => {
+        if (scope !== sessionKey() || chatElement !== scroller || !scroller.isConnected) return
+        // Loading history must not undo a newer navigation or reading intent.
+        // If the reader explicitly resumed following, include the late prepend.
+        if (version !== historyVersion) {
+          if (!chatScroll.userScrolled()) chatScroll.forceScrollToBottom()
+          return
+        }
+        const row = anchorID
+          ? scroller.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(anchorID)}"]`)
+          : undefined
+        if (row) scroller.scrollTop += row.getBoundingClientRect().top - top - offset
+        if (!row) scroller.scrollTop += scroller.scrollHeight - height
+        chatScroll.handleScroll()
+      }
+      requestAnimationFrame(() => {
+        restore()
+        requestAnimationFrame(restore)
+      })
+    } catch (error: unknown) {
+      toast.error("Could not load earlier messages", error instanceof Error ? error.message : String(error))
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+  let observer: ResizeObserver | undefined
+  let conversationPanelElement: HTMLElement | undefined
+  let promptDockElement: HTMLDivElement | undefined
+  let promptDockObserver: ResizeObserver | undefined
+
+  const cancelRestoration = () => {
+    restoration.target = undefined
+    historyVersion++
+  }
+
+  const followLatest = () => {
+    cancelRestoration()
+    chatScroll.forceScrollToBottom()
+  }
+
+  const applyRestoration = () => {
+    const target = restoration.target
+    const element = chatElement
+    if (!target || !element || target.scope !== sessionKey()) return
+    if (working()) {
+      restoration.target = undefined
+      return
+    }
+    element.scrollLeft = target.x
+    const max = Math.max(0, element.scrollHeight - element.clientHeight)
+    if (max + 1 < target.y) {
+      element.scrollTop = max
+      return
+    }
+    restoration.target = undefined
+    element.scrollTop = target.y
+    chatScroll.handleScroll()
+  }
+
+  // Restore once per scoped conversation. The previous array-valued effect ran
+  // again as assistant messages were appended, replaying a stale saved offset
+  // in the middle of a live response and visibly pulling the reader upward.
+  createEffect(() => {
+    const scope = sessionKey()
+    const hasMessages = messages().length > 0
+    if (restoration.initialized !== scope) {
+      restoration.initialized = undefined
+      cancelRestoration()
+    }
+    if (!hasMessages || restoration.initialized === scope) return
+    restoration.initialized = scope
+    const frame = requestAnimationFrame(() => {
+      if (scope !== sessionKey()) return
+      if (working()) {
+        chatScroll.forceScrollToBottom()
+        return
+      }
+      const saved = chatView.scroll("conversation")
+      if (!saved) {
+        chatScroll.forceScrollToBottom()
+        return
+      }
+      restoration.target = { scope, x: saved.x, y: saved.y }
+      applyRestoration()
+    })
+    onCleanup(() => cancelAnimationFrame(frame))
+  })
 
   createEffect(() => {
     if (project()) layout.projects.open(project()!.worktree)
   })
 
-  // Re-anchor a bottom-following view on viewport-height changes with no new
-  // content (window resize, right-pane toggle, mobile virtual keyboard).
   onMount(() => {
-    const onResize = () => {
-      if (!chatScroll.userScrolled()) chatScroll.forceScrollToBottom()
+    observer = new ResizeObserver(applyRestoration)
+    if (contentElement) observer.observe(contentElement)
+
+    const measurePromptDock = () => {
+      if (!conversationPanelElement || !promptDockElement) return
+      const height = Math.ceil(promptDockElement.getBoundingClientRect().height)
+      if (height <= 0) return
+      conversationPanelElement.style.setProperty("--workspace-composer-height", `${height}px`)
     }
-    window.addEventListener("resize", onResize)
-    onCleanup(() => window.removeEventListener("resize", onResize))
+
+    measurePromptDock()
+    promptDockObserver = new ResizeObserver(measurePromptDock)
+    if (promptDockElement) promptDockObserver.observe(promptDockElement)
+
+    onCleanup(() => {
+      observer?.disconnect()
+      promptDockObserver?.disconnect()
+    })
   })
 
   return (
@@ -449,48 +1036,99 @@ export default function Page(): JSX.Element {
         flex: 1,
         display: "flex",
         "flex-direction": "column",
-        height: "100dvh",
+        height: "100%",
         overflow: "hidden",
         background: "var(--color-bg)",
       }}
     >
       <ToastContainer />
       <HelpOverlay open={uiStore.helpOpen()} onClose={() => uiStore.setHelpOpen(false)} />
-      <CommandPalette open={uiStore.paletteOpen()} onClose={() => uiStore.setPaletteOpen(false)} />
-
-      <DisconnectedPanel />
-      <Header
-        projectName={projectName()}
-        projectPath={projectPath()}
-        isDark={isDark()}
-        onBack={() => navigate("/")}
-        onOpenPalette={() => uiStore.setPaletteOpen(true)}
-        onOpenHelp={() => uiStore.setHelpOpen(true)}
-        onOpenSettings={() => dialog.show(() => <DialogSettings />)}
-        onToggleTheme={() => theme.setColorScheme(isDark() ? "light" : "dark")}
+      <CommandPalette
+        open={uiStore.paletteOpen()}
+        onClose={() => uiStore.setPaletteOpen(false)}
+        directory={sdk.directory}
+        projectID={sdk.projectID}
       />
 
+      <DisconnectedPanel />
+
       <div
+        class="session-workspace"
+        data-context-open={uiStore.rightPaneOpen() ? "true" : "false"}
         style={{
           flex: 1,
           "min-height": 0,
           "min-width": 0,
           display: "flex",
           overflow: "hidden",
+          position: "relative",
         }}
       >
+        <Show when={mobileSessionsOpen()}>
+          <button
+            type="button"
+            class="session-sidebar-backdrop"
+            aria-label="Close sessions"
+            onClick={() => setMobileSessionsOpen(false)}
+          />
+        </Show>
         <SessionsSidebar
+          projectName={projectName()}
           sessions={sessions()}
+          archivedSessions={archivedSessions()}
           activeId={params.id}
           dirParam={params.dir ?? ""}
           creating={creating()}
-          onNew={() => void newSession()}
-          onSelect={(id) => navigate(`/${params.dir}/session/${id}`)}
+          collapsed={sessionsCollapsed()}
+          width={sessionsWidth()}
+          mobileOpen={mobileSessionsOpen()}
+          onCloseMobile={() => setMobileSessionsOpen(false)}
+          onNew={() => {
+            setMobileSessionsOpen(false)
+            newSession()
+          }}
+          onBack={() => navigate("/")}
+          onCollapse={toggleSessions}
+          onResize={(width, done) => {
+            const next = clampSidebarWidth(width)
+            setSessionsWidth(next)
+            if (done) writeSessionSidebarWidth(next)
+          }}
+          onSearch={() => {
+            setMobileSessionsOpen(false)
+            uiStore.setPaletteOpen(true)
+          }}
+          onCustomize={() => {
+            setMobileSessionsOpen(false)
+            dialog.show(() => <DialogSettings />)
+          }}
+          onContext={(context) => {
+            setMobileSessionsOpen(false)
+            openContext(context)
+          }}
+          context={uiStore.context()}
+          contextOpen={uiStore.open()}
+          onSelect={(id) => {
+            setMobileSessionsOpen(false)
+            sessionTabs.open(id)
+            navigate(`/${params.dir}/session/${id}`)
+          }}
+          onWarm={(id) => {
+            if (id === params.id || prewarmed.has(id)) return
+            prewarmed.add(id)
+            void hydrateSession(id).catch((error) => {
+              if (!discardUnavailableSession(id, error)) prewarmed.delete(id)
+            })
+          }}
           onDelete={(id) => void deleteSession(id)}
+          onArchive={(id) => void archiveSession(id)}
+          onRestore={(id) => void restoreSession(id)}
           onRename={(id, title) => void renameSession(id, title)}
+          onPin={(id, pinned) => void pinSession(id, pinned)}
         />
 
         <div
+          class="session-main"
           style={{
             flex: 1,
             "min-width": 0,
@@ -501,8 +1139,28 @@ export default function Page(): JSX.Element {
             overflow: "hidden",
           }}
         >
-          <CenterTabStrip chatTitle={chatTitle()} />
-
+          <Header
+            title={chatTitle()}
+            context={contextSample()}
+            tabs={openSessions()}
+            active={params.id ?? "new"}
+            onSelect={(id) => {
+              if (id !== "new") sessionTabs.open(id)
+              navigate(`/${params.dir}/session/${id}`)
+            }}
+            onClose={closeSessionTab}
+            onReorder={(id, to) => sessionTabs.move(id, to)}
+            onRename={renameSession}
+            onWarm={(id) => {
+              if (id === "new" || id === params.id || prewarmed.has(id)) return
+              prewarmed.add(id)
+              void hydrateSession(id).catch((error) => {
+                if (!discardUnavailableSession(id, error)) prewarmed.delete(id)
+              })
+            }}
+            onBack={() => navigate("/")}
+            onToggleSessions={() => setMobileSessionsOpen((open) => !open)}
+          />
           <div
             style={{
               flex: 1,
@@ -513,10 +1171,16 @@ export default function Page(): JSX.Element {
               "flex-direction": "column",
             }}
           >
-            {/* chat — always mounted so streaming + scroll survive tab switches */}
-            <div
+            {/* conversation center — never replaced by file navigation */}
+            <section
+              ref={(element) => (conversationPanelElement = element)}
+              id="session-conversation-panel"
+              role="tabpanel"
+              aria-labelledby={sessionTabID(params.id ?? "new")}
+              data-component="conversation-center"
+              aria-label="Conversation"
               style={{
-                display: centerTabs.active() === "chat" ? "flex" : "none",
+                display: "flex",
                 flex: 1,
                 "min-height": 0,
                 "flex-direction": "column",
@@ -524,11 +1188,70 @@ export default function Page(): JSX.Element {
               }}
             >
               <Switch>
+                <Match when={params.id === undefined}>
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    style={{
+                      flex: 1,
+                      display: "flex",
+                      "align-items": "center",
+                      "justify-content": "center",
+                      gap: "8px",
+                      color: "var(--color-text-muted)",
+                      "font-family": FONT_SANS,
+                      "font-size": "12px",
+                    }}
+                  >
+                    <AsciiSpinner size={10} />
+                    <span>Opening your last session…</span>
+                  </div>
+                </Match>
+                <Match when={params.id && messages().length === 0 && loadFailure()?.id === params.id}>
+                  <div class="session-empty" role="alert">
+                    <div class="session-empty__inner">
+                      <h2 class="session-empty__title">This conversation didn't load</h2>
+                      <p class="session-empty__hint">{loadFailure()?.message}</p>
+                      <div class="session-empty__starters">
+                        <button
+                          type="button"
+                          class="session-empty__starter"
+                          onClick={() => {
+                            const id = params.id
+                            if (!id) return
+                            setLoadFailure(undefined)
+                            void hydrateSession(id).catch((error) => {
+                              if (discardUnavailableSession(id, error)) return
+                              setLoadFailure({ id, message: error instanceof Error ? error.message : String(error) })
+                            })
+                          }}
+                        >
+                          Try again
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </Match>
+                <Match when={params.id && messages().length === 0 && activeSession()?.parentID}>
+                  <div class="session-empty" role="region" aria-label="Worker session">
+                    <div class="session-empty__inner">
+                      <h2 class="session-empty__title">Waiting for the lead's brief</h2>
+                      <p class="session-empty__hint">
+                        This worker starts when its lead delegates a task. Its work and handoff will appear here.
+                      </p>
+                    </div>
+                  </div>
+                </Match>
+                <Match when={params.id && messages().length === 0}>
+                  {/* A new session opens on the composer alone. */}
+                  <div class="session-empty" role="region" aria-label="Start a session" />
+                </Match>
                 <Match when={params.id && messages().length > 0}>
                   {/* Scoped to just the scroll area (not the revert banner / Composer
                       below) so the jump-to-latest pill's position:absolute resolves
                       against this box instead of the whole chat column. */}
                   <div
+                    class="session-conversation-scroll-frame"
                     style={{
                       position: "relative",
                       flex: 1,
@@ -538,8 +1261,25 @@ export default function Page(): JSX.Element {
                     }}
                   >
                     <div
-                      ref={chatScroll.scrollRef}
-                      onScroll={chatScroll.handleScroll}
+                      ref={(element) => {
+                        chatElement = element
+                        chatScroll.scrollRef(element)
+                      }}
+                      onScroll={(event) => {
+                        chatScroll.handleScroll()
+                        if (restoration.target) return
+                        chatView.setScroll("conversation", {
+                          x: event.currentTarget.scrollLeft,
+                          y: event.currentTarget.scrollTop,
+                        })
+                      }}
+                      onWheel={cancelRestoration}
+                      onPointerDown={cancelRestoration}
+                      onTouchMove={cancelRestoration}
+                      onKeyDown={(event) => {
+                        if (["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "].includes(event.key))
+                          cancelRestoration()
+                      }}
                       onClick={chatScroll.handleInteraction}
                       class="atlas-scroll atlas-chat-scroll session-scroller"
                       style={{
@@ -549,31 +1289,74 @@ export default function Page(): JSX.Element {
                         "overflow-x": "hidden",
                       }}
                     >
-                      {/* Sub-agent back-to-parent header only. Normal chats render
-                          NO fixed header — the sticky session title used to sit on top
-                          of the conversation and block content. The title is still
-                          shown/renamable in the session list. Kept outside contentRef
-                          so the ResizeObserver measures only the growing message list. */}
+                      <Show when={params.id && sync.session.history.more(params.id)}>
+                        <div class="session-history-loader">
+                          <button
+                            type="button"
+                            class="session-history-loader__button"
+                            disabled={historyLoading() || sync.session.history.loading(params.id!)}
+                            onClick={() => void loadOlderMessages()}
+                          >
+                            <Show when={historyLoading()} fallback={<IconChevronDown size={12} strokeWidth={1.5} />}>
+                              <AsciiSpinner size={10} />
+                            </Show>
+                            {historyLoading() ? "Loading earlier messages…" : "Load earlier messages"}
+                          </button>
+                        </div>
+                      </Show>
+                      {/* Delegated work keeps its own identity and sibling navigation.
+                          This remains outside contentRef so the ResizeObserver measures
+                          only the growing message list. */}
                       <Show when={activeSession()?.parentID}>
-                        <div class="sticky top-0 z-30 bg-background-stronger w-full">
+                        <div class="session-delegated-bar sticky top-0 z-30 bg-background-stronger w-full">
                           <div class="w-full px-4 md:px-6 md:max-w-200 md:mx-auto">
-                            <div class="h-10 flex items-center gap-1.5">
-                              <Show when={activeSession()?.parentID}>
+                            <div class="min-h-12 py-1.5 flex items-center gap-2 border-b border-border-weak-base">
+                              <div class="min-w-0 flex-1">
+                                <div class="text-[10px] tracking-[0.04em] text-text-weaker">
+                                  {assignment()?.phase
+                                    ? `${assignment()!.phase.charAt(0).toUpperCase()}${assignment()!.phase.slice(1)} agent`
+                                    : "Delegated agent"}
+                                </div>
+                                <div class="truncate text-xs font-medium text-text-base">
+                                  {assignment()?.description || activeSession()?.title?.trim() || "Research task"}
+                                </div>
+                              </div>
+                              <div
+                                class="flex items-center gap-1"
+                                role="navigation"
+                                aria-label="Delegated agent sessions"
+                              >
                                 <button
                                   type="button"
-                                  class="flex items-center justify-center size-7 shrink-0 rounded-md text-text-weak hover:text-text-base hover:bg-surface-base-hover transition-colors"
+                                  class="h-7 px-2 flex items-center gap-1 rounded-md text-xs text-text-weak hover:text-text-base hover:bg-surface-base-hover transition-colors"
                                   aria-label="Back to parent session"
                                   onClick={() => navigate(`/${params.dir}/session/${activeSession()!.parentID}`)}
                                 >
-                                  <IconChevronLeft />
+                                  <IconChevronLeft size={12} strokeWidth={1.5} />
+                                  Parent
                                 </button>
-                              </Show>
-                              <Show when={activeSession()?.title}>
-                                <EditableTitle
-                                  title={activeSession()!.title!}
-                                  onRename={(t) => void renameSession(activeSession()!.id, t)}
-                                />
-                              </Show>
+                                <button
+                                  type="button"
+                                  class="size-7 flex items-center justify-center rounded-md text-text-weak hover:text-text-base hover:bg-surface-base-hover transition-colors disabled:opacity-30 disabled:pointer-events-none"
+                                  aria-label="Previous delegated agent"
+                                  disabled={!previousChild()}
+                                  onClick={() => navigate(`/${params.dir}/session/${previousChild()!.id}`)}
+                                >
+                                  <IconChevronLeft size={12} strokeWidth={1.5} />
+                                </button>
+                                <span class="min-w-10 text-center text-[11px] text-text-weaker">
+                                  {Math.max(0, childIndex()) + 1}/{childSessions().length}
+                                </span>
+                                <button
+                                  type="button"
+                                  class="size-7 flex items-center justify-center rounded-md text-text-weak hover:text-text-base hover:bg-surface-base-hover transition-colors disabled:opacity-30 disabled:pointer-events-none"
+                                  aria-label="Next delegated agent"
+                                  disabled={!nextChild()}
+                                  onClick={() => navigate(`/${params.dir}/session/${nextChild()!.id}`)}
+                                >
+                                  <IconChevronRight size={12} strokeWidth={1.5} />
+                                </button>
+                              </div>
                             </div>
                           </div>
                         </div>
@@ -581,8 +1364,13 @@ export default function Page(): JSX.Element {
 
                       {/* Centered conversation column with 2px between-turn divider */}
                       <div
-                        ref={chatScroll.contentRef}
-                        class="w-full md:max-w-200 md:mx-auto flex flex-col items-start justify-start pt-3 pb-[calc(10rem+64px)]"
+                        ref={(element) => {
+                          contentElement = element
+                          chatScroll.contentRef(element)
+                          observer?.disconnect()
+                          observer?.observe(element)
+                        }}
+                        class="session-transcript w-full flex flex-col items-start justify-start"
                       >
                         <For each={turnMessages()}>
                           {(message, index) => (
@@ -593,22 +1381,11 @@ export default function Page(): JSX.Element {
                                   <Show
                                     when={message.id === compactingMessageId()}
                                     fallback={
-                                      <div
-                                        style={{
-                                          display: "flex",
-                                          "align-items": "center",
-                                          gap: "10px",
-                                          padding: "2px 16px",
-                                          "font-size": "11px",
-                                          "letter-spacing": "0.06em",
-                                          "text-transform": "uppercase",
-                                          color: "var(--color-text-faint)",
-                                        }}
-                                      >
-                                        <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
-                                        <span>context compacted</span>
-                                        <div style={{ flex: 1, height: "1px", background: "var(--color-border)" }} />
-                                      </div>
+                                      <CompactionBoundary
+                                        part={compactionPart(message.id)}
+                                        summary={compactionSummary(message.id)}
+                                        onOpenFile={(path) => uiStore.openFile(projectPath(), path, { scope: "auto" })}
+                                      />
                                     }
                                   >
                                     <div
@@ -618,15 +1395,14 @@ export default function Page(): JSX.Element {
                                         "justify-content": "center",
                                         gap: "8px",
                                         padding: "6px 16px",
-                                        "font-family": FONT_MONO,
-                                        "font-size": "11px",
-                                        "letter-spacing": "0.06em",
-                                        "text-transform": "uppercase",
-                                        color: "var(--color-text-faint)",
+                                        "font-family": FONT_SANS,
+                                        "font-size": "12px",
+                                        "font-weight": "var(--font-weight-regular)",
+                                        color: "var(--color-text-muted)",
                                       }}
                                     >
                                       <AsciiSpinner size={10} />
-                                      <span>compacting conversation…</span>
+                                      <span>Compacting conversation…</span>
                                     </div>
                                   </Show>
                                 }
@@ -635,22 +1411,51 @@ export default function Page(): JSX.Element {
                                   sessionID={params.id!}
                                   messageID={message.id}
                                   lastUserMessageID={lastUserMessage()?.id}
-                                  stepsExpanded={stepsExpanded()[message.id] ?? false}
-                                  onStepsExpandedToggle={() => toggleSteps(message.id)}
+                                  stepsExpanded={traceExpansion.expanded(message.id)}
+                                  onStepsExpandedToggle={() => traceExpansion.toggle(message.id)}
                                   classes={{
                                     root: "min-w-0 w-full relative",
                                     content: "flex flex-col justify-between !overflow-visible",
-                                    container: "w-full px-4 md:px-6",
+                                    container: "w-full px-4 md:px-5",
                                   }}
                                 />
+                                <div class="session-turn-actions" role="group" aria-label="Turn actions">
+                                  <Show when={!revertInfo()}>
+                                    <button
+                                      type="button"
+                                      class="session-turn-action"
+                                      disabled={Boolean(undoOperation()) || sessionBusy()}
+                                      aria-busy={undoing(message.id)}
+                                      onClick={() => void revertTo(message.id)}
+                                      aria-label="Undo conversation from this turn"
+                                      title="Undo from here"
+                                    >
+                                      <Show
+                                        when={undoing(message.id)}
+                                        fallback={<IconRefresh size={12} strokeWidth={1.5} />}
+                                      >
+                                        <AsciiSpinner size={10} />
+                                      </Show>
+                                      Undo
+                                    </button>
+                                  </Show>
+                                  <button
+                                    type="button"
+                                    class="session-turn-action"
+                                    onClick={() => void forkSession(nextTurnID(message.id))}
+                                    aria-label="Fork session from this turn"
+                                    title="Fork from here"
+                                  >
+                                    <IconSplit size={12} strokeWidth={1.5} />
+                                    Fork
+                                  </button>
+                                </div>
                               </Show>
                               {/* The v1.1.116 between-turns rule — skipped for a
                                   compaction row, which already draws its own "context
                                   compacted" divider (avoids a doubled rule). */}
                               <Show when={index() < turnMessages().length - 1 && !hasCompactionPart(message.id)}>
-                                <div class="w-full px-4 md:px-6 pt-2 pb-1">
-                                  <div class="h-[2px] bg-border-weak-base rounded-full" />
-                                </div>
+                                <div class="session-turn-divider" />
                               </Show>
                             </div>
                           )}
@@ -658,642 +1463,438 @@ export default function Page(): JSX.Element {
                       </div>
                     </div>
 
-                    <Show when={chatScroll.userScrolled()}>
-                      <button
-                        type="button"
-                        onClick={() => chatScroll.forceScrollToBottom()}
-                        title="Jump to latest"
-                        style={{
-                          position: "absolute",
-                          // The content column reserves calc(10rem + 64px) of bottom
-                          // padding (above) so the last message clears the absolute
-                          // prompt dock; land the pill just above that same
-                          // reservation so the dock doesn't sit on top of it.
-                          bottom: "calc(10rem + 64px + 16px)",
-                          left: "50%",
-                          transform: "translateX(-50%)",
-                          display: "inline-flex",
-                          "align-items": "center",
-                          gap: "6px",
-                          padding: "6px 12px",
-                          "border-radius": "999px",
-                          border: "1px solid var(--color-border-strong)",
-                          background: "var(--color-surface-solid)",
-                          "box-shadow": "var(--shadow-md)",
-                          "font-family": FONT_MONO,
-                          "font-size": "11px",
-                          color: "var(--color-text)",
-                          cursor: "pointer",
-                          "z-index": 6,
-                        }}
-                      >
-                        <IconChevronDown size={13} strokeWidth={1.6} />
-                        jump to latest
-                      </button>
-                    </Show>
+                    <div class="session-jump-latest-rail" aria-live="polite">
+                      <Show when={chatScroll.userScrolled()}>
+                        <button type="button" class="session-jump-latest" onClick={followLatest} title="Jump to latest">
+                          <IconChevronDown size={12} strokeWidth={1.5} />
+                          Jump to latest
+                        </button>
+                      </Show>
+                    </div>
                   </div>
                 </Match>
                 <Match when={true}>
-                  <NewSessionView worktree={newSessionWorktree()} onWorktreeChange={setNewSessionWorktree} />
+                  <div aria-hidden="true" style={{ flex: 1, "min-height": 0 }} />
                 </Match>
               </Switch>
 
-              {/* Prompt dock — gradient fade + centered PromptInput (v1.1.116) */}
-              <div class="absolute inset-x-0 bottom-0 pt-12 pb-4 flex flex-col justify-center items-center z-50 px-4 md:px-0 bg-gradient-to-t from-background-base via-background-base to-transparent pointer-events-none">
-                <div class="w-full px-4 pointer-events-auto md:max-w-200 md:mx-auto">
+              <div
+                ref={(element) => (promptDockElement = element)}
+                class="session-prompt-dock"
+                hidden={params.id === undefined}
+              >
+                <div class="session-prompt-dock__inner">
                   <Show when={revertInfo()}>
-                    <div
-                      class="mb-3"
-                      style={{
-                        display: "flex",
-                        "align-items": "center",
-                        gap: "12px",
-                        padding: "8px 12px",
-                        border: "1px solid var(--color-border)",
-                        "border-radius": "8px",
-                        "font-size": "12px",
-                        "font-family": FONT_SANS,
-                        color: "var(--color-text-muted)",
-                        background: "var(--color-bg)",
-                      }}
-                    >
-                      <span style={{ flex: 1, "min-width": 0 }}>
-                        Conversation reverted. {revertedCount()} turn{revertedCount() === 1 ? "" : "s"} hidden and file
-                        changes rolled back. Sending a new message makes this permanent.
+                    <div class="session-undo-bar" role="status" aria-live="polite">
+                      <span class="session-undo-bar__copy">
+                        <strong>{undoSummary(revertedPreview())} undone.</strong> Restore it now, or send a message to
+                        keep this version.
                       </span>
                       <button
                         type="button"
+                        class="session-undo-bar__restore"
+                        disabled={Boolean(undoOperation()) || sessionBusy()}
+                        aria-busy={undoOperation()?.type === "restore"}
                         onClick={() => void restoreRevert()}
-                        style={{
-                          border: "1px solid var(--color-border)",
-                          background: "transparent",
-                          color: "inherit",
-                          padding: "4px 10px",
-                          "border-radius": "8px",
-                          "font-size": "12px",
-                          cursor: "pointer",
-                          "white-space": "nowrap",
-                        }}
                       >
-                        restore
+                        <Show
+                          when={undoOperation()?.type === "restore"}
+                          fallback={<IconRefresh size={12} strokeWidth={1.5} />}
+                        >
+                          <AsciiSpinner size={10} />
+                        </Show>
+                        Restore
                       </button>
                     </div>
                   </Show>
-                  <PromptInput
-                    newSessionWorktree={newSessionWorktree()}
-                    onNewSessionWorktreeReset={() => setNewSessionWorktree("main")}
-                  />
+                  {/* A worker session belongs to its lead: the lead writes its
+                      brief and reads its handoff. Messages go to the lead. */}
+                  <Show
+                    when={!activeSession()?.parentID}
+                    fallback={
+                      <div class="session-worker-readonly" role="note">
+                        <span>This is a worker session. It takes instructions from its lead, not from the chat.</span>
+                        <button
+                          type="button"
+                          onClick={() => navigate(`/${params.dir}/session/${activeSession()!.parentID}`)}
+                        >
+                          Message the lead
+                        </button>
+                      </div>
+                    }
+                  >
+                    <PromptInput onSubmit={followLatest} />
+                  </Show>
                 </div>
               </div>
-            </div>
-
-            {/* files — the host explorer, mounted on first visit */}
-            <Show when={visitedFiles()}>
-              <div
-                style={{
-                  display: centerTabs.active() === "files" ? "flex" : "none",
-                  flex: 1,
-                  "min-height": 0,
-                  "flex-direction": "column",
-                }}
-              >
-                <FileExplorer />
-              </div>
-            </Show>
-
-            {/* skills — the global capability catalog, mounted on first visit */}
-            <Show when={visitedSkills()}>
-              <div
-                style={{
-                  display: centerTabs.active() === "skills" ? "flex" : "none",
-                  flex: 1,
-                  "min-height": 0,
-                  "flex-direction": "column",
-                }}
-              >
-                {/* Local boundary: SkillsPage reads its skills resource eagerly, so
-                    its first-load suspend must stay in this pane, not blank the
-                    whole session via the coarse route-level <Suspense>. */}
-                <Suspense fallback={<PaneLoading />}>
-                  <SkillsPage />
-                </Suspense>
-              </div>
-            </Show>
-
-            {/* document tabs — one inline FileView per opened file */}
-            <For each={centerTabs.docs()}>
-              {(doc) => (
-                <div
-                  style={{
-                    display: centerTabs.active() === doc.id ? "flex" : "none",
-                    flex: 1,
-                    "min-height": 0,
-                    "flex-direction": "column",
-                  }}
-                >
-                  {/* Local boundary: FileView reads its `file` resource eagerly (the
-                      `kind` memo forces it at mount), so opening a NEW file suspends.
-                      Contain it here so the doc tab shows a local spinner instead of
-                      blanking the entire session through the route-level <Suspense>. */}
-                  <Suspense fallback={<PaneLoading />}>
-                    <FileView
-                      path={doc.path}
-                      directory={doc.directory}
-                      subtitle={`This computer · ${doc.directory.replace(/\/$/, "")}/${doc.path}`}
-                      onClose={() => centerTabs.closeDoc(doc.id)}
-                    />
-                  </Suspense>
-                </div>
-              )}
-            </For>
+            </section>
           </div>
         </div>
-
-        <RightPane />
       </div>
     </div>
   )
 }
 
-// Pane-scoped Suspense fallback — a small centered spinner shown while an
-// interaction-mounted pane (a file view, the Skills catalog) loads its data,
-// so the load can't reach the route-level boundary and blank the whole session.
-function PaneLoading(): JSX.Element {
-  return (
-    <div style={{ flex: 1, display: "flex", "align-items": "center", "justify-content": "center" }}>
-      <AsciiSpinner size={10} label="loading…" color="var(--color-text-faint)" />
-    </div>
-  )
-}
-
-function CenterTabStrip(props: { chatTitle: string }): JSX.Element {
-  const active = centerTabs.active
-  return (
-    <div
-      class="atlas-scroll"
-      style={{
-        display: "flex",
-        "align-items": "stretch",
-        gap: "5px",
-        padding: "7px 10px",
-        "border-bottom": "1px solid var(--color-border)",
-        background: "var(--color-bg-subtle)",
-        "overflow-x": "auto",
-        "flex-shrink": 0,
-      }}
-    >
-      <CenterTab active={active() === "chat"} label={props.chatTitle} onClick={() => centerTabs.setActive("chat")}>
-        <IconMessageSquare size={12} strokeWidth={1.6} />
-      </CenterTab>
-      <CenterTab active={active() === "files"} label="Files" onClick={() => centerTabs.setActive("files")}>
-        <IconFolderTree size={12} strokeWidth={1.6} />
-      </CenterTab>
-      <CenterTab active={active() === "skills"} label="Skills" onClick={() => centerTabs.setActive("skills")}>
-        <IconBrain size={12} strokeWidth={1.6} />
-      </CenterTab>
-      <For each={centerTabs.docs()}>
-        {(doc) => (
-          <CenterTab
-            active={active() === doc.id}
-            label={doc.name}
-            onClick={() => centerTabs.setActive(doc.id)}
-            onClose={() => centerTabs.closeDoc(doc.id)}
-          >
-            <IconFile size={12} strokeWidth={1.6} />
-          </CenterTab>
-        )}
-      </For>
-    </div>
-  )
-}
-
-function CenterTab(props: {
-  active: boolean
-  label: string
-  onClick: () => void
-  onClose?: () => void
-  children: JSX.Element
+function CompactionBoundary(props: {
+  part?: {
+    auto: boolean
+    focus?: string
+    handoffFile?: string
+    trigger?: "proactive" | "overflow" | "manual"
+  }
+  summary?: string
+  onOpenFile: (path: string) => void
 }): JSX.Element {
+  const detail = () => {
+    if (props.part?.trigger === "overflow") return "Recovered from a full context window"
+    if (props.part?.auto || props.part?.trigger === "proactive") return "Automatic context handoff"
+    return "Manual context handoff"
+  }
+
   return (
-    <div
-      role="tab"
-      aria-selected={props.active}
-      onClick={props.onClick}
-      title={props.label}
-      style={{
-        cursor: "pointer",
-        display: "inline-flex",
-        "align-items": "center",
-        gap: "7px",
-        "max-width": "220px",
-        padding: "6px 10px",
-        "border-radius": "4px",
-        border: props.active ? "1px solid var(--color-border-strong)" : "1px solid transparent",
-        background: props.active ? "var(--color-surface-solid)" : "transparent",
-        "box-shadow": props.active ? "0 1px 2px rgba(0,0,0,0.10)" : "none",
-        "font-family": FONT_MONO,
-        "font-size": "11px",
-        "font-weight": props.active ? 700 : 400,
-        color: props.active ? "var(--color-text)" : "var(--color-text-muted)",
-        transition: "background 120ms ease, color 120ms ease, border-color 120ms ease",
-        "flex-shrink": 0,
-      }}
-      onMouseEnter={(e) => {
-        if (!props.active) e.currentTarget.style.background = "var(--color-accent-subtle)"
-      }}
-      onMouseLeave={(e) => {
-        if (!props.active) e.currentTarget.style.background = "transparent"
-      }}
-    >
-      <span
-        style={{
-          display: "inline-flex",
-          color: props.active ? "var(--color-text)" : "var(--color-text-faint)",
-          "flex-shrink": 0,
-        }}
-      >
-        {props.children}
-      </span>
-      <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.label}</span>
-      <Show when={props.onClose}>
-        <span
-          role="button"
-          aria-label="close tab"
-          onClick={(e) => {
-            e.stopPropagation()
-            props.onClose!()
-          }}
-          style={{
-            display: "inline-flex",
-            "align-items": "center",
-            "justify-content": "center",
-            width: "16px",
-            height: "16px",
-            "border-radius": "4px",
-            color: "var(--color-text-faint)",
-            "flex-shrink": 0,
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.background = "var(--color-accent-subtle)"
-            e.currentTarget.style.color = "var(--color-text)"
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = "transparent"
-            e.currentTarget.style.color = "var(--color-text-faint)"
-          }}
-        >
-          <IconX size={11} strokeWidth={1.8} />
+    <details class="session-compaction">
+      <summary>
+        <span class="session-compaction__rule" aria-hidden="true" />
+        <span class="session-compaction__label">
+          Context compacted
+          <span>{detail()}</span>
         </span>
-      </Show>
-    </div>
+        <IconChevronDown size={12} strokeWidth={1.5} />
+        <span class="session-compaction__rule" aria-hidden="true" />
+      </summary>
+      <div class="session-compaction__body">
+        <Show when={props.part?.focus}>
+          {(focus) => (
+            <div>
+              <strong>Focus</strong>
+              <p>{focus()}</p>
+            </div>
+          )}
+        </Show>
+        <Show when={props.summary} fallback={<p>The next turn continues from a compact context handoff.</p>}>
+          {(summary) => (
+            <div>
+              <strong>Handoff</strong>
+              <pre>{summary()}</pre>
+            </div>
+          )}
+        </Show>
+        <Show when={props.part?.handoffFile}>
+          {(path) => (
+            <button type="button" class="session-compaction__file" onClick={() => props.onOpenFile(path())}>
+              Open {path()}
+            </button>
+          )}
+        </Show>
+      </div>
+    </details>
   )
 }
 
 function Header(props: {
-  projectName: string
-  projectPath: string
-  isDark: boolean
+  title: string
+  tabs: SessionTabItem[]
+  active: string
+  onSelect: (id: string) => void
+  onClose: (id: string) => void
+  onReorder: (id: string, to: number) => void
+  onRename: (id: string, title: string) => Promise<boolean>
+  onWarm: (id: string) => void
   onBack: () => void
-  onOpenPalette: () => void
-  onOpenHelp: () => void
-  onOpenSettings: () => void
-  onToggleTheme: () => void
+  onToggleSessions: () => void
+  context?: ContextSample
 }): JSX.Element {
   return (
-    <AppHeader>
+    <AppHeader class="workspace-header">
       <button
-        onClick={props.onBack}
-        title="back to projects"
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          display: "inline-flex",
-          "align-items": "center",
-          gap: "5px",
-          padding: "5px 10px",
-          "border-radius": "4px",
-          "font-family": FONT_MONO,
-          "font-size": "11px",
-          color: "var(--color-text-muted)",
-          transition: "background 120ms ease",
-        }}
-        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-accent-subtle)")}
-        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        type="button"
+        class="session-sidebar-toggle workspace-header__sessions"
+        onClick={props.onToggleSessions}
+        title="Show sessions"
+        aria-label="Show sessions"
       >
-        <IconChevronLeft size={11} strokeWidth={1.5} />
-        projects
+        <IconMessageSquare size={12} strokeWidth={1.5} />
       </button>
-      <HeaderDivider />
-      <Wordmark size="sm" />
-      <HeaderDivider />
-      <span
-        style={{
-          "font-family": FONT_SANS,
-          "font-size": "13px",
-          "font-weight": 400,
-          color: "var(--color-text)",
-        }}
+      <button
+        class="workspace-header__back"
+        onClick={props.onBack}
+        title="Back to projects"
+        aria-label="Back to projects"
       >
-        {props.projectName}
-      </span>
-      <span
-        style={{
-          "font-family": FONT_MONO,
-          "font-size": "10px",
-          color: "var(--color-text-faint)",
-          overflow: "hidden",
-          "text-overflow": "ellipsis",
-          "white-space": "nowrap",
-          "max-width": "320px",
-        }}
-      >
-        {props.projectPath}
-      </span>
-      <span style={{ flex: 1 }} />
-      <HeaderIconButton onClick={props.onOpenPalette} title="command palette">
-        <IconSearch size={13} strokeWidth={1.5} />
-      </HeaderIconButton>
-      <HeaderIconButton onClick={props.onOpenHelp} title="help">
-        <IconBookOpen size={13} strokeWidth={1.5} />
-      </HeaderIconButton>
-      <HeaderIconButton onClick={props.onOpenSettings} title="settings">
-        <IconSettings size={13} strokeWidth={1.5} />
-      </HeaderIconButton>
-      <HeaderIconButton onClick={props.onToggleTheme} title="toggle theme">
-        <Show when={props.isDark} fallback={<IconMoon size={13} strokeWidth={1.5} />}>
-          <IconSun size={13} strokeWidth={1.5} />
-        </Show>
-      </HeaderIconButton>
+        <IconChevronLeft size={14} strokeWidth={1.5} />
+      </button>
+      <h1 class="sr-only">{props.title}</h1>
+      <SessionTabStrip
+        tabs={props.tabs}
+        active={props.active}
+        onSelect={props.onSelect}
+        onClose={props.onClose}
+        onReorder={props.onReorder}
+        onRename={props.onRename}
+        onWarm={props.onWarm}
+      />
+      <SessionContextUsage variant="header" sample={props.context} />
     </AppHeader>
   )
 }
 
-// The conversation title in the sticky chat header — double-click to rename,
-// mirroring the sidebar's SessionRow. Enter/blur commits, Esc cancels.
-function EditableTitle(props: { title: string; onRename: (t: string) => void }): JSX.Element {
-  const [editing, setEditing] = createSignal(false)
-  const [draft, setDraft] = createSignal("")
-  const start = () => {
-    setDraft(props.title)
-    setEditing(true)
-  }
-  const commit = () => {
-    if (!editing()) return
-    const next = draft().trim()
-    setEditing(false)
-    if (next && next !== props.title) props.onRename(next)
-  }
-  return (
-    <Show
-      when={editing()}
-      fallback={
-        <h1
-          class="text-14-medium text-text-strong truncate"
-          style={{ cursor: "text" }}
-          title="Double-click to rename"
-          onDblClick={start}
-        >
-          {props.title}
-        </h1>
-      }
-    >
-      <input
-        ref={(el) =>
-          queueMicrotask(() => {
-            el.focus()
-            el.select()
-          })
-        }
-        class="text-14-medium text-text-strong truncate"
-        value={draft()}
-        onInput={(e) => setDraft(e.currentTarget.value)}
-        onKeyDown={(e) => {
-          e.stopPropagation()
-          if (e.key === "Enter") {
-            e.preventDefault()
-            commit()
-          } else if (e.key === "Escape") {
-            e.preventDefault()
-            setEditing(false)
-          }
-        }}
-        onBlur={commit}
-        spellcheck={false}
-        autocomplete="off"
-        style={{
-          all: "unset",
-          "box-sizing": "border-box",
-          flex: 1,
-          "min-width": 0,
-          "font-family": FONT_SANS,
-          background: "var(--color-surface-solid)",
-          "box-shadow": "inset 0 0 0 1px var(--color-border-strong)",
-          "border-radius": "6px",
-          padding: "1px 6px",
-          margin: "0 -6px",
-          color: "var(--color-text-strong, var(--color-text))",
-        }}
-      />
-    </Show>
-  )
-}
-
 function SessionsSidebar(props: {
+  projectName: string
   sessions: SyncSession[]
+  archivedSessions: SyncSession[]
   activeId: string | undefined
   dirParam: string
   creating: boolean
+  collapsed: boolean
+  width: number
+  mobileOpen: boolean
+  onCloseMobile: () => void
   onNew: () => void
+  onBack: () => void
+  onCollapse: () => void
+  onResize: (width: number, done: boolean) => void
+  onSearch: () => void
+  onCustomize: () => void
+  onContext: (context: SessionContext) => void
+  context: SessionContext
+  contextOpen: boolean
   onSelect: (id: string) => void
+  onWarm: (id: string) => void
   onDelete: (id: string) => void
+  onArchive: (id: string) => void
+  onRestore: (id: string) => void
   onRename: (id: string, title: string) => void
+  onPin: (id: string, pinned: boolean) => void
 }): JSX.Element {
-  const [query, setQuery] = createSignal("")
-  const searching = () => query().trim().length > 0
-  const filtered = createMemo(() => {
-    const q = query().trim().toLowerCase()
-    if (!q) return props.sessions
-    return props.sessions.filter((s) => (s.title || "session").toLowerCase().includes(q))
+  const compact = createMediaQuery("(max-width: 719px)")
+  const mobileHidden = () => compact() && !props.mobileOpen
+  let sidebar: HTMLElement | undefined
+
+  createEffect(() => {
+    if (!compact() || !props.mobileOpen || !sidebar) return
+    const previous = document.activeElement as HTMLElement | null
+    const selector =
+      'button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"]), [role="button"]'
+    queueMicrotask(() => sidebar?.querySelector<HTMLElement>(selector)?.focus())
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault()
+        props.onCloseMobile()
+        return
+      }
+      if (event.key !== "Tab" || !sidebar) return
+      const items = Array.from(sidebar.querySelectorAll<HTMLElement>(selector)).filter(
+        (item) => !item.hasAttribute("disabled") && item.getClientRects().length > 0,
+      )
+      if (items.length === 0) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    document.addEventListener("keydown", onKeyDown, true)
+    onCleanup(() => {
+      document.removeEventListener("keydown", onKeyDown, true)
+      if (previous?.isConnected) previous.focus()
+    })
   })
+
   return (
     <aside
-      class="atlas-scroll"
+      ref={sidebar}
+      id="session-sidebar"
+      class="atlas-scroll session-sidebar"
+      data-mobile-open={props.mobileOpen ? "true" : "false"}
+      data-collapsed={props.collapsed ? "true" : "false"}
+      aria-label="Research sessions"
+      aria-hidden={mobileHidden() ? "true" : undefined}
+      aria-modal={compact() && props.mobileOpen ? "true" : undefined}
+      role={compact() && props.mobileOpen ? "dialog" : undefined}
+      inert={mobileHidden()}
       style={{
-        width: "240px",
-        "min-width": "240px",
-        "border-right": "1px solid var(--color-border)",
-        background: "var(--color-bg-subtle)",
-        display: "flex",
-        "flex-direction": "column",
-        "overflow-y": "auto",
+        "--session-sidebar-width": `${props.width}px`,
+        "--session-sidebar-collapsed-width": `${SIDEBAR_WIDTH.collapsed}px`,
       }}
     >
-      <div
-        style={{
-          padding: "12px 12px 8px",
-          display: "flex",
-          "flex-direction": "column",
-          gap: "8px",
-        }}
-      >
+      <div class="session-sidebar__top">
         <button
-          onClick={props.onNew}
-          disabled={props.creating}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            display: "flex",
-            "align-items": "center",
-            "justify-content": "center",
-            gap: "6px",
-            padding: "7px 12px",
-            "border-radius": "8px",
-            background: "var(--color-surface-solid)",
-            border: "1px solid var(--color-border-strong)",
-            "font-family": FONT_MONO,
-            "font-size": "12px",
-            "font-weight": 400,
-            color: "var(--color-text)",
-            transition: "all 120ms ease",
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-bg-elevated)")}
-          onMouseLeave={(e) => (e.currentTarget.style.background = "var(--color-surface-solid)")}
-          onFocusIn={(e) => (e.currentTarget.style.background = "var(--color-bg-elevated)")}
-          onFocusOut={(e) => (e.currentTarget.style.background = "var(--color-surface-solid)")}
+          type="button"
+          class="session-sidebar__project"
+          aria-label="Back to projects"
+          data-tooltip="Projects"
+          onClick={props.onBack}
         >
-          <IconPlus size={12} strokeWidth={2} />
-          {props.creating ? "creating…" : "New session"}
+          <IconHome size={16} strokeWidth={1.5} />
+          <strong>{props.projectName}</strong>
         </button>
-
-        {/* Search — filters the loaded list live; Esc clears. */}
-        <div style={{ position: "relative", display: "flex", "align-items": "center" }}>
-          <span
-            style={{
-              position: "absolute",
-              left: "10px",
-              display: "inline-flex",
-              "align-items": "center",
-              color: "var(--color-text-faint)",
-              "pointer-events": "none",
-            }}
+        <button
+          type="button"
+          class="session-sidebar__collapse"
+          aria-label={
+            compact() ? "Close sessions" : props.collapsed ? "Expand sessions sidebar" : "Collapse sessions sidebar"
+          }
+          aria-controls="session-sidebar"
+          aria-expanded={compact() ? props.mobileOpen : !props.collapsed}
+          data-tooltip={compact() ? "Close sessions" : props.collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          onClick={() => (compact() ? props.onCloseMobile() : props.onCollapse())}
+        >
+          <Show
+            when={compact()}
+            fallback={
+              <Show when={props.collapsed} fallback={<IconChevronLeft size={14} strokeWidth={1.5} />}>
+                <IconChevronRight size={14} strokeWidth={1.5} />
+              </Show>
+            }
           >
-            <IconSearch size={13} strokeWidth={1.6} />
-          </span>
-          <input
-            value={query()}
-            onInput={(e) => setQuery(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") {
-                e.preventDefault()
-                setQuery("")
-                e.currentTarget.blur()
-              }
-            }}
-            placeholder="Search sessions"
-            spellcheck={false}
-            autocomplete="off"
-            style={{
-              all: "unset",
-              "box-sizing": "border-box",
-              width: "100%",
-              padding: "8px 28px 8px 30px",
-              "border-radius": "8px",
-              background: "var(--color-surface-solid)",
-              border: "1px solid var(--color-border)",
-              "font-family": FONT_MONO,
-              "font-size": "12.5px",
-              color: "var(--color-text)",
-              transition: "border-color 120ms ease",
-            }}
-            onFocusIn={(e) => (e.currentTarget.style.borderColor = "var(--color-border-strong)")}
-            onFocusOut={(e) => (e.currentTarget.style.borderColor = "var(--color-border)")}
-          />
-          <Show when={searching()}>
-            <button
-              type="button"
-              title="clear search"
-              aria-label="clear search"
-              onClick={() => setQuery("")}
-              style={{
-                all: "unset",
-                position: "absolute",
-                right: "8px",
-                cursor: "pointer",
-                display: "inline-flex",
-                "align-items": "center",
-                "justify-content": "center",
-                width: "18px",
-                height: "18px",
-                "border-radius": "5px",
-                color: "var(--color-text-faint)",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--color-text)")}
-              onMouseLeave={(e) => (e.currentTarget.style.color = "var(--color-text-faint)")}
-            >
-              <IconX size={12} strokeWidth={1.8} />
-            </button>
+            <IconX size={14} strokeWidth={1.5} />
           </Show>
+        </button>
+      </div>
+
+      <nav class="session-sidebar__actions" aria-label="Research navigation">
+        <div class="session-sidebar__action-list session-sidebar__primary-actions">
+          <SidebarAction
+            class="session-sidebar__new"
+            label={props.creating ? "Creating…" : "New"}
+            detail="Start a session"
+            ariaLabel="New research"
+            shortcut="⌘N"
+            disabled={props.creating}
+            onClick={props.onNew}
+          >
+            <IconPlus size={16} strokeWidth={1.5} />
+          </SidebarAction>
+          <SidebarAction
+            label="Search"
+            detail="Files, messages, and actions"
+            ariaLabel="Search this project"
+            shortcut="⌘K"
+            onClick={props.onSearch}
+          >
+            <IconSearch size={16} strokeWidth={1.5} />
+          </SidebarAction>
+          <SidebarAction
+            label="Customize"
+            detail="Open settings"
+            ariaLabel="Customize OpenScience"
+            onClick={props.onCustomize}
+          >
+            <IconSettings size={16} strokeWidth={1.5} />
+          </SidebarAction>
+          <ProjectTrustControl />
         </div>
+
+        <SessionSidebarActions context={props.context} contextOpen={props.contextOpen} onContext={props.onContext} />
+      </nav>
+
+      <Show when={!props.collapsed && !compact()}>
+        <PaneResizer
+          owner={props.dirParam}
+          controls="session-sidebar"
+          class="session-sidebar__resize"
+          label="Resize sessions sidebar"
+          title="Drag or use arrow keys to resize. Shift resizes faster. Home/End sets the minimum/maximum. Double-click to reset sidebar width. Escape cancels a drag."
+          edge="right"
+          disabled={props.collapsed || compact()}
+          min={SIDEBAR_WIDTH.min}
+          max={SIDEBAR_WIDTH.max}
+          width={props.width}
+          onResize={(width) => props.onResize(width, false)}
+          onCommit={(width) => props.onResize(width, true)}
+          onReset={() => props.onResize(SIDEBAR_WIDTH.initial, true)}
+        />
+      </Show>
+
+      <div class="session-sidebar__label" id="session-sidebar-sessions">
+        Sessions
       </div>
 
-      {/* Quiet section label — sentence case, no shouty uppercase. */}
-      <div
-        style={{
-          display: "flex",
-          "align-items": "baseline",
-          "justify-content": "space-between",
-          padding: "2px 14px 6px",
-          "font-family": FONT_MONO,
-          "font-size": "11px",
-          color: "var(--color-text-faint)",
-        }}
-      >
-        <span>{searching() ? "Results" : "Sessions"}</span>
-        <span style={{ "font-variant-numeric": "tabular-nums" }}>
-          {searching() ? `${filtered().length} of ${props.sessions.length}` : props.sessions.length}
-        </span>
-      </div>
-
-      <div style={{ display: "flex", "flex-direction": "column", gap: "1px", padding: "0 8px 10px" }}>
-        <For each={filtered()}>
+      <nav class="session-sidebar__list" aria-labelledby="session-sidebar-sessions">
+        <For each={props.sessions}>
           {(s) => (
             <SessionRow
               session={s}
               active={props.activeId === s.id}
               onSelect={() => props.onSelect(s.id)}
+              onWarm={() => props.onWarm(s.id)}
               onDelete={() => props.onDelete(s.id)}
+              onArchive={() => props.onArchive(s.id)}
               onRename={(title) => props.onRename(s.id, title)}
+              onPin={(pinned) => props.onPin(s.id, pinned)}
             />
           )}
         </For>
         <Show when={props.sessions.length === 0}>
-          <div
-            style={{
-              padding: "12px 10px",
-              "font-family": FONT_MONO,
-              "font-size": "11px",
-              color: "var(--color-text-faint)",
-              "line-height": 1.55,
-            }}
-          >
-            No sessions yet — click <span style={{ color: "var(--color-text-muted)" }}>New session</span> above.
-          </div>
+          <div class="session-sidebar__empty">No sessions yet.</div>
         </Show>
-        <Show when={props.sessions.length > 0 && filtered().length === 0}>
-          <div
-            style={{
-              padding: "12px 10px",
-              "font-family": FONT_MONO,
-              "font-size": "11px",
-              color: "var(--color-text-faint)",
-              "line-height": 1.55,
-            }}
-          >
-            No sessions match “{query().trim()}”.
+      </nav>
+      <Show when={props.archivedSessions.length > 0}>
+        <details class="session-sidebar__archived">
+          <summary>
+            <IconArchive size={12} strokeWidth={1.5} />
+            Archived
+            <span>{props.archivedSessions.length}</span>
+            <IconChevronDown size={12} strokeWidth={1.5} />
+          </summary>
+          <div class="session-sidebar__archived-list">
+            <For each={props.archivedSessions}>
+              {(session) => (
+                <div class="session-sidebar__archived-row">
+                  <span title={session.title || "Session"}>{session.title || "Session"}</span>
+                  <button type="button" onClick={() => props.onRestore(session.id)}>
+                    Restore
+                  </button>
+                </div>
+              )}
+            </For>
           </div>
-        </Show>
-      </div>
+        </details>
+      </Show>
     </aside>
+  )
+}
+
+function ProjectTrustControl(): JSX.Element {
+  const authority = useExecutionAuthority("shell")
+  const dialog = useDialog()
+
+  const trust = async () => {
+    const root = authority.decision()?.remediation?.body.root
+    if (!root || authority.trusting()) return
+    const confirmed = await confirmDialog(dialog, {
+      title: "Trust this project?",
+      message: `Allow project code under ${root} to run using the current execution policy. If sandboxing is off or unavailable and fallback permits it, code may run with your user authority. Review Settings → Sandbox first.`,
+      confirmLabel: "Trust project",
+    })
+    if (!confirmed) return
+    try {
+      await authority.trust()
+      toast.success("Project trusted", "Project code can now run under the current execution policy.")
+    } catch (error) {
+      toast.error("Could not trust project", error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  return (
+    <Show when={authority.canTrust()}>
+      <SidebarAction
+        class="session-sidebar__trust"
+        label={authority.trusting() ? "Trusting…" : "Trust project"}
+        detail="Allow project code"
+        ariaLabel="Trust this project to run project code"
+        disabled={authority.trusting()}
+        onClick={() => void trust()}
+      >
+        <IconShield size={16} strokeWidth={1.5} />
+      </SidebarAction>
+    </Show>
   )
 }
 
@@ -1301,183 +1902,146 @@ function SessionRow(props: {
   session: SyncSession
   active: boolean
   onSelect: () => void
+  onWarm: () => void
   onDelete: () => void
+  onArchive: () => void
   onRename: (title: string) => void
+  onPin: (pinned: boolean) => void
 }): JSX.Element {
   const [hover, setHover] = createSignal(false)
+  const [menu, setMenu] = createSignal(false)
   const [editing, setEditing] = createSignal(false)
   const [draft, setDraft] = createSignal("")
+  let tab: HTMLButtonElement | undefined
   const startEdit = () => {
     setDraft(props.session.title || "")
     setEditing(true)
   }
-  const commit = () => {
+  const finishEditing = (restoreFocus: boolean) => {
+    setEditing(false)
+    if (restoreFocus) queueMicrotask(() => tab?.focus())
+  }
+  const commit = (restoreFocus = false) => {
     if (!editing()) return
     const next = draft().trim()
-    setEditing(false)
+    finishEditing(restoreFocus)
     if (next && next !== (props.session.title || "")) props.onRename(next)
   }
-  const cancel = () => {
-    setEditing(false)
+  const cancel = (restoreFocus = false) => {
+    finishEditing(restoreFocus)
     setDraft("")
   }
   return (
     <div
-      role="button"
-      tabindex="0"
-      onClick={() => {
-        if (editing()) return
-        props.onSelect()
-      }}
-      onDblClick={(e) => {
-        e.stopPropagation()
-        startEdit()
-      }}
-      onKeyDown={(e) => {
-        if (editing()) return
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault()
-          props.onSelect()
-        }
-      }}
+      class="session-sidebar__session"
+      role="presentation"
+      data-active={props.active ? "true" : undefined}
+      data-pinned={props.session.time?.pinned ? "true" : undefined}
+      data-actions={(hover() || menu()) && !editing() ? "true" : undefined}
+      data-menu-open={menu() ? "true" : undefined}
+      data-editing={editing() ? "true" : undefined}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onFocusIn={() => setHover(true)}
       onFocusOut={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setHover(false)
-      }}
-      style={{
-        cursor: editing() ? "text" : "pointer",
-        display: "flex",
-        "flex-direction": "column",
-        gap: "3px",
-        padding: "8px 12px",
-        "padding-right": hover() && !editing() ? "34px" : "12px",
-        "border-radius": "8px",
-        background: props.active ? "var(--color-bg-elevated)" : hover() ? "var(--color-accent-subtle)" : "transparent",
-        transition: "background 120ms ease, padding 120ms ease",
-        position: "relative",
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+        setHover(false)
       }}
     >
-      <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-        <StatusDot status={props.active ? "active" : "muted"} size={9} />
-        <Show
-          when={editing()}
-          fallback={
-            <span
-              title="Double-click to rename"
-              style={{
-                "font-family": FONT_MONO,
-                "font-size": "12.5px",
-                color: props.active ? "var(--color-text)" : "var(--color-text-muted)",
-                "font-weight": 400,
-                flex: 1,
-                overflow: "hidden",
-                "text-overflow": "ellipsis",
-                "white-space": "nowrap",
-              }}
-            >
-              {props.session.title || "session"}
+      <Show
+        when={editing()}
+        fallback={
+          <button
+            ref={tab}
+            type="button"
+            class="session-sidebar__session-main"
+            aria-current={props.active ? "page" : undefined}
+            aria-label={props.session.title || "Session"}
+            data-session-id={props.session.id}
+            onPointerEnter={props.onWarm}
+            onFocus={props.onWarm}
+            onClick={props.onSelect}
+            onDblClick={(event) => {
+              event.preventDefault()
+              startEdit()
+            }}
+          >
+            <span class="session-sidebar__session-status" aria-hidden="true">
+              <Show
+                when={props.session.time?.pinned}
+                fallback={
+                  <span class="session-sidebar__session-dot">
+                    <StatusDot status={props.active ? "active" : "muted"} size={7} />
+                  </span>
+                }
+              >
+                <IconPinFilled size={10} strokeWidth={1.5} />
+              </Show>
             </span>
-          }
-        >
-          <input
-            ref={(el) =>
-              queueMicrotask(() => {
-                el.focus()
-                el.select()
-              })
-            }
-            value={draft()}
-            onInput={(e) => setDraft(e.currentTarget.value)}
-            onClick={(e) => e.stopPropagation()}
-            onPointerDown={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              e.stopPropagation()
-              if (e.key === "Enter") {
-                e.preventDefault()
-                commit()
-              } else if (e.key === "Escape") {
-                e.preventDefault()
-                cancel()
-              }
-            }}
-            onBlur={commit}
-            spellcheck={false}
-            autocomplete="off"
-            style={{
-              all: "unset",
-              "box-sizing": "border-box",
-              flex: 1,
-              "min-width": 0,
-              padding: "1px 5px",
-              "margin-left": "-5px",
-              "border-radius": "5px",
-              background: "var(--color-surface-solid)",
-              "box-shadow": "inset 0 0 0 1px var(--color-border-strong)",
-              "font-family": FONT_MONO,
-              "font-size": "12.5px",
-              color: "var(--color-text)",
-            }}
-          />
-        </Show>
-      </div>
-      <div
-        style={{
-          "font-family": FONT_MONO,
-          "font-size": "10.5px",
-          color: "var(--color-text-faint)",
-          "letter-spacing": "0.04em",
-          "padding-left": "17px",
-        }}
+            <span class="session-sidebar__session-title" title="Double-click to rename">
+              {props.session.title || "Session"}
+            </span>
+          </button>
+        }
       >
-        {props.session.time?.updated ? DateTime.fromMillis(props.session.time.updated).toRelative() : "—"}
-      </div>
-      <Show when={hover() && !editing()}>
-        <button
-          type="button"
-          title="delete session"
-          aria-label="delete session"
-          onPointerDown={(e) => {
-            // Stop pointerdown on the parent row before its own click
-            // can fire — Solid runs the row's onClick first otherwise.
-            e.stopPropagation()
+        <input
+          ref={(el) =>
+            queueMicrotask(() => {
+              el.focus()
+              el.select()
+            })
+          }
+          class="session-sidebar__session-input"
+          aria-label="Rename session"
+          value={draft()}
+          onInput={(e) => setDraft(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault()
+              commit(true)
+            } else if (e.key === "Escape") {
+              e.preventDefault()
+              cancel(true)
+            }
           }}
-          onClick={(e) => {
-            e.stopPropagation()
-            e.preventDefault()
-            props.onDelete()
-          }}
-          style={{
-            position: "absolute",
-            right: "6px",
-            top: "50%",
-            transform: "translateY(-50%)",
-            display: "inline-flex",
-            "align-items": "center",
-            "justify-content": "center",
-            width: "22px",
-            height: "22px",
-            "border-radius": "4px",
-            background: "var(--color-surface-solid)",
-            border: "1px solid var(--color-border)",
-            color: "var(--color-text-faint)",
-            cursor: "pointer",
-            transition: "all 120ms ease",
-          }}
-          onMouseEnter={(el) => {
-            el.currentTarget.style.background = "var(--color-error-muted)"
-            el.currentTarget.style.borderColor = "var(--color-error)"
-            el.currentTarget.style.color = "var(--color-error)"
-          }}
-          onMouseLeave={(el) => {
-            el.currentTarget.style.background = "var(--color-surface-solid)"
-            el.currentTarget.style.borderColor = "var(--color-border)"
-            el.currentTarget.style.color = "var(--color-text-faint)"
-          }}
-        >
-          <IconTrash size={11} strokeWidth={1.5} />
-        </button>
+          onBlur={() => commit()}
+          spellcheck={false}
+          autocomplete="off"
+        />
+      </Show>
+      <Show when={!editing()}>
+        <DropdownMenu open={menu()} onOpenChange={setMenu}>
+          <DropdownMenu.Trigger
+            class="session-sidebar__session-menu-button"
+            title="Session actions"
+            aria-label={`Session actions for ${props.session.title || "Session"}`}
+            tabindex={props.active || hover() || menu() ? 0 : -1}
+          >
+            <IconMoreH size={12} strokeWidth={1.5} />
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content class="session-sidebar__session-menu-popover">
+              <DropdownMenu.Item onSelect={() => props.onPin(!props.session.time?.pinned)}>
+                <Show when={props.session.time?.pinned} fallback={<IconPin size={12} strokeWidth={1.5} />}>
+                  <IconPinFilled size={12} strokeWidth={1.5} />
+                </Show>
+                <DropdownMenu.ItemLabel>{props.session.time?.pinned ? "Unpin" : "Pin"}</DropdownMenu.ItemLabel>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item onSelect={startEdit}>
+                <DropdownMenu.ItemLabel>Rename</DropdownMenu.ItemLabel>
+              </DropdownMenu.Item>
+              <DropdownMenu.Item onSelect={props.onArchive}>
+                <IconArchive size={12} strokeWidth={1.5} />
+                <DropdownMenu.ItemLabel>Archive</DropdownMenu.ItemLabel>
+              </DropdownMenu.Item>
+              <DropdownMenu.Separator />
+              <DropdownMenu.Item class="session-sidebar__session-menu-danger" onSelect={props.onDelete}>
+                <IconTrash size={12} strokeWidth={1.5} />
+                <DropdownMenu.ItemLabel>Delete</DropdownMenu.ItemLabel>
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu>
       </Show>
     </div>
   )

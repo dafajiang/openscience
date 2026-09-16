@@ -5,6 +5,7 @@ import { retry } from "@synsci/util/retry"
 import { createSimpleContext } from "@synsci/ui/context"
 import { useGlobalSync } from "./global-sync"
 import { useSDK } from "./sdk"
+import { SESSION_MESSAGE_CHUNK, mergeHydratedMessages, sessionHydrationPlan } from "./session-hydration"
 import type { Message, Part } from "@synsci/sdk/v2/client"
 
 const keyFor = (directory: string, id: string) => `${directory}\n${id}`
@@ -16,11 +17,13 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
     const sdk = useSDK()
 
     type Child = ReturnType<(typeof globalSync)["child"]>
+    type Store = Child[0]
     type Setter = Child[1]
 
-    const current = createMemo(() => globalSync.child(sdk.directory))
+    const child = () => globalSync.child(sdk.directory, { projectID: sdk.projectID })
+    const current = createMemo(child)
     const absolute = (path: string) => (current()[0].path.directory + "/" + path).replace("//", "/")
-    const chunk = 400
+    const chunk = SESSION_MESSAGE_CHUNK
     const inflight = new Map<string, Promise<void>>()
     const inflightDiff = new Map<string, Promise<void>>()
     const inflightTodo = new Map<string, Promise<void>>()
@@ -37,39 +40,54 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       return undefined
     }
 
-    const limitFor = (count: number) => {
-      if (count <= chunk) return chunk
-      return Math.ceil(count / chunk) * chunk
-    }
-
     const loadMessages = async (input: {
       directory: string
       client: typeof sdk.client
+      store: Store
       setStore: Setter
       sessionID: string
       limit: number
+      preserveMessages?: Message[]
     }) => {
       const key = keyFor(input.directory, input.sessionID)
       if (meta.loading[key]) return
 
       setMeta("loading", key, true)
+      // SSE keeps streaming while this request is in flight. Entities it
+      // changes meanwhile are newer than the response bytes and must win;
+      // otherwise entering a streaming session rolled its text backwards.
+      const startedAt = globalSync.transcript.revision(input.directory, input.sessionID)
       await retry(() => input.client.session.messages({ sessionID: input.sessionID, limit: input.limit }))
         .then((messages) => {
           const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
-          const next = items
+          const incoming = items
             .map((x) => x.info)
             .filter((m) => !!m?.id)
             .sort((a, b) => a.id.localeCompare(b.id))
+          const changes = globalSync.transcript.changesSince(input.directory, input.sessionID, startedAt)
+          const live = input.store.message[input.sessionID] ?? []
+          const next = mergeHydratedMessages(input.preserveMessages?.length ? input.preserveMessages : live, incoming, {
+            preserveCached: !!input.preserveMessages?.length,
+            preferCached: changes.messages.changed,
+            removed: changes.messages.removed,
+          })
 
           batch(() => {
             input.setStore("message", input.sessionID, reconcile(next, { key: "id" }))
 
             for (const message of items) {
+              if (changes.messages.removed.has(message.info.id)) continue
+              const incomingParts = message.parts.filter((p) => !!p?.id).sort((a, b) => a.id.localeCompare(b.id))
+              const liveParts = input.store.part[message.info.id] ?? []
               input.setStore(
                 "part",
                 message.info.id,
                 reconcile(
-                  message.parts.filter((p) => !!p?.id).sort((a, b) => a.id.localeCompare(b.id)),
+                  mergeHydratedMessages(liveParts, incomingParts, {
+                    preserveCached: false,
+                    preferCached: changes.parts.changed,
+                    removed: changes.parts.removed,
+                  }),
                   { key: "id" },
                 ),
               )
@@ -133,10 +151,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             }),
           )
         },
-        async sync(sessionID: string) {
-          const directory = sdk.directory
+        async sync(sessionID: string, options?: { refresh?: boolean }) {
+          const directory = sdk.scope
           const client = sdk.client
-          const [store, setStore] = globalSync.child(directory)
+          const [store, setStore] = child()
           const key = keyFor(directory, sessionID)
           const hasSession = (() => {
             const match = Binary.search(store.session, sessionID, (s) => s.id)
@@ -144,13 +162,17 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           })()
 
           const hasMessages = store.message[sessionID] !== undefined
-          const hydrated = meta.limit[key] !== undefined
-          if (hasSession && hasMessages && hydrated) return
+          const count = store.message[sessionID]?.length ?? 0
+          const plan = sessionHydrationPlan({
+            hasSession,
+            hasMessages,
+            hydratedLimit: meta.limit[key],
+            messageCount: count,
+            refresh: options?.refresh,
+          })
+          if (plan.skip) return
           const pending = inflight.get(key)
           if (pending) return pending
-
-          const count = store.message[sessionID]?.length ?? 0
-          const limit = hydrated ? (meta.limit[key] ?? chunk) : limitFor(count)
 
           const sessionReq = hasSession
             ? Promise.resolve()
@@ -170,16 +192,17 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                 )
               })
 
-          const messagesReq =
-            hasMessages && hydrated
-              ? Promise.resolve()
-              : loadMessages({
-                  directory,
-                  client,
-                  setStore,
-                  sessionID,
-                  limit,
-                })
+          const messagesReq = plan.loadMessages
+            ? loadMessages({
+                directory,
+                client,
+                store,
+                setStore,
+                sessionID,
+                limit: plan.limit,
+                preserveMessages: options?.refresh ? store.message[sessionID] : undefined,
+              })
+            : Promise.resolve()
 
           const promise = Promise.all([sessionReq, messagesReq])
             .then(() => {})
@@ -191,9 +214,9 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           return promise
         },
         async diff(sessionID: string) {
-          const directory = sdk.directory
+          const directory = sdk.scope
           const client = sdk.client
-          const [store, setStore] = globalSync.child(directory)
+          const [store, setStore] = child()
           if (store.session_diff[sessionID] !== undefined) return
 
           const key = keyFor(directory, sessionID)
@@ -213,13 +236,19 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         },
         async revert(sessionID: string, messageID: string) {
           const client = sdk.client
-          const [, setStore] = globalSync.child(sdk.directory)
+          const [, setStore] = child()
           const res = await client.session.revert({ sessionID, messageID })
-          if (res.data)
+          const payload: unknown = res.data
+          const data = (() => {
+            if (!payload || typeof payload !== "object") return
+            if (!("session" in payload)) return payload as ReturnType<typeof getSession>
+            return (payload as { session?: ReturnType<typeof getSession> }).session
+          })()
+          if (data)
             setStore(
               produce((draft) => {
                 const m = Binary.search(draft.session, sessionID, (s) => s.id)
-                if (m.found) draft.session[m.index] = res.data!
+                if (m.found) draft.session[m.index] = data
               }),
             )
           const next = await client.session
@@ -227,10 +256,19 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             .then((d) => d.data ?? [])
             .catch(() => [])
           setStore("session_diff", sessionID, reconcile(next, { key: "file" }))
+          if (!payload || typeof payload !== "object" || !("status" in payload)) return
+          const result = payload as { status?: unknown; turns?: unknown; files?: unknown }
+          return {
+            status: typeof result.status === "string" ? result.status : undefined,
+            turns: typeof result.turns === "number" ? result.turns : undefined,
+            files: Array.isArray(result.files)
+              ? result.files.filter((file): file is string => typeof file === "string")
+              : undefined,
+          }
         },
         async unrevert(sessionID: string) {
           const client = sdk.client
-          const [, setStore] = globalSync.child(sdk.directory)
+          const [, setStore] = child()
           const res = await client.session.unrevert({ sessionID })
           if (res.data)
             setStore(
@@ -246,9 +284,9 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           setStore("session_diff", sessionID, reconcile(next, { key: "file" }))
         },
         async todo(sessionID: string) {
-          const directory = sdk.directory
+          const directory = sdk.scope
           const client = sdk.client
-          const [store, setStore] = globalSync.child(directory)
+          const [store, setStore] = child()
           if (store.todo[sessionID] !== undefined) return
 
           const key = keyFor(directory, sessionID)
@@ -269,20 +307,20 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         history: {
           more(sessionID: string) {
             const store = current()[0]
-            const key = keyFor(sdk.directory, sessionID)
+            const key = keyFor(sdk.scope, sessionID)
             if (store.message[sessionID] === undefined) return false
             if (meta.limit[key] === undefined) return false
             if (meta.complete[key]) return false
             return true
           },
           loading(sessionID: string) {
-            const key = keyFor(sdk.directory, sessionID)
+            const key = keyFor(sdk.scope, sessionID)
             return meta.loading[key] ?? false
           },
           async loadMore(sessionID: string, count = chunk) {
-            const directory = sdk.directory
+            const directory = sdk.scope
             const client = sdk.client
-            const [, setStore] = globalSync.child(directory)
+            const [store, setStore] = child()
             const key = keyFor(directory, sessionID)
             if (meta.loading[key]) return
             if (meta.complete[key]) return
@@ -291,6 +329,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             await loadMessages({
               directory,
               client,
+              store,
               setStore,
               sessionID,
               limit: currentLimit + count,
@@ -298,9 +337,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           },
         },
         fetch: async (count = 10) => {
-          const directory = sdk.directory
           const client = sdk.client
-          const [store, setStore] = globalSync.child(directory)
+          const [store, setStore] = child()
           setStore("limit", (x) => x + count)
           await client.session.list().then((x) => {
             const sessions = (x.data ?? [])
@@ -312,9 +350,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         },
         more: createMemo(() => current()[0].session.length >= current()[0].limit),
         archive: async (sessionID: string) => {
-          const directory = sdk.directory
           const client = sdk.client
-          const [, setStore] = globalSync.child(directory)
+          const [, setStore] = child()
           await client.session.update({ sessionID, time: { archived: Date.now() } })
           setStore(
             produce((draft) => {
@@ -323,10 +360,32 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             }),
           )
         },
-        rename: async (sessionID: string, title: string) => {
-          const directory = sdk.directory
+        pin: async (sessionID: string, pinned: boolean) => {
           const client = sdk.client
-          const [, setStore] = globalSync.child(directory)
+          const [, setStore] = child()
+          const value = pinned ? Date.now() : 0
+          const previous: { value?: number } = {}
+          setStore(
+            produce((draft) => {
+              const match = Binary.search(draft.session, sessionID, (session) => session.id)
+              if (!match.found) return
+              previous.value = draft.session[match.index].time.pinned
+              draft.session[match.index].time.pinned = value || undefined
+            }),
+          )
+          await client.session.update({ sessionID, time: { pinned: value } }).catch((error) => {
+            setStore(
+              produce((draft) => {
+                const match = Binary.search(draft.session, sessionID, (session) => session.id)
+                if (match.found) draft.session[match.index].time.pinned = previous.value
+              }),
+            )
+            throw error
+          })
+        },
+        rename: async (sessionID: string, title: string) => {
+          const client = sdk.client
+          const [, setStore] = child()
           // Optimistically retitle in place so the row renames instantly; if the
           // backend rejects it we roll the title back so the UI stays honest.
           let prev: string | undefined
@@ -352,9 +411,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           }
         },
         delete: async (sessionID: string) => {
-          const directory = sdk.directory
           const client = sdk.client
-          const [, setStore] = globalSync.child(directory)
+          const [, setStore] = child()
           // Optimistically remove from the per-directory store. If the
           // backend call rejects we re-add it so the UI stays honest.
           let snapshot: any

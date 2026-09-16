@@ -1,7 +1,8 @@
 import { defineConfig, devices } from "@playwright/test"
+import { resolvePlaywrightTarget } from "./script/e2e-mode"
 
-const port = Number(process.env.PLAYWRIGHT_PORT ?? 3000)
-const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? `http://localhost:${port}`
+const target = resolvePlaywrightTarget(process.env)
+const baseURL = target.baseURL
 const serverHost = process.env.PLAYWRIGHT_SERVER_HOST ?? "localhost"
 const serverPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
 // Basic-Auth creds for the in-process openscience server. e2e-local.ts pins both
@@ -9,37 +10,54 @@ const serverPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
 // the same value so the Playwright-hosted frontend can authenticate.
 const serverUsername = process.env.VITE_OPENSCIENCE_SERVER_USERNAME ?? "openscience"
 const serverPassword = process.env.VITE_OPENSCIENCE_SERVER_PASSWORD ?? ""
-const command = `bun run dev -- --host 0.0.0.0 --port ${port}`
-const reuse = !process.env.CI
+const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+const command = `bun run dev -- --host 0.0.0.0 --port ${target.port}`
 
 export default defineConfig({
   testDir: "./e2e",
   outputDir: "./e2e/test-results",
   timeout: 60_000,
+  // The integration harness intentionally shares one backend, project
+  // worktree, deterministic model, and PTY pool. Parallel browser contexts
+  // mutate that shared state and can abort prompts or tear down another
+  // test's terminal, so keep this suite serial and deterministic.
+  workers: 1,
   expect: {
     timeout: 10_000,
   },
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  // Keep one retry for diagnosis, but a passing retry must not conceal an
+  // unstable release gate. Local runs keep their existing no-retry behavior.
+  failOnFlakyTests: !!process.env.CI,
+  retries: process.env.CI ? 1 : 0,
   reporter: [["html", { outputFolder: "e2e/playwright-report", open: "never" }], ["line"]],
-  webServer: {
-    command,
-    url: baseURL,
-    reuseExistingServer: reuse,
-    timeout: 120_000,
-    env: {
-      VITE_OPENSCIENCE_SERVER_HOST: serverHost,
-      VITE_OPENSCIENCE_SERVER_PORT: serverPort,
-      VITE_OPENSCIENCE_SERVER_USERNAME: serverUsername,
-      VITE_OPENSCIENCE_SERVER_PASSWORD: serverPassword,
-    },
-  },
+  ...(target.startWebServer
+    ? {
+        webServer: {
+          command,
+          url: baseURL,
+          // The isolated harness owns a freshly allocated port. Reusing any
+          // listener would make it possible to test a different checkout.
+          reuseExistingServer: target.reuseExistingServer,
+          timeout: 120_000,
+          env: {
+            VITE_OPENSCIENCE_SERVER_HOST: serverHost,
+            VITE_OPENSCIENCE_SERVER_PORT: serverPort,
+            VITE_OPENSCIENCE_SERVER_USERNAME: serverUsername,
+            VITE_OPENSCIENCE_SERVER_PASSWORD: serverPassword,
+          },
+        },
+      }
+    : {}),
   use: {
     baseURL,
-    trace: "on-first-retry",
+    trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
+    // Recording every attempt and discarding the passing footage costs real
+    // wall-clock time under a single worker. Failed attempts retain traces and
+    // screenshots; the retry also records video for diagnosis.
+    video: "on-first-retry",
     // Inject Basic-Auth on every browser request. The frontend's
     // openscience-fetch.ts wraps fetch() with the same header, but its
     // dev-mode gate + port-match check is fragile under windows-latest
@@ -52,7 +70,10 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        launchOptions: executablePath ? { executablePath } : undefined,
+      },
     },
   ],
 })

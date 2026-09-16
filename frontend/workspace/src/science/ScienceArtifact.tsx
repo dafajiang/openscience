@@ -1,6 +1,6 @@
 import { Show, createMemo, type JSX } from "solid-js"
 import { Dynamic } from "solid-js/web"
-import { get, type ArtifactKind } from "./renderers"
+import { get, type ArtifactInspection, type ArtifactKind } from "./renderers"
 
 /**
  * Dispatcher for scientific artifacts rendered inline in chat.
@@ -18,6 +18,7 @@ export interface ScienceArtifactProps {
   kind: ArtifactKind
   data: unknown
   height?: number
+  onInspect?: (inspection: ArtifactInspection) => void
 }
 
 export function ScienceArtifact(props: ScienceArtifactProps): JSX.Element {
@@ -26,7 +27,15 @@ export function ScienceArtifact(props: ScienceArtifactProps): JSX.Element {
   return (
     <div data-component="science-artifact" data-kind={props.kind}>
       <Show when={renderer()} fallback={<ScienceArtifactFallback kind={props.kind} data={props.data} />}>
-        {(Renderer) => <Dynamic component={Renderer()} kind={props.kind} data={props.data} height={props.height} />}
+        {(Renderer) => (
+          <Dynamic
+            component={Renderer()}
+            kind={props.kind}
+            data={props.data}
+            height={props.height}
+            onInspect={props.onInspect}
+          />
+        )}
       </Show>
     </div>
   )
@@ -50,5 +59,3 @@ function ScienceArtifactFallback(props: { kind: ArtifactKind; data: unknown }): 
     </div>
   )
 }
-
-export default ScienceArtifact

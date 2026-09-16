@@ -3,8 +3,10 @@ import { createSimpleContext } from "@synsci/ui/context"
 import { batch, createMemo, createRoot, onCleanup } from "solid-js"
 import { useParams } from "@solidjs/router"
 import type { FileSelection } from "@/context/file"
+import { attachBytes, detachBytes, dropBytelessAttachments } from "./prompt-attachments"
 import { Persist, persisted } from "@/utils/persist"
 import { checksum } from "@synsci/util/encode"
+import { useSDK } from "./sdk"
 
 interface PartBase {
   content: string
@@ -12,7 +14,7 @@ interface PartBase {
   end: number
 }
 
-export interface TextPart extends PartBase {
+interface TextPart extends PartBase {
   type: "text"
 }
 
@@ -27,18 +29,26 @@ export interface AgentPart extends PartBase {
   name: string
 }
 
+export interface ConversationAttachmentPart extends PartBase {
+  type: "conversation"
+  sourceSessionID: string
+  label: string
+  throughMessageID?: string
+}
+
 export interface ImageAttachmentPart {
   type: "image"
   id: string
   filename: string
   mime: string
   dataUrl: string
+  size?: number
 }
 
-export type ContentPart = TextPart | FileAttachmentPart | AgentPart | ImageAttachmentPart
+export type ContentPart = TextPart | FileAttachmentPart | AgentPart | ConversationAttachmentPart | ImageAttachmentPart
 export type Prompt = ContentPart[]
 
-export type FileContextItem = {
+type FileContextItem = {
   type: "file"
   path: string
   selection?: FileSelection
@@ -78,6 +88,11 @@ export function isPromptEqual(promptA: Prompt, promptB: Prompt): boolean {
     if (partA.type === "agent" && partA.name !== (partB as AgentPart).name) {
       return false
     }
+    if (partA.type === "conversation") {
+      const conversation = partB as ConversationAttachmentPart
+      if (partA.sourceSessionID !== conversation.sourceSessionID) return false
+      if (partA.throughMessageID !== conversation.throughMessageID) return false
+    }
     if (partA.type === "image" && partA.id !== (partB as ImageAttachmentPart).id) {
       return false
     }
@@ -94,6 +109,7 @@ function clonePart(part: ContentPart): ContentPart {
   if (part.type === "text") return { ...part }
   if (part.type === "image") return { ...part }
   if (part.type === "agent") return { ...part }
+  if (part.type === "conversation") return { ...part }
   return {
     ...part,
     selection: cloneSelection(part.selection),
@@ -118,7 +134,7 @@ function createPromptSession(dir: string, id: string | undefined) {
   const legacy = `${dir}/prompt${id ? "/" + id : ""}.v2`
 
   const [store, setStore, _, ready] = persisted(
-    Persist.scoped(dir, id, "prompt", [legacy]),
+    { ...Persist.scoped(dir, id, "prompt", [legacy]), migrate: dropBytelessAttachments },
     createStore<{
       prompt: Prompt
       cursor?: number
@@ -152,7 +168,7 @@ function createPromptSession(dir: string, id: string | undefined) {
 
   return {
     ready,
-    current: createMemo(() => store.prompt),
+    current: createMemo(() => attachBytes(store.prompt)),
     cursor: createMemo(() => store.cursor),
     dirty: createMemo(() => !isPromptEqual(store.prompt, DEFAULT_PROMPT)),
     context: {
@@ -167,7 +183,7 @@ function createPromptSession(dir: string, id: string | undefined) {
       },
     },
     set(prompt: Prompt, cursorPosition?: number) {
-      const next = clonePrompt(prompt)
+      const next = detachBytes(clonePrompt(prompt))
       batch(() => {
         setStore("prompt", next)
         if (cursorPosition !== undefined) setStore("cursor", cursorPosition)
@@ -187,6 +203,7 @@ export const { use: usePrompt, provider: PromptProvider } = createSimpleContext(
   gate: false,
   init: () => {
     const params = useParams()
+    const sdk = useSDK()
     const cache = new Map<string, PromptCacheEntry>()
 
     const disposeAll = () => {
@@ -227,7 +244,7 @@ export const { use: usePrompt, provider: PromptProvider } = createSimpleContext(
       return entry.value
     }
 
-    const session = createMemo(() => load(params.dir!, params.id))
+    const session = createMemo(() => load(sdk.scope, params.id))
 
     return {
       ready: () => session().ready(),

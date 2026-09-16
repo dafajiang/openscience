@@ -1,4 +1,4 @@
-import { test, expect, mock } from "bun:test"
+import { afterEach, test, expect, mock } from "bun:test"
 import path from "path"
 
 // Mock BunProc and default plugins to prevent actual installations during tests
@@ -26,51 +26,364 @@ import { tmpdir } from "../fixture/fixture"
 import { Instance } from "../../src/project/instance"
 import { Provider } from "../../src/provider/provider"
 import { Env } from "../../src/env"
+import { Auth } from "../../src/auth"
+import { ModelsDev } from "../../src/provider/models"
+import { MANAGED_OPENROUTER_MODELS, MANAGED_MODEL_DETAILS } from "../../src/provider/managed-catalog"
+import { OpenScience } from "../../src/openscience"
 
-/* Pinned against the live models.dev catalog. When models.dev delists one of
-   these ids, the "pinned catalog models still exist upstream" test below fails
-   with instructions — update the pin here and every test follows. Previous
-   pin claude-sonnet-4-20250514 was delisted upstream on 2026-07-05 and broke
-   10 tests at once. */
+/* Keep this list aligned with live-catalog.test.ts. The committed fixture makes
+   PR CI deterministic; the scheduled live check catches upstream delistings. */
+const FRONTIER_MODELS = {
+  anthropic: ["claude-opus-5", "claude-sonnet-5"],
+  openai: ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+  xai: [
+    "grok-4.3",
+    "grok-4.5",
+    "grok-build-0.1",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent-0309",
+  ],
+  moonshotai: ["kimi-k3"],
+  zai: ["glm-5.3-flash"],
+  zhipuai: ["glm-5.3-flash"],
+  vercel: ["meta/muse-spark-1.1"],
+  openrouter: [
+    "anthropic/claude-opus-5",
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-5.6-sol",
+    "x-ai/grok-4.5",
+    "moonshotai/kimi-k3",
+    "meta/muse-spark-1.1",
+  ],
+}
 const SONNET = "claude-sonnet-4-6"
 const OPUS = "claude-opus-4-5"
 
-test("pinned catalog models are present in the seeded test fixture", async () => {
-  await using tmp = await tmpdir({})
+test("Ace preserves reviewed fallback models but requires approval for new bound-thinking routes", async () => {
+  await using tmp = await tmpdir({ config: { billing: { llm: "managed" } } })
+  await OpenScience.saveSession({
+    api_key: "osk_fixture_managed_catalog",
+    user_id: "fixture",
+    organization_id: "fixture-org",
+    workspace_locked: true,
+  })
+  try {
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const provider = (await Provider.list()).openrouter
+        expect(provider.source).toBe("managed")
+        const available = MANAGED_OPENROUTER_MODELS.filter((id) => !MANAGED_MODEL_DETAILS[id].requiresApproval)
+        expect(Object.keys(provider.models).sort()).toEqual([...available].sort())
+        expect(Object.keys(provider.models)).toHaveLength(22)
+        expect(provider.models["anthropic/claude-fable-5.1"]).toBeUndefined()
+        for (const id of available) {
+          const model = provider.models[id]
+          const reviewed = MANAGED_MODEL_DETAILS[id]
+          expect(model.api.id).toBe(id)
+          expect(model.name).toBe(reviewed.name)
+          expect(model.limit.context).toBe(reviewed.context)
+          expect(model.limit.output).toBe(reviewed.output)
+        }
+        expect(provider.models["qwen/qwen3.8-flash"].name).toBe("Qwen 3.8 Flash Next")
+        expect(provider.models["nvidia/nemotron-3-ultra-550b-a55b"].capabilities.input.image).toBe(false)
+        // The managed envelope accepts text and images only; audio, video and
+        // documents are cleared on the Ace route even for multimodal models.
+        expect(provider.models["google/gemini-3.7-flash"].capabilities.input.video).toBe(false)
+        expect(provider.models["google/gemini-3.7-flash"].capabilities.input.image).toBe(true)
+        for (const id of ["openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna"]) {
+          expect(Object.keys(provider.models[id].variants ?? {})).toEqual([
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+          ])
+          expect(provider.models[id].modes).toEqual({})
+        }
+        for (const id of ["openai/gpt-6-astra"]) {
+          expect(Object.keys(provider.models[id].variants ?? {})).toEqual(["low", "medium", "high", "xhigh", "max"])
+          expect(provider.models[id].modes).toEqual({})
+        }
+      },
+    })
+  } finally {
+    await OpenScience.clearSession()
+  }
+})
+
+test("normalized catalog providers satisfy the public provider schema without an API URL", () => {
+  const catalog = ModelsDev.Provider.parse({
+    id: "native",
+    name: "Native",
+    env: [],
+    npm: "@ai-sdk/openai",
+    models: {
+      echo: {
+        id: "echo",
+        name: "Echo",
+        release_date: "2026-01-01",
+        attachment: false,
+        reasoning: false,
+        temperature: true,
+        tool_call: true,
+        limit: {
+          context: 128_000,
+          output: 4_096,
+        },
+        options: {},
+      },
+    },
+  })
+  const provider = Provider.fromModelsDevProvider(catalog)
+  expect(Provider.Info.safeParse(provider).success).toBe(true)
+})
+
+test("Codex OAuth allowlist includes the GPT-5.6 family", () => {
+  for (const id of ["gpt-5.6-sol", "gpt-5-6-sol", "gpt-5.6-terra", "gpt-5-6-terra", "gpt-5.6-luna", "gpt-5-6-luna"]) {
+    expect(Provider.isCodexOAuthModel(id)).toBe(true)
+  }
+  for (const unsupported of ["gpt-5.6", "gpt-5-6", "gpt-5.2", "gpt-5-2", "gpt-5.3-codex", "gpt-5-3-codex"]) {
+    expect(Provider.isCodexOAuthModel(unsupported)).toBe(false)
+  }
+})
+
+test("synthesized Codex OAuth models use Codex variants and preserve model-specific context", async () => {
+  const previous = await Auth.get("openai-codex")
+  await using tmp = await tmpdir({
+    config: {
+      // The real Codex plugin performs this provider merge after OAuth. Force
+      // the same catalog entry active while default plugins are disabled in
+      // the hermetic test preload.
+      provider: {
+        openai: { options: { apiKey: "openai-test" } },
+        "openai-codex": { options: { apiKey: "codex-test" } },
+      },
+    },
+  })
+  try {
+    await Auth.set("openai-codex", {
+      type: "oauth",
+      refresh: "refresh-test",
+      access: "access-test",
+      expires: Date.now() + 60_000,
+    })
+    Provider.invalidate()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const providers = await Provider.list()
+        const codex = providers["openai-codex"]
+        expect(codex).toBeDefined()
+
+        const sol = codex.models["gpt-5.6-sol"]
+        expect(sol.providerID).toBe("openai-codex")
+        expect(sol.limit.context).toBe(1_050_000)
+        expect(sol.cost).toEqual({ input: 0, output: 0, cache: { read: 0, write: 0 } })
+        expect(Object.keys(sol.variants ?? {})).toEqual(["low", "medium", "high", "xhigh", "max"])
+        expect(Object.keys(sol.modes ?? {})).toEqual(["fast"])
+        expect(sol.modes?.fast.provider?.body).toEqual({ service_tier: "priority" })
+
+        const codex54 = codex.models["gpt-5.4"]
+        expect(codex54.limit.context).toBe(1_050_000)
+        expect(Object.keys(codex54.variants ?? {})).toEqual(["low", "medium", "high", "xhigh"])
+        expect(Object.keys(codex54.modes ?? {})).toEqual(["fast"])
+        const mini = codex.models["gpt-5.4-mini"]
+        expect(mini.limit.context).toBe(400_000)
+        expect(mini.modes).toBeUndefined()
+        expect(codex.name).toBe("OpenAI (Codex subscription)")
+
+        const publicSol = providers.openai?.models["gpt-5.6-sol"]
+        const astra = codex.models["gpt-6-astra"]
+        expect(astra.limit).toEqual({ context: 872_000, output: 128_000 })
+        expect(astra.contextOptions).toEqual([272_000, 872_000])
+        expect(astra.modes).toBeUndefined()
+        expect(Object.keys(astra.variants ?? {})).toEqual(["low", "medium", "high", "xhigh", "max"])
+        for (const [id, model] of Object.entries(codex.models)) {
+          expect(model.limit.context).toBe(id === "gpt-6-astra" ? 872_000 : providers.openai?.models[id]?.limit.context)
+        }
+        expect(Object.keys(publicSol?.variants ?? {})).toEqual(["none", "low", "medium", "high", "xhigh", "max"])
+      },
+    })
+  } finally {
+    if (previous) await Auth.set("openai-codex", previous)
+    else await Auth.remove("openai-codex")
+    Provider.invalidate()
+  }
+})
+
+test("current frontier models are routable from the seeded catalog", async () => {
+  await using tmp = await tmpdir({
+    config: {
+      provider: Object.fromEntries(Object.keys(FRONTIER_MODELS).map((id) => [id, {}])),
+    },
+  })
   await Instance.provide({
     directory: tmp.path,
-    init: async () => {
-      Env.set("ANTHROPIC_API_KEY", "test-api-key")
-    },
     fn: async () => {
       const providers = await Provider.list()
-      const models = Object.keys(providers["anthropic"]?.models ?? {})
-      for (const id of [SONNET, OPUS]) {
-        if (!models.includes(id))
+      for (const [provider, expected] of Object.entries(FRONTIER_MODELS)) {
+        const models = Object.keys(providers[provider]?.models ?? {})
+        for (const id of expected) {
+          if (models.includes(id)) continue
           throw new Error(
-            `test fixture is missing anthropic/${id} — regenerate test/fixture/models-catalog.json.gz or update the SONNET/OPUS pins here (a live models.dev delisting is caught separately by the scheduled catalog job)`,
+            `test fixture is missing ${provider}/${id} — regenerate test/fixture/models-catalog.json.gz or update FRONTIER_MODELS (the scheduled live-catalog job catches upstream delistings)`,
           )
+        }
       }
+      expect(Object.keys(providers["moonshotai"].models["kimi-k3"].variants ?? {})).toEqual(["low", "high", "max"])
+      expect(Object.keys(providers["xai"].models["grok-4.3"].variants ?? {})).toEqual(["none", "low", "medium", "high"])
+      expect(Object.keys(providers["xai"].models["grok-4.5"].variants ?? {})).toEqual(["low", "medium", "high"])
+      expect(providers["xai"].models["grok-4.5"].cost.cache.read).toBe(0.3)
+      expect(providers["openrouter"].models["x-ai/grok-4.5"].cost.cache.read).toBe(0.5)
+      expect(Object.keys(providers["xai"].models["grok-4.20-multi-agent-0309"].variants ?? {})).toEqual([
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+      ])
+      expect((providers["openai"].models["gpt-5.4"] as any).modes?.fast?.provider?.body).toEqual({
+        service_tier: "priority",
+      })
+      expect(Object.keys(providers["openai"].models["gpt-5.6-sol"].modes ?? {})).toEqual(["fast"])
+      expect(providers["openrouter"].models["openai/gpt-5.6-sol"].modes?.fast?.provider?.body).toEqual({
+        service_tier: "priority",
+      })
+      expect(providers["openrouter"].models["openai/gpt-5.6-sol"].modes?.fast?.cost?.input).toBe(
+        providers["openrouter"].models["openai/gpt-5.6-sol"].cost.input * 2,
+      )
+      expect(providers["openrouter"].models["x-ai/grok-4.5"].modes?.fast).toBeUndefined()
+      expect(providers["openrouter"].models["anthropic/claude-opus-5"].modes?.fast).toBeUndefined()
+      expect(providers["xai"].models["grok-4.5"].modes?.fast).toBeUndefined()
+      expect(providers["openrouter"].models["openai/gpt-5.6-sol"].modes?.pro).toBeUndefined()
+      expect(providers["openrouter"].models["openai/gpt-5.6-sol-pro"]).toBeDefined()
+      expect((providers["anthropic"].models["claude-opus-4-8"] as any).modes?.fast?.provider?.body).toEqual({
+        speed: "fast",
+      })
+      expect((providers["anthropic"].models["claude-opus-4-8"] as any).modes?.fast?.provider?.headers).toEqual({
+        "anthropic-beta": "fast-mode-2026-02-01",
+      })
+      expect((providers["anthropic"].models["claude-opus-4-7"] as any).modes).toBeUndefined()
+      expect((providers["anthropic"].models["claude-opus-4-6"] as any).modes).toBeUndefined()
     },
   })
 })
 
+test("Codex OAuth exposes the GPT-5.6 family as subscription models", async () => {
+  await Auth.set("openai-codex", {
+    type: "oauth",
+    refresh: "test-refresh",
+    access: "test-access",
+    expires: Date.now() + 60_000,
+  })
+  await using tmp = await tmpdir({
+    config: {
+      provider: {
+        "openai-codex": {},
+      },
+    },
+  })
+  try {
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const providers = await Provider.list()
+        const codex = providers["openai-codex"]
+        expect(codex).toBeDefined()
+        for (const id of FRONTIER_MODELS.openai.filter((modelID) => Provider.isCodexOAuthModel(modelID))) {
+          expect(codex.models[id]).toBeDefined()
+          expect(codex.models[id].providerID).toBe("openai-codex")
+          expect(codex.models[id].cost).toEqual({
+            input: 0,
+            output: 0,
+            cache: { read: 0, write: 0 },
+          })
+          expect(Object.keys(codex.models[id].modes ?? {})).toEqual(["fast"])
+        }
+      },
+    })
+  } finally {
+    await Auth.remove("openai-codex")
+    Provider.invalidate()
+  }
+})
+
+test("seeded catalog exposes GPT-5.6, Grok 4.5, and Muse Spark 1.1 for direct BYOK", async () => {
+  await using tmp = await tmpdir({})
+  try {
+    await Instance.provide({
+      directory: tmp.path,
+      init: async () => {
+        Env.set("OPENAI_API_KEY", "sk-openai-user")
+        Env.set("XAI_API_KEY", "xai-user")
+        Env.set("META_MODEL_API_KEY", "meta-user")
+        Provider.invalidate()
+      },
+      fn: async () => {
+        const providers = await Provider.list()
+        for (const id of ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+          expect(providers["openai"]?.models[id]).toBeDefined()
+        }
+        const grok = providers["xai"]?.models["grok-4.5"]
+        expect(grok).toBeDefined()
+        const grokLanguage = await Provider.getLanguage(grok!)
+        expect(grokLanguage.provider).toBe("xai.responses")
+        const muse = providers["meta"]?.models["muse-spark-1.1"]
+        expect(muse).toBeDefined()
+        expect(muse?.release_date).toBe("2026-07-09")
+        expect(muse?.limit).toMatchObject({ context: 1_048_576, output: 131_072 })
+        const language = await Provider.getLanguage(muse!)
+        expect(language.provider).toBe("meta.responses")
+      },
+    })
+  } finally {
+    for (const key of ["OPENAI_API_KEY", "XAI_API_KEY", "META_MODEL_API_KEY"]) delete process.env[key]
+    Provider.invalidate()
+  }
+})
+
+const MANAGED_ENV_KEYS = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "GOOGLE_GENERATIVE_AI_BASE_URL",
+  "GOOGLE_API_KEY",
+  "GEMINI_API_KEY",
+  "GEMINI_BASE_URL",
+  "OPENROUTER_API_KEY",
+  "OPENROUTER_BASE_URL",
+] as const
+const PROVIDER_ENV_KEYS = [
+  ...MANAGED_ENV_KEYS,
+  "XAI_API_KEY",
+  "META_MODEL_API_KEY",
+  "GITHUB_TOKEN",
+  "MULTI_ENV_KEY_1",
+  "MULTI_ENV_KEY_2",
+  "SINGLE_ENV_KEY",
+  "PRIMARY_KEY",
+  "FALLBACK_KEY",
+] as const
+const providerEnv = new Map(PROVIDER_ENV_KEYS.map((key) => [key, process.env[key]]))
+
 function clearManagedLLMEnv() {
-  for (const key of [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_BASE_URL",
-    "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
-    "GOOGLE_GENERATIVE_AI_API_KEY",
-    "GOOGLE_GENERATIVE_AI_BASE_URL",
-    "GEMINI_API_KEY",
-    "GEMINI_BASE_URL",
-    "OPENROUTER_API_KEY",
-    "OPENROUTER_BASE_URL",
-  ]) {
-    Env.remove(key)
+  for (const key of MANAGED_ENV_KEYS) {
+    delete process.env[key]
   }
 }
+
+afterEach(() => {
+  for (const key of PROVIDER_ENV_KEYS) {
+    const value = providerEnv.get(key)
+    if (value === undefined) delete process.env[key]
+    if (value !== undefined) process.env[key] = value
+  }
+  Provider.invalidate()
+})
 
 test("provider loaded from env variable", async () => {
   await using tmp = await tmpdir({
@@ -97,6 +410,27 @@ test("provider loaded from env variable", async () => {
       expect(providers["anthropic"].options.headers["anthropic-beta"]).toBeDefined()
     },
   })
+})
+
+test("repository GitHub tokens do not masquerade as Copilot inference credentials", async () => {
+  await using tmp = await tmpdir({})
+  try {
+    await Instance.provide({
+      directory: tmp.path,
+      init: async () => {
+        Env.set("GITHUB_TOKEN", "github-app-server-token")
+        Provider.invalidate()
+      },
+      fn: async () => {
+        const providers = await Provider.list()
+        expect(providers["github-copilot"]).toBeUndefined()
+        expect(providers["github-copilot-enterprise"]).toBeUndefined()
+      },
+    })
+  } finally {
+    delete process.env.GITHUB_TOKEN
+    Provider.invalidate()
+  }
 })
 
 test("provider loaded from config with apiKey option", async () => {
@@ -192,20 +526,43 @@ test("openrouter with a BYOK env key routes to public OpenRouter with that key",
   })
 })
 
-test("a BYOK openrouter key overrides a lingering synced proxy base URL (no misroute)", async () => {
+test("a BYOK openrouter key overrides a path-prefixed synced proxy base URL (no misroute)", async () => {
   await using tmp = await tmpdir({})
   await Instance.provide({
     directory: tmp.path,
     init: async () => {
       Env.set("OPENROUTER_API_KEY", "sk-or-user-byok")
       // A proxy base URL left in env from a prior managed session must NOT
-      // capture the user's own key — the resolver pins it to public OpenRouter.
-      Env.set("OPENROUTER_BASE_URL", "https://thesis-synsc.fly.dev/api/llm/proxy/openrouter/v1")
+      // capture the user's own key, including when Atlas is hosted below a
+      // path prefix. The resolver pins it to public OpenRouter.
+      Env.set("OPENROUTER_BASE_URL", "https://atlas.example/control/api/llm/proxy/openrouter/v1")
     },
     fn: async () => {
       const providers = await Provider.list()
       expect(providers["openrouter"].options["apiKey"]).toBe("sk-or-user-byok")
       expect(providers["openrouter"].options["baseURL"]).toBe("https://openrouter.ai/api/v1")
+    },
+  })
+})
+
+test("a generic BYOK provider never sends its key to a path-prefixed Atlas proxy", async () => {
+  await using tmp = await tmpdir({})
+  await Instance.provide({
+    directory: tmp.path,
+    init: async () => {
+      Env.set("OPENAI_API_KEY", "sk-openai-user-byok")
+      Env.set("OPENAI_BASE_URL", "https://atlas.example/control/api/llm/proxy/openai/v1")
+      Provider.invalidate()
+    },
+    fn: async () => {
+      const openai = (await Provider.list())["openai"]
+      const model = openai.models["gpt-5.6"]
+      expect(model).toBeDefined()
+      expect(Provider.effectiveKey(openai)).toBe("sk-openai-user-byok")
+      const language = await Provider.getLanguage(model)
+      const requestURL = (language as any).config.url({ path: "/responses" })
+      expect(requestURL).toBe("https://api.openai.com/v1/responses")
+      expect(requestURL).not.toContain("/api/llm/proxy/")
     },
   })
 })
@@ -228,10 +585,9 @@ test("openrouter BYOK honours a custom (non-Atlas) OPENROUTER_BASE_URL gateway",
   })
 })
 
-test("openrouter on a BYOK key ignores the managed whitelist and shows the full catalog", async () => {
+test("openrouter on a BYOK key honors the user's explicit whitelist", async () => {
   await using tmp = await tmpdir({
     config: {
-      // The curated managed whitelist binds only the managed route.
       provider: { openrouter: { whitelist: ["deepseek/deepseek-r1"] } },
     },
   })
@@ -243,8 +599,7 @@ test("openrouter on a BYOK key ignores the managed whitelist and shows the full 
     fn: async () => {
       const providers = await Provider.list()
       expect(providers["openrouter"]).toBeDefined()
-      // BYOK ⇒ whitelist skipped ⇒ far more than the single whitelisted model.
-      expect(Object.keys(providers["openrouter"].models).length).toBeGreaterThan(1)
+      expect(Object.keys(providers["openrouter"].models)).toEqual(["deepseek/deepseek-r1"])
     },
   })
 })
@@ -401,6 +756,126 @@ test("custom provider with npm package", async () => {
       expect(providers["custom-provider"]).toBeDefined()
       expect(providers["custom-provider"].name).toBe("Custom Provider")
       expect(providers["custom-provider"].models["custom-model"]).toBeDefined()
+    },
+  })
+})
+
+test("custom provider model exposes configured service modes", async () => {
+  await using tmp = await tmpdir({
+    config: {
+      provider: {
+        e2e: {
+          name: "E2E",
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            apiKey: "test-key",
+            baseURL: "https://e2e.test/v1",
+          },
+          models: {
+            echo: {
+              name: "Echo",
+              limit: { context: 128_000, output: 4_096 },
+              options: {
+                apiKey: "model-secret",
+              },
+              headers: {
+                authorization: "Bearer model-secret",
+              },
+              variants: {
+                careful: {
+                  apiKey: "variant-secret",
+                },
+              },
+              experimental: {
+                modes: {
+                  fast: {
+                    cost: {
+                      input: 6,
+                      output: 30,
+                      cache_read: 0.6,
+                      cache_write: 7.5,
+                    },
+                    provider: {
+                      body: { service_tier: "priority", api_key: "mode-secret" },
+                      headers: { authorization: "Bearer mode-secret" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const providers = await Provider.list()
+      expect(providers.e2e.models.echo.api.url).toBe("https://e2e.test/v1")
+      expect(Object.keys(providers.e2e.models.echo.modes ?? {})).toEqual(["fast"])
+      expect(providers.e2e.models.echo.modes?.fast.cost).toEqual({
+        input: 6,
+        output: 30,
+        cache: { read: 0.6, write: 7.5 },
+      })
+      expect(providers.e2e.models.echo.modes?.fast.provider?.body).toEqual({
+        service_tier: "priority",
+        api_key: "mode-secret",
+      })
+
+      const redacted = Provider.redact(providers.e2e)
+      expect(Provider.Info.safeParse(redacted).success).toBe(true)
+      expect(redacted.options).toEqual({})
+      expect(redacted.models.echo.api.url).toBeUndefined()
+      expect(redacted.models.echo.options).toEqual({})
+      expect(redacted.models.echo.headers).toEqual({})
+      expect(redacted.models.echo.variants).toEqual({ careful: {} })
+      expect(redacted.models.echo.modes?.fast.provider).toBeUndefined()
+      expect(redacted.models.echo.modes?.fast.cost).toEqual({
+        input: 6,
+        output: 30,
+        cache: { read: 0.6, write: 7.5 },
+      })
+    },
+  })
+})
+
+test("configured native provider without a URL keeps the SDK public endpoint", async () => {
+  await using tmp = await tmpdir({
+    config: {
+      provider: {
+        native: {
+          name: "Native OpenAI",
+          npm: "@ai-sdk/openai",
+          options: {
+            apiKey: "test-key",
+          },
+          models: {
+            echo: {
+              name: "Echo",
+              limit: { context: 128_000, output: 4_096 },
+            },
+          },
+        },
+      },
+    },
+  })
+
+  await Instance.provide({
+    directory: tmp.path,
+    init: async () => {
+      Env.remove("OPENAI_BASE_URL")
+      Provider.invalidate()
+    },
+    fn: async () => {
+      const model = await Provider.getModel("native", "echo")
+      expect(model.api.url).toBeUndefined()
+
+      const language = await Provider.getLanguage(model)
+      const requestURL = (language as any).config.url({ path: "/responses" })
+      expect(requestURL).toBe("https://api.openai.com/v1/responses")
     },
   })
 })
@@ -1170,42 +1645,7 @@ test("multiple providers can be configured simultaneously", async () => {
   })
 })
 
-test("managed atlas proxy base URLs are forwarded for managed LLM providers", async () => {
-  await using tmp = await tmpdir({
-    init: async (dir) => {
-      await Bun.write(
-        path.join(dir, "openscience.json"),
-        JSON.stringify({
-          $schema: "https://syntheticsciences.ai/config.json",
-        }),
-      )
-    },
-  })
-  await Instance.provide({
-    directory: tmp.path,
-    init: async () => {
-      clearManagedLLMEnv()
-      Env.set("ANTHROPIC_API_KEY", "thk_anthropic")
-      Env.set("ANTHROPIC_BASE_URL", "https://atlas.test/api/llm/proxy/anthropic/v1")
-      Env.set("OPENAI_API_KEY", "thk_openai")
-      Env.set("OPENAI_BASE_URL", "https://atlas.test/api/llm/proxy/openai/v1")
-      Env.set("GOOGLE_GENERATIVE_AI_API_KEY", "thk_google")
-      Env.set("GOOGLE_GENERATIVE_AI_BASE_URL", "https://atlas.test/api/llm/proxy/gemini/v1beta")
-      Env.set("OPENROUTER_API_KEY", "thk_openrouter")
-      Env.set("OPENROUTER_BASE_URL", "https://atlas.test/api/llm/proxy/openrouter/v1")
-      Provider.invalidate()
-    },
-    fn: async () => {
-      const providers = await Provider.list()
-      expect(providers["anthropic"].options.baseURL).toBe("https://atlas.test/api/llm/proxy/anthropic/v1")
-      expect(providers["openai"].options.baseURL).toBe("https://atlas.test/api/llm/proxy/openai/v1")
-      expect(providers["google"].options.baseURL).toBe("https://atlas.test/api/llm/proxy/gemini/v1beta")
-      expect(providers["openrouter"].options.baseURL).toBe("https://atlas.test/api/llm/proxy/openrouter/v1")
-    },
-  })
-})
-
-test("managed atlas keys without proxy base URLs fail before provider SDK creation", async () => {
+test("legacy non-OpenRouter managed keys without proxy URLs are removed", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
       await Bun.write(
@@ -1227,17 +1667,7 @@ test("managed atlas keys without proxy base URLs fail before provider SDK creati
     fn: async () => {
       const providers = await Provider.list()
       for (const providerID of ["openai", "google"]) {
-        const model = Object.values(providers[providerID].models)[0]
-        expect(model).toBeDefined()
-        let error: unknown
-        try {
-          await Provider.getLanguage(model!)
-        } catch (e) {
-          error = e
-        }
-        expect(error).toBeDefined()
-        expect((error as Error).cause).toBeInstanceOf(Error)
-        expect(((error as Error).cause as Error).message).toContain("managed Atlas key without an Atlas proxy URL")
+        expect(providers[providerID]).toBeUndefined()
       }
     },
   })
@@ -2257,8 +2687,8 @@ test("variant config merges with generated variants", async () => {
       const providers = await Provider.list()
       const model = providers["anthropic"].models[SONNET]
       expect(model.variants!["high"]).toBeDefined()
-      // Should have both the generated thinking config and the custom option
-      expect(model.variants!["high"].thinking).toBeDefined()
+      // Should have both the generated native effort and the custom option.
+      expect(model.variants!["high"].effort).toBe("high")
       expect(model.variants!["high"].extraOption).toBe("custom-value")
     },
   })

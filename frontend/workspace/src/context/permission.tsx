@@ -1,4 +1,4 @@
-import { createMemo, onCleanup } from "solid-js"
+import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { createSimpleContext } from "@synsci/ui/context"
 import type { PermissionRequest } from "@synsci/sdk/v2/client"
@@ -7,12 +7,16 @@ import { useGlobalSDK } from "@/context/global-sdk"
 import { useGlobalSync } from "./global-sync"
 import { useParams } from "@solidjs/router"
 import { base64Encode } from "@synsci/util/encode"
-import { decode64 } from "@/utils/base64"
+import { useLanguage } from "@/context/language"
+import { usePlatform } from "@/context/platform"
+import { useSettings } from "@/context/settings"
+import { playSound, preloadSound, soundSrc } from "@/utils/sound"
+import { projectForDirectory, projectHref, projectScope, resolveProjectRoute } from "@/utils/project-route"
 
 type PermissionRespondFn = (input: {
   sessionID: string
   permissionID: string
-  response: "once" | "always" | "reject"
+  response: "once" | "session" | "project" | "always" | "reject"
   directory?: string
 }) => void
 
@@ -46,17 +50,20 @@ function hasAutoAcceptPermissionConfig(permission: unknown) {
   return false
 }
 
-export const { use: usePermission, provider: PermissionProvider } = createSimpleContext({
+export const { provider: PermissionProvider } = createSimpleContext({
   name: "Permission",
   init: () => {
     const params = useParams()
     const globalSDK = useGlobalSDK()
     const globalSync = useGlobalSync()
+    const language = useLanguage()
+    const platform = usePlatform()
+    const settings = useSettings()
 
     const permissionsEnabled = createMemo(() => {
-      const directory = decode64(params.dir)
-      if (!directory) return false
-      const [store] = globalSync.child(directory)
+      const route = resolveProjectRoute(params.dir, globalSync.data.project)
+      if (!route) return false
+      const [store] = globalSync.child(route.directory, { projectID: route.projectID })
       return hasAutoAcceptPermissionConfig(store.config.permission)
     })
 
@@ -66,10 +73,27 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
         autoAcceptEdits: {} as Record<string, boolean>,
       }),
     )
+    const migration = { complete: false }
+
+    // The old hidden auto-accept toggle could answer edit prompts after a user
+    // switched to Ask always. It no longer has a product control, so clear the
+    // persisted authority instead of letting stale client state weaken the
+    // execution-time mode.
+    createEffect(() => {
+      if (!ready() || migration.complete) return
+      migration.complete = true
+      if (Object.keys(store.autoAcceptEdits).length === 0) return
+      setStore("autoAcceptEdits", {})
+    })
 
     const MAX_RESPONDED = 1000
     const RESPONDED_TTL_MS = 60 * 60 * 1000
     const responded = new Map<string, number>()
+
+    createEffect(() => {
+      if (!settings.sounds.enabled()) return
+      preloadSound(soundSrc(settings.sounds.permissions()))
+    })
 
     function pruneResponded(now: number) {
       for (const [id, ts] of responded) {
@@ -106,12 +130,13 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
 
     function acceptKey(sessionID: string, directory?: string) {
       if (!directory) return sessionID
-      return `${base64Encode(directory)}/${sessionID}`
+      return `${projectScope(globalSync.data.project, directory)}/${sessionID}`
     }
 
     function isAutoAccepting(sessionID: string, directory?: string) {
       const key = acceptKey(sessionID, directory)
-      return store.autoAcceptEdits[key] ?? store.autoAcceptEdits[sessionID] ?? false
+      const legacy = directory ? `${base64Encode(directory)}/${sessionID}` : undefined
+      return store.autoAcceptEdits[key] ?? (legacy ? store.autoAcceptEdits[legacy] : undefined) ?? false
     }
 
     const unsubscribe = globalSDK.event.listen((e) => {
@@ -119,10 +144,25 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
       if (event?.type !== "permission.asked") return
 
       const perm = event.properties
-      if (!isAutoAccepting(perm.sessionID, e.name)) return
-      if (!shouldAutoAccept(perm)) return
+      if (settings.sounds.enabled()) {
+        playSound(soundSrc(settings.sounds.permissions()), settings.sounds.volume())
+      }
 
-      respondOnce(perm, e.name)
+      if (settings.notifications.permissions()) {
+        const project = projectForDirectory(globalSync.data.project, e.name)
+        const [syncStore] = globalSync.child(e.name, { bootstrap: false })
+        const session = syncStore.session.find((item) => item.id === perm.sessionID)
+        const projectName =
+          ((project as { name?: string } | undefined)?.name || e.name.split(/[\\/]/).filter(Boolean).at(-1)) ??
+          project?.id ??
+          "OpenScience"
+        const description = language.t("notification.permission.description", {
+          sessionTitle: session?.title ?? perm.sessionID,
+          projectName,
+        })
+        const href = project ? projectHref(project, e.name, perm.sessionID) : "/"
+        void platform.notify(language.t("notification.permission.title"), description, href)
+      }
     })
     onCleanup(unsubscribe)
 
@@ -161,8 +201,8 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
     return {
       ready,
       respond,
-      autoResponds(permission: PermissionRequest, directory?: string) {
-        return isAutoAccepting(permission.sessionID, directory) && shouldAutoAccept(permission)
+      autoResponds(_permission: PermissionRequest, _directory?: string) {
+        return false
       },
       isAutoAccepting,
       toggleAutoAccept(sessionID: string, directory: string) {

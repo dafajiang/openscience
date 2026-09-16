@@ -1,5 +1,6 @@
 import { type JSX, Show } from "solid-js"
-import { FONT_SERIF } from "@/styles/tokens"
+import { FONT_SANS } from "@/styles/tokens"
+import { ProviderIcon } from "@synsci/ui/provider-icon"
 
 interface WordmarkProps {
   size?: "sm" | "md" | "lg"
@@ -11,36 +12,35 @@ interface WordmarkProps {
 export function Wordmark(props: WordmarkProps): JSX.Element {
   const size = () => props.size ?? "md"
   const px = () =>
-    size() === "lg" ? { logo: 30, text: 28 } : size() === "sm" ? { logo: 22, text: 18 } : { logo: 26, text: 22 }
-  return (
-    <button
-      onClick={props.onClick}
-      class="atlas-wordmark"
-      style={{
-        all: "unset",
-        cursor: props.onClick ? "pointer" : "default",
-        display: "inline-flex",
-        "align-items": "center",
-        gap: size() === "sm" ? "8px" : "10px",
-      }}
-    >
+    size() === "lg" ? { logo: 30, text: 28 } : size() === "sm" ? { logo: 20, text: 14.5 } : { logo: 26, text: 22 }
+  const weight = () => (size() === "sm" ? "var(--font-weight-emphasis)" : "var(--font-weight-regular)")
+  const rootStyle = (): JSX.CSSProperties => ({
+    all: "unset",
+    cursor: props.onClick ? "pointer" : "default",
+    display: "inline-flex",
+    "align-items": "center",
+    gap: size() === "sm" ? "7px" : "10px",
+  })
+  const content = () => (
+    <>
       <Show when={!props.textOnly}>
-        <img
-          src="/openscience-logo.png"
-          alt=""
+        <ProviderIcon
+          id="synsci"
+          aria-hidden="true"
           style={{
             width: `${px().logo}px`,
             height: `${px().logo}px`,
-            "object-fit": "contain",
             "flex-shrink": 0,
+            color: "var(--color-text)",
           }}
         />
       </Show>
       <span
+        aria-hidden="true"
         style={{
-          "font-family": FONT_SERIF,
+          "font-family": FONT_SANS,
           "font-size": `${px().text}px`,
-          "font-weight": 400,
+          "font-weight": weight(),
           "letter-spacing": "-0.02em",
           color: "var(--color-text)",
           "white-space": "nowrap",
@@ -48,6 +48,20 @@ export function Wordmark(props: WordmarkProps): JSX.Element {
       >
         OpenScience
       </span>
-    </button>
+    </>
+  )
+  return (
+    <Show
+      when={props.onClick}
+      fallback={
+        <span class="atlas-wordmark" role="img" aria-label="OpenScience" style={rootStyle()}>
+          {content()}
+        </span>
+      }
+    >
+      <button type="button" class="atlas-wordmark" aria-label="OpenScience" onClick={props.onClick} style={rootStyle()}>
+        {content()}
+      </button>
+    </Show>
   )
 }

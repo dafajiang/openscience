@@ -3,13 +3,15 @@ import { createEffect, createMemo } from "solid-js"
 import { createSimpleContext } from "@synsci/ui/context"
 import { persisted } from "@/utils/persist"
 
-export interface NotificationSettings {
+interface NotificationSettings {
   agent: boolean
   permissions: boolean
   errors: boolean
 }
 
-export interface SoundSettings {
+interface SoundSettings {
+  enabled: boolean
+  volume: number
   agent: string
   permissions: string
   errors: string
@@ -60,12 +62,13 @@ const defaultSettings: Settings = {
     errors: false,
   },
   sounds: {
-    // Silent by default — UI sounds are opt-in. ("" → soundSrc() returns
-    // undefined → playSound() is a no-op.) The agent/error sound firing on
-    // click-triggered notifications was jarring; enable per-sound in Settings.
-    agent: "",
-    permissions: "",
-    errors: "",
+    // Audio feedback is opt-in. The choices are ready when it is enabled, but
+    // fresh installs remain silent and playback stays deliberately subtle.
+    enabled: false,
+    volume: 0.3,
+    agent: "yup-01",
+    permissions: "bip-bop-01",
+    errors: "alert-01",
   },
   ui: {
     showChangesView: false,
@@ -74,20 +77,21 @@ const defaultSettings: Settings = {
 
 const monoFallback =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'
+const monoPrefix = '"Söhne Mono", "Sohne Mono"'
 
 const monoFonts: Record<string, string> = {
-  "ibm-plex-mono": `"IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "cascadia-code": `"Cascadia Code Nerd Font", "Cascadia Code NF", "Cascadia Mono NF", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "fira-code": `"Fira Code Nerd Font", "FiraMono Nerd Font", "FiraMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  hack: `"Hack Nerd Font", "Hack Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  inconsolata: `"Inconsolata Nerd Font", "Inconsolata Nerd Font Mono","IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "intel-one-mono": `"Intel One Mono Nerd Font", "IntoneMono Nerd Font", "IntoneMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  iosevka: `"Iosevka Nerd Font", "Iosevka Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "jetbrains-mono": `"JetBrains Mono Nerd Font", "JetBrainsMono Nerd Font Mono", "JetBrainsMonoNL Nerd Font", "JetBrainsMonoNL Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "meslo-lgs": `"Meslo LGS Nerd Font", "MesloLGS Nerd Font", "MesloLGM Nerd Font", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "roboto-mono": `"Roboto Mono Nerd Font", "RobotoMono Nerd Font", "RobotoMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "source-code-pro": `"Source Code Pro Nerd Font", "SauceCodePro Nerd Font", "SauceCodePro Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
-  "ubuntu-mono": `"Ubuntu Mono Nerd Font", "UbuntuMono Nerd Font", "UbuntuMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "ibm-plex-mono": `${monoPrefix}, "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "cascadia-code": `${monoPrefix}, "Cascadia Code Nerd Font", "Cascadia Code NF", "Cascadia Mono NF", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "fira-code": `${monoPrefix}, "Fira Code Nerd Font", "FiraMono Nerd Font", "FiraMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  hack: `${monoPrefix}, "Hack Nerd Font", "Hack Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  inconsolata: `${monoPrefix}, "Inconsolata Nerd Font", "Inconsolata Nerd Font Mono","IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "intel-one-mono": `${monoPrefix}, "Intel One Mono Nerd Font", "IntoneMono Nerd Font", "IntoneMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  iosevka: `${monoPrefix}, "Iosevka Nerd Font", "Iosevka Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "jetbrains-mono": `${monoPrefix}, "JetBrains Mono Nerd Font", "JetBrainsMono Nerd Font Mono", "JetBrainsMonoNL Nerd Font", "JetBrainsMonoNL Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "meslo-lgs": `${monoPrefix}, "Meslo LGS Nerd Font", "MesloLGS Nerd Font", "MesloLGM Nerd Font", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "roboto-mono": `${monoPrefix}, "Roboto Mono Nerd Font", "RobotoMono Nerd Font", "RobotoMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "source-code-pro": `${monoPrefix}, "Source Code Pro Nerd Font", "SauceCodePro Nerd Font", "SauceCodePro Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
+  "ubuntu-mono": `${monoPrefix}, "Ubuntu Mono Nerd Font", "UbuntuMono Nerd Font", "UbuntuMono Nerd Font Mono", "IBM Plex Mono", "IBM Plex Mono Fallback", ${monoFallback}`,
 }
 
 export function monoFontFamily(font: string | undefined) {
@@ -168,6 +172,25 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         },
       },
       sounds: {
+        enabled: createMemo(() => {
+          const stored = store.sounds?.enabled
+          if (stored !== undefined) return stored
+          // Preserve the intent of pre-toggle settings: a previously chosen
+          // sound means the user had explicitly enabled audio feedback.
+          return Boolean(store.sounds?.agent || store.sounds?.permissions || store.sounds?.errors)
+        }),
+        setEnabled(value: boolean) {
+          setStore("sounds", "enabled", value)
+          if (!value) return
+          if (!store.sounds.agent) setStore("sounds", "agent", defaultSettings.sounds.agent)
+          if (!store.sounds.permissions) setStore("sounds", "permissions", defaultSettings.sounds.permissions)
+          if (!store.sounds.errors) setStore("sounds", "errors", defaultSettings.sounds.errors)
+        },
+        volume: createMemo(() => store.sounds?.volume ?? defaultSettings.sounds.volume),
+        setVolume(value: number) {
+          const next = Number.isFinite(value) ? value : defaultSettings.sounds.volume
+          setStore("sounds", "volume", Math.min(1, Math.max(0, next)))
+        },
         agent: createMemo(() => store.sounds?.agent ?? defaultSettings.sounds.agent),
         setAgent(value: string) {
           setStore("sounds", "agent", value)

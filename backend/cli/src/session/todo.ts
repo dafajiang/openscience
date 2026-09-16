@@ -2,6 +2,7 @@ import { BusEvent } from "@/bus/bus-event"
 import { Bus } from "@/bus"
 import z from "zod"
 import { Storage } from "../storage/storage"
+import { Session } from "."
 
 export namespace Todo {
   export const Info = z
@@ -25,11 +26,13 @@ export namespace Todo {
   }
 
   export async function update(input: { sessionID: string; todos: Info[] }) {
+    await Session.assertDirectory(input.sessionID)
     await Storage.write(["todo", input.sessionID], input.todos)
     Bus.publish(Event.Updated, input)
   }
 
   export async function get(sessionID: string) {
+    await Session.assertDirectory(sessionID)
     return Storage.read<Info[]>(["todo", sessionID])
       .then((x) => x || [])
       .catch(() => [])

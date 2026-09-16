@@ -5,7 +5,8 @@ import { createSignal, createEffect } from "solid-js"
  *  - favorites: sticky-on-top, marked with a filled star.
  *  - hidden:    filtered out of the recent list.
  *
- * Both are keyed by the openscience project worktree (absolute path) and
+ * New entries are keyed by the opaque openscience project ID. Legacy
+ * worktree-keyed entries remain readable during project-list migration and
  * persisted to localStorage so they survive reloads. We do NOT delete
  * the project from openscience itself — openscience tracks workspaces globally,
  * and the user might want to "unhide" later.
@@ -37,42 +38,54 @@ const [hidden, setHiddenSig] = createSignal<Set<string>>(readSet(HIDE_KEY))
 createEffect(() => writeSet(FAV_KEY, favorites()))
 createEffect(() => writeSet(HIDE_KEY, hidden()))
 
-const toggleFavorite = (path: string) => {
+const paths = (values: string[]) => [...new Set(values.filter(Boolean))]
+
+const toggleFavorite = (...values: string[]) => {
+  const keys = paths(values)
   setFavoritesSig((prev) => {
     const next = new Set(prev)
-    if (next.has(path)) next.delete(path)
-    else next.add(path)
+    const pinned = keys.some((path) => next.has(path))
+    for (const path of keys) {
+      if (pinned) next.delete(path)
+      else next.add(path)
+    }
     return next
   })
   setHiddenSig((prev) => {
-    if (!prev.has(path)) return prev
+    if (!keys.some((path) => prev.has(path))) return prev
     const next = new Set(prev)
-    next.delete(path)
+    for (const path of keys) next.delete(path)
     return next
   })
 }
 
-const hide = (path: string) => {
-  setHiddenSig((prev) => new Set(prev).add(path))
-  setFavoritesSig((prev) => {
-    if (!prev.has(path)) return prev
-    const next = new Set(prev)
-    next.delete(path)
-    return next
-  })
-}
-
-const unhide = (path: string) => {
+const hide = (...values: string[]) => {
+  const keys = paths(values)
   setHiddenSig((prev) => {
-    if (!prev.has(path)) return prev
     const next = new Set(prev)
-    next.delete(path)
+    for (const path of keys) next.add(path)
+    return next
+  })
+  setFavoritesSig((prev) => {
+    if (!keys.some((path) => prev.has(path))) return prev
+    const next = new Set(prev)
+    for (const path of keys) next.delete(path)
     return next
   })
 }
 
-const isFavorite = (path: string) => favorites().has(path)
-const isHidden = (path: string) => hidden().has(path)
+const unhide = (...values: string[]) => {
+  const keys = paths(values)
+  setHiddenSig((prev) => {
+    if (!keys.some((path) => prev.has(path))) return prev
+    const next = new Set(prev)
+    for (const path of keys) next.delete(path)
+    return next
+  })
+}
+
+const isFavorite = (...values: string[]) => values.some((path) => favorites().has(path))
+const isHidden = (...values: string[]) => values.some((path) => hidden().has(path))
 
 export const projectPrefs = {
   favorites,

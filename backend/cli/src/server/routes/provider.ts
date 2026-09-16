@@ -7,7 +7,7 @@ import { ModelsDev } from "../../provider/models"
 import { ProviderAuth } from "../../provider/auth"
 import { mapValues } from "remeda"
 import { errors } from "../error"
-import { lazy } from "../../util/lazy"
+import { lazy } from "@synsci/util/lazy"
 
 export const ProviderRoutes = lazy(() =>
   new Hono()
@@ -24,7 +24,7 @@ export const ProviderRoutes = lazy(() =>
               "application/json": {
                 schema: resolver(
                   z.object({
-                    all: ModelsDev.Provider.array(),
+                    all: Provider.Info.array(),
                     default: z.record(z.string(), z.string()),
                     connected: z.array(z.string()),
                   }),
@@ -34,6 +34,15 @@ export const ProviderRoutes = lazy(() =>
           },
         },
       }),
+      validator(
+        "query",
+        z.object({
+          refresh: z
+            .enum(["true", "false"])
+            .optional()
+            .describe("Re-read managed model pricing now, skipping its cache and failure cooldown"),
+        }),
+      ),
       async (c) => {
         const config = await Config.get()
         const disabled = new Set(config.disabled_providers ?? [])
@@ -47,19 +56,12 @@ export const ProviderRoutes = lazy(() =>
           }
         }
 
-        const connected = await Provider.list()
+        const connected = await Provider.list({ refresh: c.req.valid("query").refresh === "true" })
         const providers = Object.assign(
           mapValues(filteredProviders, (x) => Provider.fromModelsDevProvider(x)),
           connected,
         )
-        // Never hand raw credentials to the browser. The UI only needs to
-        // know that a provider is connected and where its key came from
-        // (`source`), not the key itself.
-        const redacted = Object.values(providers).map((item) => {
-          const options = { ...item.options }
-          if (typeof options["apiKey"] === "string" && options["apiKey"].length > 0) options["apiKey"] = ""
-          return { ...item, key: undefined, options }
-        })
+        const redacted = Object.values(providers).map(Provider.redact)
         return c.json({
           all: redacted,
           default: mapValues(providers, (item) => Provider.sort(Object.values(item.models))[0].id),

@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { isAllowedHost, isAllowedOrigin, isCrossOrigin } from "../../src/server/host-guard"
+import {
+  isAllowedHost,
+  isAllowedOrigin,
+  isCorsPreflight,
+  isCrossOrigin,
+  isDeploymentAuthorized,
+} from "../../src/server/host-guard"
 
 describe("isAllowedHost", () => {
   test("allows localhost with a port", () => {
@@ -57,9 +63,9 @@ describe("isAllowedOrigin", () => {
     expect(isAllowedOrigin("http://tauri.localhost")).toBe(true)
   })
 
-  test("allows the hosted web UI on a syntheticsciences.ai subdomain", () => {
-    expect(isAllowedOrigin("https://web.syntheticsciences.ai")).toBe(true)
-    expect(isAllowedOrigin("https://app.syntheticsciences.ai")).toBe(true)
+  test("does not trust a hosted product origin by default", () => {
+    expect(isAllowedOrigin("https://web.syntheticsciences.ai")).toBe(false)
+    expect(isAllowedOrigin("https://app.syntheticsciences.ai")).toBe(false)
   })
 
   test("rejects the bare syntheticsciences.ai apex (subdomain required)", () => {
@@ -117,5 +123,35 @@ describe("isCrossOrigin", () => {
 
   test("allows non-browser clients (neither Origin nor Sec-Fetch-Site)", () => {
     expect(isCrossOrigin(undefined, undefined)).toBe(false)
+  })
+})
+
+describe("isCorsPreflight", () => {
+  test("recognizes a real browser preflight", () => {
+    expect(isCorsPreflight("OPTIONS", "https://app.syntheticsciences.ai", "POST")).toBe(true)
+  })
+
+  test("does not exempt ordinary OPTIONS requests", () => {
+    expect(isCorsPreflight("OPTIONS", undefined, undefined)).toBe(false)
+    expect(isCorsPreflight("OPTIONS", "https://app.syntheticsciences.ai", undefined)).toBe(false)
+    expect(isCorsPreflight("GET", "https://app.syntheticsciences.ai", "POST")).toBe(false)
+  })
+})
+
+describe("isDeploymentAuthorized", () => {
+  test("preserves existing behavior when no deployment token is configured", () => {
+    expect(isDeploymentAuthorized(undefined, undefined)).toBe(true)
+  })
+
+  test("accepts the configured bearer token", () => {
+    expect(isDeploymentAuthorized("lab-secret", "Bearer lab-secret")).toBe(true)
+    expect(isDeploymentAuthorized("lab-secret", "bearer lab-secret")).toBe(true)
+  })
+
+  test("rejects missing, malformed, and incorrect credentials", () => {
+    expect(isDeploymentAuthorized("lab-secret", undefined)).toBe(false)
+    expect(isDeploymentAuthorized("lab-secret", "Basic lab-secret")).toBe(false)
+    expect(isDeploymentAuthorized("lab-secret", "Bearer wrong-secret")).toBe(false)
+    expect(isDeploymentAuthorized("lab-secret", "Bearer lab-secret-extra")).toBe(false)
   })
 })

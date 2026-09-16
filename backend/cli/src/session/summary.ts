@@ -1,6 +1,6 @@
 import { Provider } from "@/provider/provider"
 
-import { fn } from "@/util/fn"
+import { fn } from "@synsci/util/fn"
 import z from "zod"
 import { Session } from "."
 
@@ -82,11 +82,32 @@ export namespace SessionSummary {
       messageID: z.string(),
     }),
     async (input) => {
-      const all = await Session.messages({ sessionID: input.sessionID })
-      await Promise.all([
+      const all = await Session.messages({ sessionID: input.sessionID }).catch((error) => {
+        if (error instanceof Storage.NotFoundError) return
+        throw error
+      })
+      if (!all) return
+      const message = all.find((item) => item.info.id === input.messageID)
+      if (!message || message.info.role !== "user") {
+        log.warn("skipping summary for missing user message", input)
+        return
+      }
+
+      const results = await Promise.allSettled([
         summarizeSession({ sessionID: input.sessionID, messages: all }),
-        summarizeMessage({ messageID: input.messageID, messages: all }),
+        summarizeMessage({ message, messages: all }),
       ])
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")
+      if (!failure) return
+
+      const sessionExists = await Session.get(input.sessionID)
+        .then(() => true)
+        .catch((error) => {
+          if (error instanceof Storage.NotFoundError) return false
+          throw error
+        })
+      if (sessionExists) throw failure.reason
+      log.warn("skipping summary for deleted session", input)
     },
   )
 
@@ -117,31 +138,77 @@ export namespace SessionSummary {
     })
   }
 
-  async function summarizeMessage(input: { messageID: string; messages: MessageV2.WithParts[] }) {
+  async function summarizeMessage(input: { message: MessageV2.WithParts; messages: MessageV2.WithParts[] }) {
     const messages = input.messages.filter(
-      (m) => m.info.id === input.messageID || (m.info.role === "assistant" && m.info.parentID === input.messageID),
+      (m) =>
+        m.info.id === input.message.info.id ||
+        (m.info.role === "assistant" && m.info.parentID === input.message.info.id),
     )
-    const msgWithParts = messages.find((m) => m.info.id === input.messageID)!
-    const userMsg = msgWithParts.info as MessageV2.User
+    const msgWithParts = input.message
+    let userMsg = msgWithParts.info as MessageV2.User
     const diffs = await computeDiff({ messages })
-    userMsg.summary = {
-      ...userMsg.summary,
-      diffs,
-    }
-    await Session.updateMessage(userMsg)
+    const updated = await updateUserMessage(userMsg, (draft) => {
+      draft.summary = {
+        ...draft.summary,
+        diffs,
+      }
+    })
+    if (!updated) return
+    userMsg = updated
 
     const textPart = msgWithParts.parts.find((p) => p.type === "text" && !p.synthetic) as MessageV2.TextPart
-    if (textPart && !userMsg.summary?.title) {
-      const agent = await Agent.get("title")
-      if (!agent) return
+    if (!textPart || userMsg.summary?.title) return
+    const pending = titles.pending.get(userMsg.id)
+    if (pending) return pending
+    const last = titles.attempts.get(userMsg.id)
+    if (last && Date.now() - last.at < TITLE_COOLDOWN_MS) return
+    const attempt = last?.count ?? 0
+    titles.attempts.set(userMsg.id, { at: Date.now(), count: attempt + 1 })
+    const run = titleMessage({ user: userMsg, text: textPart.text, diffs, attempt }).finally(() =>
+      titles.pending.delete(userMsg.id),
+    )
+    titles.pending.set(userMsg.id, run)
+    return run
+  }
+
+  // The managed proxy seals a streamed idempotency key the moment the upstream
+  // stream starts, so re-sending an identical title request can only collect
+  // 409s. Keep one title request per message in flight, allow one attempt per
+  // message per cooldown window, and bound each attempt so a stalled stream is
+  // abandoned instead of pinning the summary forever.
+  const TITLE_COOLDOWN_MS = 10 * 60 * 1_000
+  const TITLE_TIMEOUT_MS = 45_000
+  const titles = {
+    pending: new Map<string, Promise<void>>(),
+    attempts: new Map<string, { at: number; count: number }>(),
+  }
+
+  async function titleMessage(input: {
+    user: MessageV2.User
+    text: string
+    diffs: Snapshot.FileDiff[]
+    attempt: number
+  }) {
+    const agent = await Agent.get("title")
+    if (!agent) return
+    const model = agent.model
+      ? await Provider.getModel(agent.model.providerID, agent.model.modelID)
+      : ((await Provider.getSmallModel(input.user.model.providerID)) ??
+        (await Provider.getModel(input.user.model.providerID, input.user.model.modelID)))
+    const context = {
+      sessionID: input.user.sessionID,
+      messageID: input.attempt ? `summary:${input.user.id}:${input.attempt}` : `summary:${input.user.id}`,
+      attempt: input.attempt,
+    }
+    const result = await Provider.withRequestContext(context, async () => {
       const stream = await LLM.stream({
         agent,
-        user: userMsg,
+        // Title generation is an isolated internal call over the visible user
+        // text. Replaying the source turn's custom/child system guidance here
+        // can conflict with the title agent and needlessly duplicate context.
+        user: { ...input.user, system: undefined },
         tools: {},
-        model: agent.model
-          ? await Provider.getModel(agent.model.providerID, agent.model.modelID)
-          : ((await Provider.getSmallModel(userMsg.model.providerID)) ??
-            (await Provider.getModel(userMsg.model.providerID, userMsg.model.modelID))),
+        model,
         small: true,
         messages: [
           {
@@ -149,20 +216,40 @@ export namespace SessionSummary {
             content: `
               The following is the text to summarize:
               <text>
-              ${textPart?.text ?? ""}
+              ${input.text}
               </text>
             `,
           },
         ],
-        abort: new AbortController().signal,
-        sessionID: userMsg.sessionID,
+        abort: AbortSignal.timeout(TITLE_TIMEOUT_MS),
+        sessionID: input.user.sessionID,
         system: [],
-        retries: 3,
+        retries: 0,
       })
-      const result = await stream.text
-      log.info("title", { title: result })
-      userMsg.summary.title = result
-      await Session.updateMessage(userMsg)
+      return stream.text
+    })
+    log.info("title", { title: result })
+    await updateUserMessage(input.user, (draft) => {
+      draft.summary = {
+        ...draft.summary,
+        diffs: draft.summary?.diffs ?? input.diffs,
+        title: result,
+      }
+    })
+  }
+
+  async function updateUserMessage(message: MessageV2.User, editor: (draft: MessageV2.User) => void) {
+    try {
+      const updated = await Storage.update<MessageV2.User>(["message", message.sessionID, message.id], editor)
+      Bus.publish(MessageV2.Event.Updated, { info: updated })
+      return updated
+    } catch (error) {
+      if (!(error instanceof Storage.NotFoundError)) throw error
+      log.warn("skipping summary update for removed user message", {
+        sessionID: message.sessionID,
+        messageID: message.id,
+      })
+      return undefined
     }
   }
 
@@ -172,6 +259,7 @@ export namespace SessionSummary {
       messageID: Identifier.schema("message").optional(),
     }),
     async (input) => {
+      await Session.assertDirectory(input.sessionID)
       const diffs = await Storage.read<Snapshot.FileDiff[]>(["session_diff", input.sessionID]).catch(() => [])
       const next = diffs.map((item) => {
         const file = unquoteGitPath(item.file)

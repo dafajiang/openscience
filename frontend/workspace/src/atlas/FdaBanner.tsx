@@ -1,23 +1,25 @@
-import { createSignal, createResource, type JSX, Show, onMount } from "solid-js"
+import { createSignal, createResource, type JSX, Show } from "solid-js"
 import { Dialog } from "@synsci/ui/dialog"
 import { useDialog } from "@synsci/ui/context/dialog"
-import { FONT_CODE, FONT_MONO, FONT_SANS } from "@/styles/tokens"
 import { IconRefresh, IconArrowRight } from "@/atlas/shared/Icon"
+import { useGlobalSDK } from "@/context/global-sdk"
+import { resolveServerRoute } from "@/config/server-url"
+import "./FdaBanner.css"
 
 interface ProbeResult {
   fda: boolean
-  reason?: string
+  reason?: "permission_denied"
 }
 
 const DISMISS_KEY = "atlas.fda.banner.hidden"
 
-async function probeFda(): Promise<ProbeResult> {
+async function probeFda(server: string): Promise<ProbeResult> {
   try {
-    const res = await fetch("/api/resolve-folder/probe")
-    if (!res.ok) return { fda: false, reason: `probe ${res.status}` }
+    const res = await fetch(resolveServerRoute("/api/resolve-folder/probe", server, window.location.origin))
+    if (!res.ok) return { fda: true }
     return await res.json()
-  } catch (err: any) {
-    return { fda: false, reason: err?.message ?? "network error" }
+  } catch {
+    return { fda: true }
   }
 }
 
@@ -36,51 +38,34 @@ const SETTINGS_URL: Record<"mac" | "win" | "linux", string | null> = {
 }
 
 const STEP_TITLE: Record<"mac" | "win" | "linux", string> = {
-  mac: "Grant Full Disk Access",
-  win: "Filesystem access",
-  linux: "Filesystem access",
+  mac: "Allow project folder access",
+  win: "Allow project folder access",
+  linux: "Allow project folder access",
 }
 
 const STEP_BODY: Record<"mac" | "win" | "linux", string> = {
-  mac: "macOS blocks ~/Desktop · ~/Documents · ~/Downloads from any process that doesn't have Full Disk Access. Add the openscience binary itself to the FDA list — that way it works no matter which shell you launch it from.",
-  win: "Run openscience from Windows Terminal / PowerShell — not a sandboxed Microsoft Store shell.",
-  linux: "Run openscience from a system shell, not a confined Snap/Flatpak terminal.",
+  mac: "macOS denied OpenScience access to a protected folder. Grant access to the terminal or app that started this server, then relaunch it.",
+  win: "Windows denied OpenScience access to this project folder. Relaunch it from a terminal with access to the folder.",
+  linux:
+    "Linux denied OpenScience access to this project folder. Relaunch it outside a confined shell or grant the shell access.",
 }
 
 /**
- * Tiny status chip that surfaces only when Full Disk Access is missing.
- * Lives next to the "+ new project" button on home; click → small sheet
- * with a one-tap deep-link to System Settings (mac) and a recheck.
+ * Tiny status chip that surfaces only after an explicit protected-folder
+ * permission denial. Lives next to the new-project button; click opens a
+ * compact recovery sheet with a deliberate settings link and recheck.
  */
-export function FdaChip(): JSX.Element {
+function FdaChip(): JSX.Element {
+  const sdk = useGlobalSDK()
   const [dismissed, setDismissed] = createSignal(
     typeof localStorage !== "undefined" && localStorage.getItem(DISMISS_KEY) === "1",
   )
-  const [refreshKey, setRefreshKey] = createSignal(0)
-  const [probe, { refetch }] = createResource(refreshKey, probeFda)
+  const [probe, { refetch }] = createResource(() => sdk.url, probeFda)
   const dialog = useDialog()
 
-  onMount(() => {
-    setTimeout(() => {
-      if (probe()?.fda && !dismissed()) {
-        try {
-          localStorage.setItem(DISMISS_KEY, "1")
-        } catch {}
-        setDismissed(true)
-      }
-    }, 800)
-  })
-
   const recheck = async () => {
-    setRefreshKey((k) => k + 1)
     const r = await refetch()
-    if (r?.fda) {
-      try {
-        localStorage.setItem(DISMISS_KEY, "1")
-      } catch {}
-      setDismissed(true)
-      dialog.close()
-    }
+    if (r?.fda) dialog.close()
   }
 
   const dismiss = () => {
@@ -96,7 +81,6 @@ export function FdaChip(): JSX.Element {
       () => (
         <FdaSheet
           os={os}
-          reason={probe()?.reason}
           onRecheck={recheck}
           onDismiss={() => {
             dismiss()
@@ -110,43 +94,9 @@ export function FdaChip(): JSX.Element {
 
   return (
     <Show when={!dismissed() && !probe.loading && probe()?.fda === false}>
-      <button
-        onClick={openSheet}
-        title="grant filesystem access for the OS file picker"
-        style={{
-          all: "unset",
-          "box-sizing": "border-box",
-          cursor: "pointer",
-          display: "inline-flex",
-          "align-items": "center",
-          gap: "6px",
-          height: "32px",
-          padding: "0 10px",
-          "border-radius": "4px",
-          background: "color-mix(in srgb, var(--color-warning) 10%, transparent)",
-          border: "1px solid color-mix(in srgb, var(--color-warning) 35%, transparent)",
-          color: "color-mix(in srgb, var(--color-warning) 65%, var(--color-text))",
-          "font-family": FONT_MONO,
-          "font-size": "11px",
-          "font-weight": 400,
-        }}
-        onMouseEnter={(e) =>
-          (e.currentTarget.style.background = "color-mix(in srgb, var(--color-warning) 18%, transparent)")
-        }
-        onMouseLeave={(e) =>
-          (e.currentTarget.style.background = "color-mix(in srgb, var(--color-warning) 10%, transparent)")
-        }
-      >
-        <span
-          style={{
-            width: "6px",
-            height: "6px",
-            "border-radius": "50%",
-            background: "var(--color-warning)",
-            display: "inline-block",
-          }}
-        />
-        FDA
+      <button type="button" class="folder-access-chip" onClick={openSheet} title="Project folder access is blocked">
+        <span class="folder-access-chip__dot" aria-hidden="true" />
+        Folder access
       </button>
     </Show>
   )
@@ -154,151 +104,67 @@ export function FdaChip(): JSX.Element {
 
 function FdaSheet(props: {
   os: "mac" | "win" | "linux"
-  reason: string | undefined
   onRecheck: () => Promise<void>
   onDismiss: () => void
 }): JSX.Element {
   const url = () => SETTINGS_URL[props.os]
   const [busy, setBusy] = createSignal(false)
   return (
-    <Dialog title={STEP_TITLE[props.os]}>
-      <div
-        style={{
-          display: "flex",
-          "flex-direction": "column",
-          gap: "14px",
-          "max-width": "440px",
-        }}
-      >
-        <p
-          style={{
-            "font-family": FONT_SANS,
-            "font-size": "13px",
-            color: "var(--color-text-muted)",
-            "line-height": 1.55,
-            margin: 0,
-          }}
-        >
-          {STEP_BODY[props.os]}
-        </p>
+    <Dialog title={STEP_TITLE[props.os]} description={STEP_BODY[props.os]} class="folder-access-dialog" fit transition>
+      <section class="folder-access-sheet" aria-label="Folder access recovery">
+        <div class="folder-access-status">
+          <span class="folder-access-status__dot" aria-hidden="true" />
+          <span>
+            <strong>Protected folders are unavailable</strong>
+            <small>You can keep working with folders this process is allowed to read.</small>
+          </span>
+        </div>
         <Show when={props.os === "mac"}>
-          <ol
-            style={{
-              margin: 0,
-              "padding-left": "18px",
-              display: "flex",
-              "flex-direction": "column",
-              gap: "4px",
-              "font-family": FONT_MONO,
-              "font-size": "12px",
-              color: "var(--color-text)",
-            }}
-          >
-            <li>Open Privacy &amp; Security → Full Disk Access</li>
+          <ol class="folder-access-steps">
             <li>
-              Click <strong>+</strong>, press <code style={kbd()}>⌘⇧G</code>, paste{" "}
-              <code style={kbd()}>/opt/homebrew/bin/openscience</code>, hit Enter, Open
+              <span>Open Privacy &amp; Security → Full Disk Access.</span>
             </li>
-            <li>Toggle the openscience entry on</li>
-            <li>Restart OpenScience (kill + relaunch) — recheck below</li>
+            <li>
+              <span>Enable the terminal or desktop app you used to launch OpenScience.</span>
+            </li>
+            <li>
+              <span>
+                If you launch the executable directly, run <code>which openscience</code> in that shell to locate it.
+              </span>
+            </li>
+            <li>
+              <span>Quit and relaunch OpenScience, then recheck access.</span>
+            </li>
           </ol>
         </Show>
-        <div style={{ display: "flex", gap: "8px", "padding-top": "4px" }}>
+        <div class="folder-access-actions">
           <Show when={url()}>
-            <a
-              href={url()!}
-              target="_self"
-              style={{
-                all: "unset",
-                cursor: "pointer",
-                padding: "7px 14px",
-                "border-radius": "4px",
-                background: "var(--color-accent)",
-                color: "var(--color-on-accent)",
-                "font-family": FONT_MONO,
-                "font-size": "11px",
-                "font-weight": 400,
-                display: "inline-flex",
-                "align-items": "center",
-                gap: "5px",
-              }}
-            >
-              <IconArrowRight size={11} strokeWidth={1.5} />
-              open system settings
+            <a href={url()!} target="_self" class="folder-access-action folder-access-action--primary">
+              <IconArrowRight size={12} strokeWidth={1.5} />
+              Open privacy settings
             </a>
           </Show>
           <button
+            type="button"
+            class="folder-access-action folder-access-action--secondary"
             onClick={async () => {
               setBusy(true)
               await props.onRecheck()
               setBusy(false)
             }}
             disabled={busy()}
-            style={{
-              all: "unset",
-              cursor: busy() ? "not-allowed" : "pointer",
-              padding: "7px 14px",
-              "border-radius": "4px",
-              background: "var(--color-surface-solid)",
-              border: "1px solid var(--color-border)",
-              "font-family": FONT_MONO,
-              "font-size": "11px",
-              color: "var(--color-text)",
-              opacity: busy() ? 0.5 : 1,
-              display: "inline-flex",
-              "align-items": "center",
-              gap: "5px",
-            }}
           >
-            <IconRefresh size={11} strokeWidth={1.5} />
-            recheck
+            <IconRefresh size={12} strokeWidth={1.5} />
+            {busy() ? "Checking…" : "Recheck"}
           </button>
-          <span style={{ flex: 1 }} />
-          <button
-            onClick={props.onDismiss}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              padding: "7px 12px",
-              "border-radius": "4px",
-              "font-family": FONT_MONO,
-              "font-size": "11px",
-              color: "var(--color-text-muted)",
-            }}
-          >
-            skip
+          <button type="button" class="folder-access-action folder-access-action--dismiss" onClick={props.onDismiss}>
+            Dismiss
           </button>
         </div>
-        <Show when={props.reason}>
-          <div
-            style={{
-              "font-family": FONT_MONO,
-              "font-size": "10px",
-              color: "var(--color-text-faint)",
-              "padding-top": "4px",
-              "border-top": "1px dashed var(--color-border)",
-            }}
-          >
-            {props.reason}
-          </div>
-        </Show>
-      </div>
+      </section>
     </Dialog>
   )
 }
 
 // Backwards-compat: home.tsx still imports FdaBanner. Re-export the chip.
 export const FdaBanner = FdaChip
-
-function kbd(): JSX.CSSProperties {
-  return {
-    "font-family": FONT_CODE,
-    "font-size": "11px",
-    padding: "1px 5px",
-    "border-radius": "4px",
-    background: "var(--color-bg-elevated)",
-    border: "1px solid var(--color-border)",
-    color: "var(--color-text-muted)",
-    "white-space": "nowrap",
-  } as JSX.CSSProperties
-}

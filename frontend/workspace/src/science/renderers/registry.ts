@@ -22,6 +22,16 @@ export type ArtifactKind =
   | "latex" // katex — rendered math / equations
   | (string & {})
 
+export interface ArtifactInspection {
+  facts: Array<{ label: string; value: string }>
+  capabilities: string[]
+  selection?: {
+    kind: "molecule" | "genome" | "notebook" | "text"
+    label: string
+    count?: number
+  }
+}
+
 /** Props every science renderer receives. */
 export interface ArtifactRenderProps {
   /** The artifact kind (redundant with lookup key; handy for shared renderers). */
@@ -34,6 +44,8 @@ export interface ArtifactRenderProps {
   data: unknown
   /** Optional display height hint in px. */
   height?: number
+  /** Publish live renderer facts and selection state to the artifact inspector. */
+  onInspect?: (inspection: ArtifactInspection) => void
 }
 
 export type ArtifactRenderer = Component<ArtifactRenderProps>

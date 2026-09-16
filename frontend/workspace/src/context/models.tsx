@@ -4,56 +4,61 @@ import { uniqueBy } from "remeda"
 import { createSimpleContext } from "@synsci/ui/context"
 import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
+import {
+  isChatModel,
+  isFrontier,
+  logicalModelKey,
+  preferredModel,
+  preferredModels,
+  type ModelKey,
+} from "./model-catalog"
 
-export type ModelKey = { providerID: string; modelID: string }
+export { canonicalKey, FRONTIER_MODELS, type ModelKey } from "./model-catalog"
 
-// The curated "frontier" set shown in the model picker by default. Everything
-// else stays in the catalog and is one click away in Manage Models, but the
-// default toggle is just these. Matched by canonicalKey() so a BYOK-native id
-// and the managed OpenRouter "vendor/model" slug for the same model collapse to
-// one entry (folds dots<->dashes and the z-ai/zai/zhipuai alias).
-//
-// NOTE: two requested entries don't exist in the live catalog yet — they're
-// kept here so they light up the moment they ship: `openai/gpt-5-5-mini` (the
-// 5.5 tier currently ships only gpt-5.5 + gpt-5.5-pro) and kimi-k2.7 (only the
-// coding flagship `kimi-k2.7-code` exists, which is what's listed below).
-export const FRONTIER_MODELS = new Set([
-  "openai/gpt-5-5", // gpt-5.5
-  "openai/gpt-5-5-mini", // gpt-5.5-mini (not shipped yet)
-  "anthropic/claude-sonnet-5",
-  "anthropic/claude-opus-4-8", // native dashes == OpenRouter anthropic/claude-opus-4.8
-  "anthropic/claude-fable-5",
-  "zai/glm-5-2", // native zai/zhipuai, OpenRouter z-ai/glm-5.2
-  "moonshotai/kimi-k2-7-code", // "kimi k2.7" -> the only k2.7 flagship that exists
-  "deepseek/deepseek-v4-pro",
-  "deepseek/deepseek-v4-flash",
-])
+export const RECOMMENDED_MODELS: ModelKey[] = [
+  { providerID: "openai", modelID: "gpt-5.6-sol" },
+  { providerID: "anthropic", modelID: "claude-opus-5" },
+  { providerID: "moonshotai", modelID: "kimi-k3" },
+]
 
-/** Stable key that matches a native id AND an OpenRouter vendor/model slug for
- *  the same model: strips the OpenRouter "~" alias marker, folds the GLM vendor
- *  aliases, lowercases, and normalizes dots to dashes. */
-export function canonicalKey(providerID: string, modelID: string): string {
-  let vendor = providerID
-  let base = modelID
-  const slash = modelID.lastIndexOf("/")
-  if (slash >= 0) {
-    vendor = modelID.slice(0, slash)
-    base = modelID.slice(slash + 1)
-  }
-  vendor = vendor.replace(/^~/, "").toLowerCase()
-  if (vendor === "z-ai" || vendor === "zhipuai") vendor = "zai"
-  base = base.replace(/^~/, "").toLowerCase().replace(/\./g, "-")
-  return `${vendor}/${base}`
-}
-
-const isFrontier = (model: ModelKey) => FRONTIER_MODELS.has(canonicalKey(model.providerID, model.modelID))
+export const DEFAULT_PINNED_MODELS: ModelKey[] = []
 
 type Visibility = "show" | "hide"
 type User = ModelKey & { visibility: Visibility; favorite?: boolean }
 type Store = {
   user: User[]
   recent: ModelKey[]
+  /** The last model chosen in the composer. Kept here, outside any project
+   * mount, so leaving a project or opening another one does not fall back to
+   * the install default. */
+  selected?: ModelKey
+  pinned?: ModelKey[]
   variant?: Record<string, string | undefined>
+  tier?: Record<string, string | undefined>
+  context?: Record<string, number | undefined>
+}
+
+export const composerModelPreferenceKey = (model: ModelKey) => logicalModelKey(model.providerID, model.modelID)
+
+export function connectedPinnedModels(current: readonly ModelKey[], connected: ReadonlySet<string>) {
+  return uniqueBy(current, composerModelPreferenceKey)
+    .filter((model) => connected.has(composerModelPreferenceKey(model)))
+    .slice(0, 3)
+}
+
+export const togglePinned = (current: ModelKey[], model: ModelKey) => {
+  const models = uniqueBy(current, (item) => logicalModelKey(item.providerID, item.modelID)).slice(0, 3)
+  const key = logicalModelKey(model.providerID, model.modelID)
+  const pinned = models.some((item) => logicalModelKey(item.providerID, item.modelID) === key)
+  if (pinned) {
+    return {
+      models: models.filter((item) => logicalModelKey(item.providerID, item.modelID) !== key),
+      pinned: false,
+      limited: false,
+    }
+  }
+  if (models.length >= 3) return { models, pinned: false, limited: true }
+  return { models: [...models, model], pinned: true, limited: false }
 }
 
 export const { use: useModels, provider: ModelsProvider } = createSimpleContext({
@@ -66,22 +71,29 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       createStore<Store>({
         user: [],
         recent: [],
+        pinned: [],
         variant: {},
+        tier: {},
+        context: {},
       }),
     )
 
     const available = createMemo(() =>
-      providers.connected().flatMap((p) =>
-        Object.values(p.models).map((m) => ({
-          ...m,
-          provider: p,
-        })),
+      preferredModels(
+        providers.connected().flatMap((p) =>
+          Object.values(p.models)
+            .map((m) => ({
+              ...m,
+              provider: p,
+            }))
+            .filter(isChatModel),
+        ),
       ),
     )
 
     const visibility = createMemo(() => {
       const map = new Map<string, Visibility>()
-      for (const item of store.user) map.set(`${item.providerID}:${item.modelID}`, item.visibility)
+      for (const item of store.user) map.set(composerModelPreferenceKey(item), item.visibility)
       return map
     })
 
@@ -112,15 +124,15 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       })
     })
 
-    const find = (key: ModelKey) => list().find((m) => m.id === key.modelID && m.provider.id === key.providerID)
+    const find = (key: ModelKey) => preferredModel(list(), key)
 
     function update(model: ModelKey, state: Visibility) {
-      const index = store.user.findIndex((x) => x.modelID === model.modelID && x.providerID === model.providerID)
-      if (index >= 0) {
-        setStore("user", index, { visibility: state })
-        return
-      }
-      setStore("user", store.user.length, { ...model, visibility: state })
+      const key = composerModelPreferenceKey(model)
+      const previous = store.user.find((item) => composerModelPreferenceKey(item) === key)
+      setStore("user", [
+        ...store.user.filter((item) => composerModelPreferenceKey(item) !== key),
+        { ...previous, ...model, visibility: state },
+      ])
     }
 
     // Are any of the connected providers exposing a frontier model at all? If
@@ -131,10 +143,10 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
     )
 
     const visible = (model: ModelKey) => {
-      const key = `${model.providerID}:${model.modelID}`
+      const key = composerModelPreferenceKey(model)
       const state = visibility().get(key)
-      // Explicit user choice always wins (set via Manage Models, or implicitly
-      // when a model is selected — see local.set()).
+      // Explicit logical-model choice always wins across managed, subscription,
+      // and direct-key routes (set here or implicitly via local.set()).
       if (state === "hide") return false
       if (state === "show") return true
       // Default: only the curated frontier set surfaces in the picker. The full
@@ -154,6 +166,24 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       setStore("recent", uniq)
     }
 
+    const select = (model: ModelKey | undefined) => {
+      setStore("selected", model ? { providerID: model.providerID, modelID: model.modelID } : undefined)
+    }
+
+    // New installations start unpinned. The composer derives its suggested set
+    // from available models, so pinning is always an explicit user choice.
+    const connected = createMemo(() => new Set(list().map((model) => logicalModelKey(model.provider.id, model.id))))
+    const pinned = createMemo(() => connectedPinnedModels(store.pinned ?? [], connected()))
+    const isPinned = (model: ModelKey) => {
+      const key = logicalModelKey(model.providerID, model.modelID)
+      return pinned().some((item) => logicalModelKey(item.providerID, item.modelID) === key)
+    }
+    const togglePin = (model: ModelKey) => {
+      const result = togglePinned(pinned(), model)
+      if (!result.limited) setStore("pinned", result.models)
+      return { pinned: result.pinned, limited: result.limited }
+    }
+
     const variantKey = (model: ModelKey) => `${model.providerID}/${model.modelID}`
     const getVariant = (model: ModelKey) => store.variant?.[variantKey(model)]
 
@@ -166,6 +196,28 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       setStore("variant", key, value)
     }
 
+    const getTier = (model: ModelKey) => store.tier?.[variantKey(model)]
+
+    const setTier = (model: ModelKey, value: string | undefined) => {
+      const key = variantKey(model)
+      if (!store.tier) {
+        setStore("tier", { [key]: value })
+        return
+      }
+      setStore("tier", key, value)
+    }
+
+    const getContext = (model: ModelKey) => store.context?.[variantKey(model)]
+
+    const setContext = (model: ModelKey, value: number | undefined) => {
+      const key = variantKey(model)
+      if (!store.context) {
+        setStore("context", { [key]: value })
+        return
+      }
+      setStore("context", key, value)
+    }
+
     return {
       ready,
       list,
@@ -176,9 +228,26 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
         list: createMemo(() => store.recent),
         push,
       },
+      selected: {
+        get: () => store.selected,
+        set: select,
+      },
+      pinned: {
+        list: pinned,
+        has: isPinned,
+        toggle: togglePin,
+      },
       variant: {
         get: getVariant,
         set: setVariant,
+      },
+      tier: {
+        get: getTier,
+        set: setTier,
+      },
+      context: {
+        get: getContext,
+        set: setContext,
       },
     }
   },

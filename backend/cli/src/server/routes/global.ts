@@ -1,4 +1,5 @@
 import { Hono } from "hono"
+import crypto from "node:crypto"
 import { describeRoute, resolver, validator } from "hono-openapi"
 import { streamSSE } from "hono/streaming"
 import z from "zod"
@@ -7,15 +8,66 @@ import { GlobalBus } from "@/bus/global"
 import { Instance } from "../../project/instance"
 import { Installation } from "@/installation"
 import { Log } from "../../util/log"
-import { lazy } from "../../util/lazy"
+import { lazy } from "@synsci/util/lazy"
 import { Config } from "../../config/config"
 import { errors } from "../error"
-import { OpenScience } from "@/openscience"
-import { Provider } from "@/provider/provider"
+import { Project } from "@/project/project"
+import { ManagedProject } from "@/project/managed"
+import { SessionFilesystem } from "@/session/filesystem"
+import { ServerIdentity } from "../identity"
 
 const log = Log.create({ service: "server" })
 
 export const GlobalDisposedEvent = BusEvent.define("global.disposed", z.object({}))
+
+/** Upper bound on events buffered per SSE client before the oldest are dropped. */
+const EVENT_QUEUE_LIMIT = 2000
+
+type GlobalEvent = { directory?: string; payload: { type: string; properties?: unknown } }
+
+/**
+ * Part id of a streamed `message.part.updated` event, used to coalesce a full
+ * queue. Scoped by directory because this stream multiplexes every project,
+ * where the sibling `/event` carries one.
+ */
+function partID(event: GlobalEvent) {
+  if (event.payload.type !== "message.part.updated") return
+  const part = (event.payload.properties as { part?: { id?: unknown } } | undefined)?.part
+  return typeof part?.id === "string" ? `${event.directory ?? ""}:${part.id}` : undefined
+}
+
+const ProjectName = z
+  .string()
+  .transform((name) => name.normalize("NFC").trim())
+  .pipe(
+    z
+      .string()
+      .min(1, "Project name is required")
+      .max(100, "Project name must be 100 characters or fewer")
+      .refine((name) => !/[\u0000-\u001f\u007f]/u.test(name), "Project name cannot contain control characters")
+      .refine((name) => !name.includes("/") && !name.includes("\\"), "Project name cannot contain path separators")
+      .transform((name) => name.replace(/[ \t]+/gu, " ")),
+  )
+
+const ProjectSource = z.object({
+  path: z.string().trim().min(1),
+  access: SessionFilesystem.Access.default("write"),
+})
+
+const ProjectCreate = z
+  .object({
+    name: ProjectName,
+    sources: ProjectSource.array().max(10).default([]),
+    operation_id: z.string().uuid().optional(),
+  })
+  .strict()
+
+function projectFingerprint(input: z.infer<typeof ProjectCreate>) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ name: input.name, sources: input.sources }))
+    .digest("hex")
+}
 
 export const GlobalRoutes = lazy(() =>
   new Hono()
@@ -30,14 +82,82 @@ export const GlobalRoutes = lazy(() =>
             description: "Health information",
             content: {
               "application/json": {
-                schema: resolver(z.object({ healthy: z.literal(true), version: z.string() })),
+                schema: resolver(
+                  z.object({
+                    healthy: z.literal(true),
+                    version: z.string(),
+                    sourceSha: z.string().nullable(),
+                    sourceWorktreeHash: z.string().nullable(),
+                    runId: z.string(),
+                  }),
+                ),
               },
             },
           },
         },
       }),
       async (c) => {
-        return c.json({ healthy: true, version: Installation.VERSION })
+        return c.json({ healthy: true, version: Installation.VERSION, ...ServerIdentity.current })
+      },
+    )
+    .post(
+      "/project",
+      describeRoute({
+        summary: "Create project",
+        description:
+          "Create an app-managed project with an opaque identity and optional project-scoped access to source locations explicitly selected by the user. Source paths never become the project identity. Reusing an operation_id with the exact same draft safely replays its original result.",
+        operationId: "global.project.create",
+        responses: {
+          201: {
+            description: "Created project information",
+            content: {
+              "application/json": {
+                schema: resolver(Project.Info),
+              },
+            },
+          },
+          200: {
+            description: "Existing project information for a replayed operation",
+            content: {
+              "application/json": {
+                schema: resolver(Project.Info),
+              },
+            },
+          },
+          409: { description: "Operation id was already bound to a different project draft" },
+          ...errors(400),
+        },
+      }),
+      validator("json", ProjectCreate),
+      async (c) => {
+        const input = c.req.valid("json")
+        const checkpoint = async (created: Project.Info) => {
+          await Instance.provide({
+            directory: created.worktree,
+            projectID: created.id,
+            fn: async () => {
+              await SessionFilesystem.seedProject({ projectID: created.id, grants: input.sources })
+            },
+          })
+        }
+        if (!input.operation_id) return c.json(await ManagedProject.create(input.name, checkpoint), 201)
+
+        const result = await ManagedProject.createIdempotent({
+          operationID: input.operation_id,
+          fingerprint: projectFingerprint(input),
+          name: input.name,
+          checkpoint,
+        })
+        if (result.status === "conflict") {
+          return c.json(
+            {
+              error: "project_operation_conflict",
+              message: "This project operation is already bound to a different workspace choice.",
+            },
+            409,
+          )
+        }
+        return c.json(result.project, result.status === "created" ? 201 : 200)
       },
     )
     .get(
@@ -69,41 +189,81 @@ export const GlobalRoutes = lazy(() =>
       async (c) => {
         log.info("global event connected")
         return streamSSE(c, async (stream) => {
-          stream.writeSSE({
-            data: JSON.stringify({
-              payload: {
-                type: "server.connected",
-                properties: {},
-              },
-            }),
-          })
-          async function handler(event: any) {
-            await stream.writeSSE({
-              data: JSON.stringify(event),
-            })
-          }
-          GlobalBus.on("event", handler)
+          const connected = (): GlobalEvent => ({ payload: { type: "server.connected", properties: {} } })
 
           // Send heartbeat every 30s to prevent WKWebView timeout (60s default)
           const heartbeat = setInterval(() => {
-            stream.writeSSE({
-              data: JSON.stringify({
-                payload: {
-                  type: "server.heartbeat",
-                  properties: {},
-                },
-              }),
-            })
+            push({ payload: { type: "server.heartbeat", properties: {} } })
           }, 30000)
 
-          await new Promise<void>((resolve) => {
-            stream.onAbort(() => {
-              clearInterval(heartbeat)
-              GlobalBus.off("event", handler)
-              resolve()
-              log.info("global event disconnected")
-            })
-          })
+          // The subscriber never awaits the socket. Events land in a bounded
+          // per-connection queue drained by one writer loop, so a stalled
+          // browser tab cannot grow this connection without bound: `emit`
+          // discards the promise an async listener returns, so nothing else
+          // here would ever apply backpressure.
+          const queue: GlobalEvent[] = []
+          const done = Promise.withResolvers<void>()
+          const state = { closed: false, draining: false, overflowed: false }
+          const cleanup = () => {
+            if (state.closed) return
+            state.closed = true
+            clearInterval(heartbeat)
+            GlobalBus.off("event", handler)
+            done.resolve()
+            log.info("global event disconnected")
+          }
+          const drain = async () => {
+            if (state.draining) return
+            state.draining = true
+            try {
+              for (;;) {
+                const event = state.closed ? undefined : queue.shift()
+                if (!event) break
+                await stream.writeSSE({ data: JSON.stringify(event) })
+              }
+            } catch (error) {
+              log.debug("global event write failed", { error })
+              cleanup()
+            } finally {
+              state.draining = false
+            }
+          }
+          const push = (event: GlobalEvent) => {
+            if (state.closed) return
+            if (queue.length >= EVENT_QUEUE_LIMIT) {
+              const part = partID(event)
+              // Replace the newest queued update for the part, never an older
+              // one, so the client still receives states in order.
+              const index = part === undefined ? -1 : queue.findLastIndex((item) => partID(item) === part)
+              if (index >= 0) {
+                queue[index] = event
+                return
+              }
+              // Drop a queued part update before anything else: the client
+              // reconciles whole parts, whereas a dropped project, session or
+              // permission event leaves it stale for good.
+              const oldestPart = queue.findIndex((item) => partID(item) !== undefined)
+              const victim =
+                oldestPart >= 0 ? oldestPart : queue.findIndex((item) => item.payload.type !== "server.connected")
+              queue.splice(victim >= 0 ? victim : 0, 1)
+              if (!state.overflowed) {
+                state.overflowed = true
+                log.warn("global event queue overflow; dropping oldest events", { limit: EVENT_QUEUE_LIMIT })
+                // Whatever was lost, the client re-hydrates on this frame
+                // exactly as it does after a reconnect.
+                queue.unshift(connected())
+              }
+            }
+            queue.push(event)
+            void drain()
+          }
+          const handler = (event: GlobalEvent) => push(event)
+
+          push(connected())
+          GlobalBus.on("event", handler)
+
+          stream.onAbort(cleanup)
+          await done.promise
         })
       },
     )
@@ -125,7 +285,7 @@ export const GlobalRoutes = lazy(() =>
         },
       }),
       async (c) => {
-        return c.json(await Config.getGlobal())
+        return c.json(Config.redact(await Config.getGlobal()))
       },
     )
     .patch(
@@ -148,9 +308,13 @@ export const GlobalRoutes = lazy(() =>
       }),
       validator("json", Config.Info),
       async (c) => {
-        const config = c.req.valid("json")
-        const next = await Config.updateGlobal(config)
-        return c.json(next)
+        // Validated above, but written as sent: the schema's parsed form
+        // expands scalars and fills defaults that must not land in the file.
+        c.req.valid("json")
+        const config = (await c.req.json()) as Config.Info
+        const restored = Config.restore(config, await Config.getGlobal())
+        const next = await Config.updateGlobal(restored)
+        return c.json(Config.redact(next))
       },
     )
     .get(
@@ -195,7 +359,7 @@ export const GlobalRoutes = lazy(() =>
       validator("json", z.object({ content: z.string() })),
       async (c) => {
         const next = await Config.replaceGlobal(c.req.valid("json").content)
-        return c.json(next)
+        return c.json(Config.redact(next))
       },
     )
     .post(
@@ -249,47 +413,6 @@ export const GlobalRoutes = lazy(() =>
           },
         })
         return c.json(true)
-      },
-    )
-    .post(
-      "/sync",
-      describeRoute({
-        summary: "Sync account services",
-        description: "Refresh OpenScience account services and reload local provider/config state.",
-        operationId: "global.sync",
-        responses: {
-          200: {
-            description: "Services synced",
-            content: {
-              "application/json": {
-                schema: resolver(
-                  z.object({
-                    user: z.unknown().optional(),
-                    credentials: z.number(),
-                    last_synced: z.number(),
-                  }),
-                ),
-              },
-            },
-          },
-        },
-      }),
-      async (c) => {
-        const result = await OpenScience.syncServices()
-        Provider.invalidate()
-        await Instance.disposeAll()
-        GlobalBus.emit("event", {
-          directory: "global",
-          payload: {
-            type: GlobalDisposedEvent.type,
-            properties: {},
-          },
-        })
-        return c.json({
-          user: result?.user,
-          credentials: result?.credentials ?? 0,
-          last_synced: Date.now(),
-        })
       },
     ),
 )

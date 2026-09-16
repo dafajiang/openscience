@@ -1,7 +1,17 @@
 import { realpathSync } from "fs"
-import { dirname, join, relative } from "path"
+import { lstat, realpath, stat } from "fs/promises"
+import path, { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path"
 
 export namespace Filesystem {
+  /** Drop one trailing separator unless the path is a filesystem root. Cutting
+   * a Windows drive root `C:\` down to `C:` makes it drive-relative, and every
+   * later resolve grafts the process cwd onto it: a project opened at a drive
+   * root was then answered with a ProjectMismatchError naming the user's home. */
+  export function trimSeparator(value: string, module: Pick<typeof path, "parse" | "sep"> = path) {
+    const root = module.parse(value).root
+    return value.length > root.length && value.endsWith(module.sep) ? value.slice(0, -1) : value
+  }
+
   export const exists = (p: string) =>
     Bun.file(p)
       .stat()
@@ -29,11 +39,50 @@ export namespace Filesystem {
   export function overlaps(a: string, b: string) {
     const relA = relative(a, b)
     const relB = relative(b, a)
-    return !relA || !relA.startsWith("..") || !relB || !relB.startsWith("..")
+    return containsRelative(relA) || containsRelative(relB)
   }
 
   export function contains(parent: string, child: string) {
-    return !relative(parent, child).startsWith("..")
+    return containsRelative(relative(parent, child))
+  }
+
+  function containsRelative(value: string) {
+    return value === "" || (value !== ".." && !value.startsWith(`..${sep}`) && !isAbsolute(value))
+  }
+
+  async function canonicalize(cursor: string, tail: string[]): Promise<string | undefined> {
+    const result = await realpath(cursor).then(
+      (value) => ({ value }),
+      (error: NodeJS.ErrnoException) => ({ error }),
+    )
+    if ("error" in result) {
+      if (result.error.code !== "ENOENT" && result.error.code !== "ENOTDIR") return
+      const info = await lstat(cursor).catch(() => undefined)
+      if (info?.isSymbolicLink()) return
+      const parent = dirname(cursor)
+      if (parent === cursor) return
+      return canonicalize(parent, [basename(cursor), ...tail])
+    }
+    const base = result.value
+    if (!tail.length) return base
+    const info = await stat(base).catch(() => undefined)
+    if (!info?.isDirectory()) return
+    return resolve(base, ...tail)
+  }
+
+  /**
+   * Resolve a path by filesystem identity, including a target that does not
+   * exist yet. Existing symlinks are followed; a broken symlink is rejected
+   * instead of being reconstructed as if it were an ordinary path segment.
+   */
+  export function canonical(p: string): Promise<string | undefined> {
+    return canonicalize(resolve(p), [])
+  }
+
+  export async function containsCanonical(parent: string, child: string): Promise<boolean> {
+    const [root, target] = await Promise.all([canonical(parent), canonical(child)])
+    if (!root || !target) return false
+    return contains(root, target)
   }
 
   export async function findUp(target: string, start: string, stop?: string) {

@@ -1,6 +1,8 @@
 import path from "path"
 import fs from "fs/promises"
+import { appendFileSync } from "fs"
 import { Global } from "../global"
+import { DataRootBarrier } from "../global/data-root-barrier"
 import z from "zod"
 
 export namespace Log {
@@ -25,8 +27,12 @@ export namespace Log {
     info(message?: any, extra?: Record<string, any>): void
     error(message?: any, extra?: Record<string, any>): void
     warn(message?: any, extra?: Record<string, any>): void
+    /** A copy of this logger carrying one more tag; the receiver is unchanged. */
     tag(key: string, value: string): Logger
+    /** An uncached copy with the same tags. */
     clone(): Logger
+    /** An uncached copy carrying extra tags, for one call or one stream. */
+    child(tags: Record<string, any>): Logger
     time(
       message: string,
       extra?: Record<string, any>,
@@ -54,6 +60,41 @@ export namespace Log {
     process.stderr.write(msg)
     return msg.length
   }
+  let pending = Promise.resolve()
+
+  // File-mode lines are batched so one barrier marker and one append cover
+  // many lines instead of an fsync-backed marker per line.
+  const FLUSH_MS = 50
+  const FLUSH_BYTES = 64 * 1024
+  const buffered: string[] = []
+  const buffer = { size: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined, exit: false }
+
+  function drain() {
+    if (buffer.timer) clearTimeout(buffer.timer)
+    buffer.timer = undefined
+    if (!buffered.length) return pending
+    const content = buffered.join("")
+    buffered.length = 0
+    buffer.size = 0
+    // Resolve the stable data-root link for every serialized append instead
+    // of retaining an fd into one physical root. Relocation intent blocks a
+    // new append, drains earlier ones, snapshots the logs, switches the link,
+    // then releases the same precomputed path onto the new target.
+    pending = pending
+      .catch(() => undefined)
+      .then(async () => {
+        await using operation = await DataRootBarrier.enter(logpath, 120_000)
+        await fs.appendFile(logpath, content)
+      })
+      .catch((error) => {
+        process.stderr.write(`OpenScience log write failed: ${String(error)}\n`)
+      })
+    return pending
+  }
+
+  export function flush() {
+    return drain()
+  }
 
   export async function init(options: Options) {
     if (options.level) level = options.level
@@ -63,14 +104,31 @@ export namespace Log {
       Global.Path.log,
       options.dev ? "dev.log" : new Date().toISOString().split(".")[0].replace(/:/g, "") + ".log",
     )
-    const logfile = Bun.file(logpath)
     await fs.truncate(logpath).catch(() => {})
-    const writer = logfile.writer()
-    write = async (msg: any) => {
-      const num = writer.write(msg)
-      writer.flush()
-      return num
+    write = (msg: any) => {
+      const content = String(msg)
+      buffered.push(content)
+      buffer.size += content.length
+      if (buffer.size >= FLUSH_BYTES) {
+        drain()
+        return content.length
+      }
+      if (!buffer.timer) buffer.timer = setTimeout(drain, FLUSH_MS).unref()
+      return content.length
     }
+    if (buffer.exit) return
+    buffer.exit = true
+    // process.exit() skips the async drain, so land whatever is still
+    // buffered synchronously on the stable log path. DataRootBarrier is
+    // skipped on purpose: it is async, so lines buffered during an in-flight
+    // relocation may land on the old physical root rather than be lost.
+    process.on("exit", () => {
+      if (!buffered.length || !logpath) return
+      try {
+        appendFileSync(logpath, buffered.join(""))
+      } catch {}
+      buffered.length = 0
+    })
   }
 
   async function cleanup(dir: string) {
@@ -95,17 +153,21 @@ export namespace Log {
   }
 
   let last = Date.now()
+
+  /** One logger per service, shared by every caller of `create` with that
+   * service. Per-call tags belong on `child`/`tag`/`clone` copies, which are
+   * never cached: tagging the shared instance would relabel every concurrent
+   * caller's lines, and caching the copies would grow the map without bound. */
   export function create(tags?: Record<string, any>) {
-    tags = tags || {}
+    const service = tags?.["service"]
+    const cached = typeof service === "string" ? loggers.get(service) : undefined
+    if (cached) return cached
+    const result = logger({ ...tags })
+    if (typeof service === "string") loggers.set(service, result)
+    return result
+  }
 
-    const service = tags["service"]
-    if (service && typeof service === "string") {
-      const cached = loggers.get(service)
-      if (cached) {
-        return cached
-      }
-    }
-
+  function logger(tags: Record<string, any>): Logger {
     function build(message: any, extra?: Record<string, any>) {
       const prefix = Object.entries({
         ...tags,
@@ -116,6 +178,8 @@ export namespace Log {
           const prefix = `${key}=`
           if (value instanceof Error) return prefix + formatError(value)
           if (typeof value === "object") return prefix + JSON.stringify(value)
+          // An abort reason can be a Symbol; string concatenation would throw.
+          if (typeof value === "symbol") return prefix + value.toString()
           return prefix + value
         })
         .join(" ")
@@ -146,11 +210,13 @@ export namespace Log {
         }
       },
       tag(key: string, value: string) {
-        if (tags) tags[key] = value
-        return result
+        return logger({ ...tags, [key]: value })
       },
       clone() {
-        return Log.create({ ...tags })
+        return logger({ ...tags })
+      },
+      child(extra: Record<string, any>) {
+        return logger({ ...tags, ...extra })
       },
       time(message: string, extra?: Record<string, any>) {
         const now = Date.now()
@@ -170,11 +236,6 @@ export namespace Log {
         }
       },
     }
-
-    if (service && typeof service === "string") {
-      loggers.set(service, result)
-    }
-
     return result
   }
 }

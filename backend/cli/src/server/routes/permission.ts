@@ -3,7 +3,7 @@ import { describeRoute, validator, resolver } from "hono-openapi"
 import z from "zod"
 import { PermissionNext } from "@/permission/next"
 import { errors } from "../error"
-import { lazy } from "../../util/lazy"
+import { lazy } from "@synsci/util/lazy"
 
 export const PermissionRoutes = lazy(() =>
   new Hono()
@@ -63,6 +63,49 @@ export const PermissionRoutes = lazy(() =>
       async (c) => {
         const permissions = await PermissionNext.list()
         return c.json(permissions)
+      },
+    )
+    .get(
+      "/standing",
+      describeRoute({
+        summary: "List standing approvals",
+        description: "Standing permission approvals for this project plus the machine-wide ones.",
+        operationId: "permission.standing.list",
+        responses: {
+          200: {
+            description: "Standing approvals",
+            content: {
+              "application/json": {
+                schema: resolver(PermissionNext.Standing.array()),
+              },
+            },
+          },
+        },
+      }),
+      async (c) => {
+        return c.json(await PermissionNext.standing())
+      },
+    )
+    .delete(
+      "/standing/:id",
+      describeRoute({
+        summary: "Revoke standing approval",
+        description: "Remove one standing approval so the action prompts again.",
+        operationId: "permission.standing.revoke",
+        responses: {
+          200: {
+            description: "Whether an approval was removed",
+            content: {
+              "application/json": {
+                schema: resolver(z.boolean()),
+              },
+            },
+          },
+        },
+      }),
+      validator("param", z.object({ id: z.string() })),
+      async (c) => {
+        return c.json(await PermissionNext.revoke({ id: c.req.valid("param").id }))
       },
     ),
 )

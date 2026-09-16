@@ -1,9 +1,11 @@
 import { test as base, expect } from "@playwright/test"
-import { createSdk, dirSlug, getWorktree, promptSelector, serverUrl, sessionPath } from "./utils"
+import { projectPathname, projectSegment } from "../src/utils/project-route"
+import { createSdk, getWorktree, promptSelector, serverUrl } from "./utils"
 
 type TestFixtures = {
   sdk: ReturnType<typeof createSdk>
   gotoSession: (sessionID?: string) => Promise<void>
+  openSession: (title?: string) => Promise<string>
 }
 
 type WorkerFixtures = {
@@ -19,16 +21,37 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     },
     { scope: "worker" },
   ],
+  // Session URLs carry the canonical project segment: the project id, plus a
+  // `~<checksum>` suffix when the route points at a secondary worktree rather
+  // than the primary one. Legacy base64 directory slugs are reserved for the
+  // explicit redirect-compatibility spec.
   slug: [
     async ({ directory }, use) => {
-      await use(dirSlug(directory))
+      const sdk = createSdk(directory)
+      const project = await sdk.project.current().then((result) => result.data)
+      if (!project?.id) throw new Error(`Failed to resolve the current project from ${serverUrl}/project/current`)
+      await use(projectSegment(project, directory))
     },
     { scope: "worker" },
   ],
   sdk: async ({ directory }, use) => {
     await use(createSdk(directory))
   },
-  gotoSession: async ({ page, directory }, use) => {
+  // Creates a real session and navigates to it. The Files, Compute, and
+  // artifact surfaces are session-scoped, so specs exercising them need an
+  // actual session id rather than the blank new-session canvas.
+  openSession: async ({ sdk, gotoSession }, use) => {
+    const created: string[] = []
+    await use(async (title = `e2e session ${Date.now()}`) => {
+      const session = await sdk.session.create({ title }).then((result) => result.data)
+      if (!session?.id) throw new Error("Session create did not return an id")
+      created.push(session.id)
+      await gotoSession(session.id)
+      return session.id
+    })
+    for (const id of created) await sdk.session.delete({ sessionID: id }).catch(() => undefined)
+  },
+  gotoSession: async ({ page, directory, slug }, use) => {
     await page.addInitScript(
       (input: { directory: string; serverUrl: string }) => {
         const key = "openscience.global.dat:server"
@@ -79,7 +102,7 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     )
 
     const gotoSession = async (sessionID?: string) => {
-      await page.goto(sessionPath(directory, sessionID))
+      await page.goto(projectPathname(slug, sessionID))
       await expect(page.locator(promptSelector)).toBeVisible()
     }
     await use(gotoSession)

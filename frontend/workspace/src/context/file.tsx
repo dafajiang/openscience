@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createRoot, onCleanup } from "solid-js"
+import { createEffect, createMemo, createRoot, onCleanup, untrack } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { createSimpleContext } from "@synsci/ui/context"
 import type { FileContent, FileNode } from "@synsci/sdk/v2"
@@ -9,16 +9,9 @@ import { useSDK } from "./sdk"
 import { useSync } from "./sync"
 import { useLanguage } from "@/context/language"
 import { Persist, persisted } from "@/utils/persist"
-
-// Aborted / cancelled requests are expected when the user clicks quickly
-// (switching files or folders cancels the in-flight fetch). Surfacing those as
-// error toasts reads as a jarring flash on every click, so swallow them.
-function isTransientError(e: any): boolean {
-  const name = e?.name ?? ""
-  if (name === "AbortError" || name === "TimeoutError") return true
-  const msg = String(e?.message ?? e ?? "")
-  return /\bab(?:ort|orted)\b|cancell?ed|the user aborted|signal is aborted/i.test(msg)
-}
+import { createDebouncedSearch } from "./file-search"
+import { relativeLocalPath } from "@/utils/local-path"
+import { fileRequestKey, isFileRequestCancellation } from "@/atlas/file-viewer"
 
 export type FileSelection = {
   startLine: number
@@ -34,7 +27,7 @@ export type SelectedLineRange = {
   endSide?: "additions" | "deletions"
 }
 
-export type FileViewState = {
+type FileViewState = {
   scrollTop?: number
   scrollLeft?: number
   selectedLines?: SelectedLineRange | null
@@ -131,17 +124,6 @@ function unquoteGitPath(input: string) {
   return new TextDecoder().decode(new Uint8Array(bytes))
 }
 
-export function selectionFromLines(range: SelectedLineRange): FileSelection {
-  const startLine = Math.min(range.start, range.end)
-  const endLine = Math.max(range.start, range.end)
-  return {
-    startLine,
-    endLine,
-    startChar: 0,
-    endChar: 0,
-  }
-}
-
 function normalizeSelectedLines(range: SelectedLineRange): SelectedLineRange {
   if (range.start <= range.end) return range
 
@@ -183,18 +165,18 @@ function touchContent(path: string, bytes?: number) {
   contentLru.set(path, value)
 }
 
-type ViewSession = ReturnType<typeof createViewSession>
+type ViewSession = ReturnType<typeof createProjectView>
 
 type ViewCacheEntry = {
   value: ViewSession
   dispose: VoidFunction
 }
 
-function createViewSession(dir: string, id: string | undefined) {
-  const legacyViewKey = `${dir}/file${id ? "/" + id : ""}.v1`
+function createProjectView(dir: string, legacySession: string | undefined) {
+  const legacyViewKey = `${dir}/file${legacySession ? "/" + legacySession : ""}.v1`
 
   const [view, setView, _, ready] = persisted(
-    Persist.scoped(dir, id, "file-view", [legacyViewKey]),
+    Persist.workspace(dir, "file-view", [legacyViewKey, `${dir}/file.v1`]),
     createStore<{
       file: Record<string, FileViewState>
     }>({
@@ -286,22 +268,15 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     const language = useLanguage()
 
     const scope = createMemo(() => sdk.directory)
+    const storage = createMemo(() => sdk.scope)
+    const sessionID = createMemo(() => (params.id && params.id !== "new" ? params.id : undefined))
+    const requestScope = createMemo(() => [sdk.projectID ?? "", scope(), sessionID() ?? ""].join("\n"))
 
     const directory = createMemo(() => sync.data.path.directory)
 
     function normalize(input: string) {
       const root = directory()
-      const prefix = root.endsWith("/") ? root : root + "/"
-
-      let path = unquoteGitPath(stripQueryAndHash(stripFileProtocol(input)))
-
-      if (path.startsWith(prefix)) {
-        path = path.slice(prefix.length)
-      }
-
-      if (path.startsWith(root)) {
-        path = path.slice(root.length)
-      }
+      let path = relativeLocalPath(unquoteGitPath(stripQueryAndHash(stripFileProtocol(input))), root)
 
       if (path.startsWith("./")) {
         path = path.slice(2)
@@ -326,12 +301,22 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
 
     const inflight = new Map<string, Promise<void>>()
     const treeInflight = new Map<string, Promise<void>>()
+    let requestGeneration = 0
 
-    const search = (query: string, dirs: "true" | "false") =>
-      sdk.client.find.files({ query, dirs }).then(
-        (x) => (x.data ?? []).map(normalize),
-        () => [],
-      )
+    const searches = {
+      false: createDebouncedSearch(
+        (query, signal) =>
+          sdk.client.find.files({ query, dirs: "false" }, { signal }).then((x) => (x.data ?? []).map(normalize)),
+        { delayMs: 100, fallback: () => [] },
+      ),
+      true: createDebouncedSearch(
+        (query, signal) =>
+          sdk.client.find.files({ query, dirs: "true" }, { signal }).then((x) => (x.data ?? []).map(normalize)),
+        { delayMs: 100, fallback: () => [] },
+      ),
+    }
+
+    const search = (query: string, dirs: "true" | "false") => searches[dirs].search(query)
 
     const [store, setStore] = createStore<{
       file: Record<string, FileState>
@@ -377,7 +362,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     }
 
     createEffect(() => {
-      scope()
+      requestScope()
+      requestGeneration++
+      searches.false.cancel()
+      searches.true.cancel()
       inflight.clear()
       treeInflight.clear()
       contentLru.clear()
@@ -405,8 +393,8 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       }
     }
 
-    const loadView = (dir: string, id: string | undefined) => {
-      const key = `${dir}:${id ?? WORKSPACE_KEY}`
+    const loadView = (dir: string) => {
+      const key = dir || WORKSPACE_KEY
       const existing = viewCache.get(key)
       if (existing) {
         viewCache.delete(key)
@@ -415,7 +403,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       }
 
       const entry = createRoot((dispose) => ({
-        value: createViewSession(dir, id),
+        value: createProjectView(
+          dir,
+          untrack(() => params.id),
+        ),
         dispose,
       }))
 
@@ -424,7 +415,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       return entry.value
     }
 
-    const view = createMemo(() => loadView(params.dir!, params.id))
+    // File scroll, selection, and preview state belong to the project-owned
+    // inspector. Session changes update mutation authority at call time but do
+    // not replace the visible file surface.
+    const view = createMemo(() => loadView(storage()))
 
     function ensure(path: string) {
       if (!path) return
@@ -437,7 +431,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       if (!path) return Promise.resolve()
 
       const directory = scope()
-      const key = `${directory}\n${path}`
+      const session = sessionID()
+      const owner = requestScope()
+      const generation = requestGeneration
+      const key = fileRequestKey({ projectID: sdk.projectID, directory, sessionID: session, path })
       const client = sdk.client
 
       ensure(path)
@@ -458,9 +455,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       )
 
       const promise = client.file
-        .read({ path })
+        .read({ path, sessionID: session })
         .then((x) => {
-          if (scope() !== directory) return
+          if (requestGeneration !== generation || requestScope() !== owner) return
           const content = x.data
           setStore(
             "file",
@@ -477,7 +474,18 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           evictContent(new Set([path]))
         })
         .catch((e) => {
-          if (scope() !== directory) return
+          if (requestGeneration !== generation || requestScope() !== owner) return
+          if (isFileRequestCancellation(e)) {
+            setStore(
+              "file",
+              path,
+              produce((draft) => {
+                draft.loading = false
+                draft.error = undefined
+              }),
+            )
+            return
+          }
           setStore(
             "file",
             path,
@@ -486,7 +494,6 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
               draft.error = e.message
             }),
           )
-          if (isTransientError(e)) return
           showToast({
             variant: "error",
             title: language.t("toast.file.loadFailed.title"),
@@ -494,7 +501,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           })
         })
         .finally(() => {
-          inflight.delete(key)
+          if (inflight.get(key) === promise) inflight.delete(key)
         })
 
       inflight.set(key, promise)
@@ -517,7 +524,17 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       const current = tree.dir[dir]
       if (!options?.force && current?.loaded) return Promise.resolve()
 
-      const pending = treeInflight.get(dir)
+      const activeDirectory = scope()
+      const session = sessionID()
+      const owner = requestScope()
+      const generation = requestGeneration
+      const key = fileRequestKey({
+        projectID: sdk.projectID,
+        directory: activeDirectory,
+        sessionID: session,
+        path: dir,
+      })
+      const pending = treeInflight.get(key)
       if (pending) return pending
 
       setTree(
@@ -529,12 +546,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         }),
       )
 
-      const directory = scope()
-
       const promise = sdk.client.file
-        .list({ path: dir })
+        .list({ path: dir, sessionID: session })
         .then((x) => {
-          if (scope() !== directory) return
+          if (requestGeneration !== generation || requestScope() !== owner) return
           const nodes = x.data ?? []
           const prevChildren = tree.dir[dir]?.children ?? []
           const nextChildren = nodes.map((node) => node.path)
@@ -580,7 +595,18 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           )
         })
         .catch((e) => {
-          if (scope() !== directory) return
+          if (requestGeneration !== generation || requestScope() !== owner) return
+          if (isFileRequestCancellation(e)) {
+            setTree(
+              "dir",
+              dir,
+              produce((draft) => {
+                draft.loading = false
+                draft.error = undefined
+              }),
+            )
+            return
+          }
           setTree(
             "dir",
             dir,
@@ -589,7 +615,6 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
               draft.error = e.message
             }),
           )
-          if (isTransientError(e)) return
           showToast({
             variant: "error",
             title: language.t("toast.file.listFailed.title"),
@@ -597,10 +622,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           })
         })
         .finally(() => {
-          treeInflight.delete(dir)
+          if (treeInflight.get(key) === promise) treeInflight.delete(key)
         })
 
-      treeInflight.set(dir, promise)
+      treeInflight.set(key, promise)
       return promise
     }
 
@@ -699,6 +724,8 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     }
 
     onCleanup(() => {
+      searches.false.cancel()
+      searches.true.cancel()
       stop()
       disposeViews()
     })

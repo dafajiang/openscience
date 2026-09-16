@@ -19,7 +19,9 @@ function printStatus(config?: Config.Sandbox) {
   UI.println(`${S.TEXT_NORMAL_BOLD}Execution sandbox${S.TEXT_NORMAL}`)
   UI.println(
     `  status    ${enabled ? `${S.TEXT_SUCCESS_BOLD}enabled` : `${S.TEXT_DIM}disabled`}${S.TEXT_NORMAL}` +
-      `${S.TEXT_DIM}  (agent shell commands${enabled ? " are confined to the workspace" : " run with full user authority"})${S.TEXT_NORMAL}`,
+      `${S.TEXT_DIM}  (agent shell commands${
+        enabled ? " are confined to approved paths" : " require project trust before using full user authority"
+      })${S.TEXT_NORMAL}`,
   )
   UI.println(`  platform  ${d.platform}`)
   UI.println(
@@ -30,15 +32,18 @@ function printStatus(config?: Config.Sandbox) {
     }`,
   )
   if (enabled) {
-    UI.println(`  network   ${config?.network ?? "allow"}`)
-    UI.println(`  on missing backend   ${config?.onUnavailable ?? "warn"}`)
+    UI.println(`  network   ${config?.network ?? "deny"}`)
+    UI.println(
+      `  project trust   ${config?.requireProjectTrust ? "required for all execution" : "routine sandboxed work allowed"}`,
+    )
+    UI.println(`  on missing backend   ${config?.onUnavailable ?? "error"}`)
     if (config?.allowWrite?.length) UI.println(`  extra writable   ${config.allowWrite.join(", ")}`)
   }
   if (enabled && !d.available) {
     UI.println("")
     UI.println(
       `  ${S.TEXT_WARNING_BOLD}Note:${S.TEXT_NORMAL} sandbox is on but no backend exists here — ` +
-        `commands run per "${config?.onUnavailable ?? "warn"}". It takes effect on machines with a backend.`,
+        `execution follows the "${config?.onUnavailable ?? "error"}" fallback policy. It takes effect on machines with a backend.`,
     )
   }
 }
@@ -68,7 +73,7 @@ const EnableCommand = cmd({
     yargs
       .option("network", {
         choices: ["allow", "deny"] as const,
-        describe: "allow or deny network egress from sandboxed commands (default: allow)",
+        describe: "allow or deny network egress from sandboxed commands (default: deny)",
       })
       .option("allow", {
         type: "string",
@@ -77,7 +82,11 @@ const EnableCommand = cmd({
       })
       .option("on-unavailable", {
         choices: ["warn", "error", "allow"] as const,
-        describe: "what to do when no backend exists on a machine (default: warn)",
+        describe: "what to do when no backend exists on a machine (default: error)",
+      })
+      .option("require-project-trust", {
+        type: "boolean",
+        describe: "require explicit project trust even for routine sandboxed commands",
       }),
   handler: async (args) => {
     await Instance.provide({
@@ -86,8 +95,17 @@ const EnableCommand = cmd({
         const patch: Partial<Config.Sandbox> = { enabled: true }
         if (args.network) patch.network = args.network as "allow" | "deny"
         if (args["on-unavailable"]) patch.onUnavailable = args["on-unavailable"] as "warn" | "error" | "allow"
+        if (typeof args["require-project-trust"] === "boolean") {
+          patch.requireProjectTrust = args["require-project-trust"]
+        }
         const allow = args.allow as string[] | undefined
-        if (allow?.length) patch.allowWrite = allow
+        if (allow?.length) {
+          patch.allowWrite = allow.map((value) => {
+            const canonical = Sandbox.writableGrant(value)
+            if (!canonical) throw new Error(`Writable sandbox path is invalid or over-broad: ${value}`)
+            return canonical
+          })
+        }
         await Config.setSandbox(patch)
         UI.empty()
         UI.println(`${S.TEXT_SUCCESS_BOLD}Sandbox enabled${S.TEXT_NORMAL} ${S.TEXT_DIM}(global config)${S.TEXT_NORMAL}`)

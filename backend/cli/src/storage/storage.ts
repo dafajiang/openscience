@@ -1,16 +1,21 @@
 import { Log } from "../util/log"
 import path from "path"
 import fs from "fs/promises"
+import { randomUUID } from "crypto"
 import { Global } from "../global"
 import { Filesystem } from "../util/filesystem"
-import { lazy } from "../util/lazy"
+import { lazy } from "@synsci/util/lazy"
 import { Lock } from "../util/lock"
 import { $ } from "bun"
 import { NamedError } from "@synsci/util/error"
 import z from "zod"
+import { DataRootBarrier } from "@/global/data-root-barrier"
+import { LockCoordination } from "@/util/lock-coordination"
 
 export namespace Storage {
   const log = Log.create({ service: "storage" })
+  const timeout = 10_000
+  const grace = 5_000
 
   type Migration = (dir: string) => Promise<void>
 
@@ -150,7 +155,16 @@ export namespace Storage {
     for (let index = migration; index < MIGRATIONS.length; index++) {
       log.info("running migration", { index })
       const migration = MIGRATIONS[index]
-      await migration(dir).catch(() => log.error("failed to run migration", { index }))
+      // Only a completed migration advances the marker; a failed one is
+      // retried on the next start instead of being silently skipped forever.
+      const ok = await migration(dir).then(
+        () => true,
+        (error) => {
+          log.error("failed to run migration", { index, error })
+          return false
+        },
+      )
+      if (!ok) break
       await Bun.write(path.join(dir, "migration"), (index + 1).toString())
     }
     return {
@@ -162,7 +176,13 @@ export namespace Storage {
     const dir = await state().then((x) => x.dir)
     const target = path.join(dir, ...key) + ".json"
     return withErrorHandling(async () => {
-      await fs.unlink(target).catch(() => {})
+      await using operation = await DataRootBarrier.enter(target)
+      using _ = await Lock.write(target)
+      await using __ = await interprocess(target)
+      await fs.unlink(target).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+        throw error
+      })
     })
   }
 
@@ -176,14 +196,128 @@ export namespace Storage {
     })
   }
 
+  /**
+   * Publish a record by rename. Lock is an in-process map, so it orders writers
+   * inside one process and nothing at all between processes — and several
+   * openscience processes share this directory routinely (a CLI run alongside a
+   * running server; `Project.fromDirectory` rewrites a record on every instance
+   * creation). A plain write truncates in place, so a reader in another process
+   * can observe a half-written file and fail to parse it. Rename is atomic, so
+   * every reader sees either the old record or the new one.
+   */
+  async function publish(target: string, content: string) {
+    const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`
+    await Bun.write(tmp, content)
+    await fs.rename(tmp, target).catch(async (error) => {
+      await fs.unlink(tmp).catch(() => {})
+      throw error
+    })
+  }
+
+  /** A narrow cross-process lock for storage mutations. OpenScience commonly
+   * runs a production and development server against one data directory; the
+   * in-memory Lock cannot serialize those writers. O_EXCL lock creation does,
+   * while the stale timeout recovers a lock left by a crashed process. */
+  async function abandoned(lockfile: string) {
+    const owner = await Bun.file(lockfile)
+      .json()
+      .catch(() => undefined)
+    const pid =
+      owner &&
+      typeof owner === "object" &&
+      "pid" in owner &&
+      typeof owner.pid === "number" &&
+      Number.isSafeInteger(owner.pid) &&
+      owner.pid > 0
+        ? owner.pid
+        : undefined
+    const dead = (() => {
+      if (!pid) return undefined
+      try {
+        process.kill(pid, 0)
+        return false
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH"
+      }
+    })()
+    const stale = await fs
+      .stat(lockfile)
+      .then((stat) => Date.now() - stat.mtimeMs > grace)
+      .catch(() => false)
+    return dead === true || (dead === undefined && stale)
+  }
+
+  async function reclaim(lockfile: string, deadline: number) {
+    if (!(await abandoned(lockfile))) return false
+    await using claim = await LockCoordination.claim(lockfile, 30_000)
+    if (!(await claim.drain(deadline))) return false
+    if (!(await abandoned(lockfile))) return false
+    const tombstone = `${lockfile}.${process.pid}.${randomUUID()}.dead`
+    return fs
+      .rename(lockfile, tombstone)
+      .then(async () => {
+        await fs.unlink(tombstone).catch(() => {})
+        return true
+      })
+      .catch(() => false)
+  }
+
+  async function interprocess(target: string) {
+    const lockfile = `${target}.lock`
+    const deadline = Date.now() + timeout
+    await fs.mkdir(path.dirname(target), { recursive: true })
+    for (;;) {
+      const attempt = await (async () => {
+        await using intent = await LockCoordination.intent(lockfile, 30_000)
+        if (await intent.blocked()) return { status: "blocked" as const }
+        const handle = await fs.open(lockfile, "wx", 0o600).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "EEXIST") return
+          throw error
+        })
+        if (handle) return { status: "acquired" as const, handle }
+        return { status: "occupied" as const }
+      })()
+      if (attempt.status === "acquired") {
+        const handle = attempt.handle
+        const token = randomUUID()
+        // The lock JSON is only an ownership hint read back on dispose; the
+        // O_EXCL create is what excludes other writers, so no fsync is needed.
+        await handle
+          .writeFile(JSON.stringify({ pid: process.pid, token, created: Date.now() }))
+          .catch(async (error) => {
+            await handle.close().catch(() => undefined)
+            await fs.unlink(lockfile).catch(() => undefined)
+            throw error
+          })
+        return {
+          async [Symbol.asyncDispose]() {
+            await handle.close().catch(() => {})
+            const owner = await Bun.file(lockfile)
+              .json()
+              .catch(() => undefined)
+            if (!owner || typeof owner !== "object" || !("token" in owner) || owner.token !== token) return
+            await fs.unlink(lockfile).catch((error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error
+            })
+          },
+        }
+      }
+      if (await reclaim(lockfile, deadline)) continue
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for storage mutation lock: ${target}`)
+      await new Promise<void>((resolve) => setTimeout(resolve, 10 + Math.floor(Math.random() * 20)))
+    }
+  }
+
   export async function update<T>(key: string[], fn: (draft: T) => void) {
     const dir = await state().then((x) => x.dir)
     const target = path.join(dir, ...key) + ".json"
     return withErrorHandling(async () => {
+      await using operation = await DataRootBarrier.enter(target)
       using _ = await Lock.write(target)
+      await using __ = await interprocess(target)
       const content = await Bun.file(target).json()
       fn(content)
-      await Bun.write(target, JSON.stringify(content, null, 2))
+      await publish(target, JSON.stringify(content, null, 2))
       return content as T
     })
   }
@@ -192,8 +326,33 @@ export namespace Storage {
     const dir = await state().then((x) => x.dir)
     const target = path.join(dir, ...key) + ".json"
     return withErrorHandling(async () => {
+      await using operation = await DataRootBarrier.enter(target)
       using _ = await Lock.write(target)
-      await Bun.write(target, JSON.stringify(content, null, 2))
+      await using __ = await interprocess(target)
+      await publish(target, JSON.stringify(content, null, 2))
+    })
+  }
+
+  /** Atomically read-or-create and replace one record under the same
+   * interprocess lock. Callers use this when computing a revision from the
+   * previous value; splitting read() + write() would lose concurrent changes. */
+  export async function upsert<T>(key: string[], fn: (current: T | undefined) => T): Promise<T> {
+    const dir = await state().then((x) => x.dir)
+    const target = path.join(dir, ...key) + ".json"
+    return withErrorHandling(async () => {
+      await using operation = await DataRootBarrier.enter(target)
+      using _ = await Lock.write(target)
+      await using __ = await interprocess(target)
+      const current = await Bun.file(target)
+        .json()
+        .then((value) => value as T)
+        .catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return undefined
+          throw error
+        })
+      const next = fn(current)
+      await publish(target, JSON.stringify(next, null, 2))
+      return next
     })
   }
 
@@ -208,20 +367,44 @@ export namespace Storage {
     })
   }
 
-  const glob = new Bun.Glob("**/*")
-  export async function list(prefix: string[]) {
+  // Records are `.json` files and nothing else. `publish` stages every write as
+  // a sibling `<target>.<pid>.<uuid>.tmp` in the same directory — it has to,
+  // since rename is only atomic within one filesystem — so a bare `**/*` also
+  // matched the staging file during the write→rename window, and permanently
+  // when a writer died in between (nothing sweeps them). Every caller here
+  // strips a fixed 5 characters assuming ".json", so those entries became
+  // phantom keys whose `read` throws NotFoundError. Matching on the suffix
+  // makes that assumption true by construction, and unlike relocating temp
+  // files it also hides debris already left on disk by earlier runs.
+  const glob = new Bun.Glob("**/*.json")
+  export async function list(prefix: string[], attempt = 0): Promise<string[][]> {
     const dir = await state().then((x) => x.dir)
+    const root = path.join(dir, ...prefix)
     try {
       const result = await Array.fromAsync(
         glob.scan({
-          cwd: path.join(dir, ...prefix),
+          cwd: root,
           onlyFiles: true,
         }),
       ).then((results) => results.map((x) => [...prefix, ...x.slice(0, -5).split(path.sep)]))
       result.sort()
       return result
-    } catch {
-      return []
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        // A missing prefix is an empty listing. A sibling record being
+        // replaced under the scan is not: its temp file can vanish between the
+        // directory read and its stat, and reporting that as "no keys" would
+        // hide every session in the project for one caller. Look again.
+        const exists = await fs
+          .stat(root)
+          .then((info) => info.isDirectory())
+          .catch(() => false)
+        if (exists && attempt < 3) return list(prefix, attempt + 1)
+        return []
+      }
+      log.error("failed to list storage keys", { prefix, error })
+      throw error
     }
   }
 }

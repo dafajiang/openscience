@@ -7,8 +7,8 @@
  * Same underlying archive as RCSB but with EBI's own annotations, summaries,
  * and cross-references.
  */
-import type { Connector, ConnectorHit, FetchOptions, SearchOptions } from "../types"
-import { getJSON, orFallback } from "../http"
+import type { Connector, ConnectorHit, FetchedFile, FetchOptions, SearchOptions } from "../types"
+import { getJSON, getText } from "../http"
 import { asArray, clampLimit, firstString, toRaw } from "./util"
 
 interface SolrDoc {
@@ -41,11 +41,7 @@ export const pdbe: Connector = {
     const url =
       `https://www.ebi.ac.uk/pdbe/search/pdb/select?q=${encodeURIComponent(query)}` +
       `&wt=json&rows=${rows}&fl=${encodeURIComponent(fl)}`
-    const data = await orFallback(
-      getJSON<SolrResponse>(url, { signal: opts?.signal }),
-      {} as SolrResponse,
-      opts?.signal,
-    )
+    const data = await getJSON<SolrResponse>(url, { signal: opts?.signal })
     const seen = new Set<string>()
     const hits: ConnectorHit[] = []
     for (const d of asArray<SolrDoc>(data.response?.docs)) {
@@ -65,15 +61,22 @@ export const pdbe: Connector = {
 
   async fetch(id, opts?: FetchOptions): Promise<unknown> {
     const key = id.toLowerCase()
-    const data = await orFallback(
-      getJSON<Record<string, unknown>>(`https://www.ebi.ac.uk/pdbe/api/pdb/entry/summary/${encodeURIComponent(key)}`, {
-        signal: opts?.signal,
-      }),
-      {} as Record<string, unknown>,
-      opts?.signal,
+    const data = await getJSON<Record<string, unknown>>(
+      `https://www.ebi.ac.uk/pdbe/api/pdb/entry/summary/${encodeURIComponent(key)}`,
+      { signal: opts?.signal },
     )
     // PDBe wraps records as { "<pdbid>": [ {...} ] } — unwrap when present.
     const entry = asArray(data[key])[0]
     return entry ?? data
+  },
+
+  formats: ["cif"],
+
+  async fetchFile(id, format, opts?: FetchOptions): Promise<FetchedFile> {
+    const name = `${id.toLowerCase()}.${format}`
+    const body = await getText(`https://www.ebi.ac.uk/pdbe/entry-files/download/${encodeURIComponent(name)}`, {
+      signal: opts?.signal,
+    })
+    return { body, contentType: "chemical/x-cif", filename: name }
   },
 }
